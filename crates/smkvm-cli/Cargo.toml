@@ -19,6 +19,7 @@ smkvm-config = { path = "../smkvm-config" }
 smkvm-input = { path = "../smkvm-input" }
 smkvm-core = { path = "../smkvm-core" }
 smkvm-net = { path = "../smkvm-net" }
+smkvm-clipboard = { path = "../smkvm-clipboard" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

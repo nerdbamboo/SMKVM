@@ -1,6 +1,8 @@
 //! The `smkvm` command.
 
 mod client;
+mod clipboard;
+mod hello;
 mod platform;
 mod server;
 
@@ -12,16 +14,21 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use smkvm_config::status::{MachineState, Status};
 use smkvm_config::Config;
 use smkvm_input::Monitors;
-use smkvm_layout::{EdgeOverflow, Layout};
+use smkvm_layout::Layout;
 use smkvm_net::identity::Identity;
 use smkvm_net::pairing::Pairing;
 use smkvm_net::trust::Trust;
 use smkvm_proto::Role;
 use tokio::net::TcpListener;
 use tracing::info;
+
+/// Past this the log is rolled over, so a machine left running for months
+/// does not fill its disk with pointer crossings.
+const LOG_ROLLOVER: u64 = 4 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -43,8 +50,35 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RoleArg {
+    /// This machine owns the keyboard and mouse.
+    Server,
+    /// This machine receives the cursor from another.
+    Client,
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Write a starting configuration for this machine.
+    Init {
+        /// Whether this machine shares its keyboard and mouse or receives them.
+        #[arg(long, value_enum)]
+        role: RoleArg,
+        /// For a client: the server, as `host` or `host:port`.
+        #[arg(long)]
+        server: Option<String>,
+        /// For a server: an address to accept connections on. May be repeated.
+        /// Without any, only this machine itself can connect.
+        #[arg(long)]
+        listen: Vec<String>,
+        /// What this machine is called. Defaults to its hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace a configuration that is already there.
+        #[arg(long)]
+        force: bool,
+    },
     /// Introduce this machine to another, once.
     Pair {
         /// The machine to reach out to, as `host` or `host:port`. Omit to wait
@@ -55,6 +89,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Do whatever the configuration says this machine does: serve or connect.
+    Run,
     /// Own the keyboard and mouse, and pass them to the other machines.
     Serve,
     /// Receive the cursor from the machine that owns it.
@@ -62,6 +98,8 @@ enum Command {
         /// Override the server address from the configuration.
         host: Option<String>,
     },
+    /// Say what the running daemon is connected to, and where things are.
+    Status,
     /// List the machines this one has been paired with.
     Devices,
     /// Forget a machine.
@@ -87,7 +125,15 @@ fn main() -> Result<()> {
     start_logging(cli.verbose, cli.log_file.clone())?;
 
     let result = match cli.command {
+        Command::Init {
+            role,
+            server,
+            listen,
+            name,
+            force,
+        } => init(cli.config, role, server, listen, name, force),
         Command::Monitors => monitors(),
+        Command::Status => status(cli.config),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -96,6 +142,7 @@ fn main() -> Result<()> {
             write,
         } => import(from, server_config, write),
         Command::Pair { host, yes } => block_on(pair(host, yes)),
+        Command::Run => block_on(run(cli.config)),
         Command::Serve => block_on(serve(cli.config)),
         Command::Connect { host } => block_on(connect(cli.config, host)),
     };
@@ -137,6 +184,7 @@ fn start_logging(verbose: bool, explicit: Option<PathBuf>) -> Result<()> {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("making {}", dir.display()))?;
             }
+            roll_over(&path);
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -152,12 +200,76 @@ fn start_logging(verbose: bool, explicit: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Keep the log from growing without bound: past a certain size the current
+/// one becomes `.1` and a fresh one is started. One generation back is kept,
+/// because the evidence for a fault is usually in the log that was just
+/// closed, not the one that was just opened.
+fn roll_over(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() < LOG_ROLLOVER {
+        return;
+    }
+    let mut older = path.as_os_str().to_owned();
+    older.push(".1");
+    let _ = std::fs::rename(path, older);
+}
+
 fn block_on<F: std::future::Future<Output = Result<()>>>(f: F) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the runtime")?
         .block_on(f)
+}
+
+fn init(
+    path: Option<PathBuf>,
+    role: RoleArg,
+    server: Option<String>,
+    listen: Vec<String>,
+    name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let path = path.unwrap_or_else(paths::config_file);
+    if path.exists() && !force {
+        bail!(
+            "{} already exists. Edit it, or pass --force to start over.",
+            path.display()
+        );
+    }
+    let role = match role {
+        RoleArg::Server => Role::Server,
+        RoleArg::Client => Role::Client,
+    };
+    if role == Role::Client && server.is_none() {
+        bail!("a client needs to know its server: pass --server <host>");
+    }
+    let mut config = Config::fresh(name.unwrap_or_else(paths::default_name), role);
+    config.network.server = server;
+    config.network.listen = listen;
+    if role == Role::Server && config.network.listen.is_empty() {
+        eprintln!(
+            "note: no --listen address given, so only this machine can connect. Add the \
+             address other machines reach this one at to network.listen when you are ready."
+        );
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+    }
+    std::fs::write(&path, config.to_toml()?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("wrote {}", path.display());
+    println!();
+    println!("Next:");
+    println!("  1. On each pair of machines, run `smkvm pair <other>` on one and `smkvm pair` on the other.");
+    match role {
+        Role::Server => println!("  2. Run `smkvm run` here, and `smkvm run` on each client."),
+        Role::Client => println!("  2. Run `smkvm run` here once the server is running."),
+    }
+    println!("  3. Open smkvm-gui to arrange the screens; the daemon picks up the change at once.");
+    Ok(())
 }
 
 fn monitors() -> Result<()> {
@@ -174,6 +286,67 @@ fn monitors() -> Result<()> {
             m.local.y,
             if m.primary { "  primary" } else { "" }
         );
+    }
+    Ok(())
+}
+
+fn status(config_path: Option<PathBuf>) -> Result<()> {
+    let config_path = config_path.unwrap_or_else(paths::config_file);
+    println!("configuration  {}", config_path.display());
+    println!("log            {}", paths::log_file().display());
+    println!("status         {}", paths::status_file().display());
+    println!();
+
+    let status_path = paths::status_file();
+    let report = Status::load(&status_path)?;
+    let Some(report) = report else {
+        println!("smkvm is not running here (no report has been written).");
+        return Ok(());
+    };
+    if !report.is_current() {
+        println!(
+            "smkvm is not running here. Its last report is {} s old and says nothing about now.",
+            report.age().as_secs()
+        );
+        return Ok(());
+    }
+    let role = match report.role {
+        Role::Server => "sharing its keyboard and mouse",
+        Role::Client => "receiving the cursor",
+    };
+    println!(
+        "{} is {}{}, reported {} s ago.",
+        report.name,
+        role,
+        report
+            .pid
+            .map(|pid| format!(" (pid {pid})"))
+            .unwrap_or_default(),
+        report.age().as_secs()
+    );
+    if let Some(active) = report.active() {
+        println!("The cursor is on {}.", active.name);
+    }
+    println!();
+    for machine in &report.machines {
+        let state = match machine.state {
+            MachineState::Connected => "connected",
+            MachineState::Suspended => "connected, not taking input",
+            MachineState::Away => "away",
+        };
+        println!("  {:<24} {}", machine.name, state);
+        for m in &machine.monitor {
+            let r = m.rect();
+            println!(
+                "      {:<40} {:>5} x {:<5} at {:>6},{:<6}{}",
+                m.label.as_deref().unwrap_or(&m.id),
+                r.w,
+                r.h,
+                r.x,
+                r.y,
+                if m.primary { "  primary" } else { "" }
+            );
+        }
     }
     Ok(())
 }
@@ -278,16 +451,41 @@ fn default_barrier_settings() -> PathBuf {
     }
 }
 
-fn load_config(path: Option<PathBuf>) -> Result<Config> {
+fn load_config(path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
     let path = path.unwrap_or_else(paths::config_file);
     if !path.exists() {
         bail!(
-            "no configuration at {}. Run `smkvm import` to migrate an existing \
-             Barrier setup, or write one there.",
+            "no configuration at {}. Run `smkvm init --role server` or `smkvm init --role \
+             client --server <host>` to write one, or `smkvm import` to migrate an existing \
+             Barrier setup.",
             path.display()
         );
     }
-    Config::load(&path).map_err(Into::into)
+    Ok((Config::load(&path)?, path))
+}
+
+/// Refuse to start a second daemon beside one that is running.
+///
+/// Two copies on one machine fight over the link, and the one that loses is
+/// left holding whatever it did last -- a pointer out of the way, keys down.
+/// The daemon's own status report is the evidence: a report younger than its
+/// refresh interval was written by something that is still there.
+fn ensure_not_running() -> Result<()> {
+    let path = paths::status_file();
+    if let Some(report) = Status::current(&path) {
+        bail!(
+            "smkvm already seems to be running here{} -- its report at {} was written {} s ago. \
+             Stop it first. If it is not running, wait {} s or delete that file.",
+            report
+                .pid
+                .map(|pid| format!(" as pid {pid}"))
+                .unwrap_or_default(),
+            path.display(),
+            report.age().as_secs(),
+            Status::FRESH_FOR.as_secs()
+        );
+    }
+    Ok(())
 }
 
 async fn pair(host: Option<String>, yes: bool) -> Result<()> {
@@ -360,11 +558,21 @@ fn with_default_port(host: &str) -> String {
     }
 }
 
+/// Serve or connect, whichever the configuration says.
+async fn run(config_path: Option<PathBuf>) -> Result<()> {
+    let (config, _) = load_config(config_path.clone())?;
+    match config.network.role {
+        Role::Server => serve(config_path).await,
+        Role::Client => connect(config_path, None).await,
+    }
+}
+
 async fn serve(config_path: Option<PathBuf>) -> Result<()> {
-    let config = load_config(config_path)?;
+    let (config, path) = load_config(config_path)?;
     if config.network.role != Role::Server {
         bail!("this machine's configuration says it is a client; change network.role to serve");
     }
+    ensure_not_running()?;
     let identity = load_identity()?;
     let trust = load_trust()?;
     if trust.peers().count() == 0 {
@@ -372,11 +580,12 @@ async fn serve(config_path: Option<PathBuf>) -> Result<()> {
     }
     info!(name = %config.identity.name, id = %identity.id().short(), "starting as the server");
     let layout = Layout::new(config.behavior.edge_overflow);
-    server::run(identity, trust, config, layout).await
+    server::run(identity, trust, config, path, layout).await
 }
 
 async fn connect(config_path: Option<PathBuf>, host: Option<String>) -> Result<()> {
-    let config = load_config(config_path)?;
+    let (config, _) = load_config(config_path)?;
+    ensure_not_running()?;
     let identity = load_identity()?;
     let trust = load_trust()?;
 
@@ -387,17 +596,7 @@ async fn connect(config_path: Option<PathBuf>, host: Option<String>) -> Result<(
 
     // A client connects to exactly one machine, and must already know it: the
     // handshake is encrypted to that machine's key.
-    let peer = match trust.peers().count() {
-        0 => bail!("no machines are paired yet. Run `smkvm pair {address}` first."),
-        1 => trust.peers().next().expect("just counted one").clone(),
-        _ => trust
-            .peers()
-            .find(|p| p.name == config.identity.name)
-            .cloned()
-            .or_else(|| trust.peers().next().cloned())
-            .context("which paired machine is the server? Name it in the configuration.")?,
-    };
+    let peer = client::choose_server(&trust, &config)?;
     info!(server = %peer.name, %address, "connecting");
-    let _ = EdgeOverflow::default();
-    client::run(identity, peer, address).await
+    client::run(identity, peer, address, config).await
 }

@@ -1,28 +1,47 @@
 //! Running as the machine that owns the keyboard and mouse.
+//!
+//! Besides moving the cursor, the daemon keeps three promises to whatever is
+//! watching it. It says what it is connected to, in `status.toml`, whenever
+//! that changes and every few seconds regardless. It notices when the
+//! configuration file changes and takes the change into use without being
+//! restarted, so arranging screens in the window is felt at once. And it
+//! notices when a machine stops answering, so a link that has quietly died
+//! does not leave a pointer hidden or a machine believed connected.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use smkvm_core::{Action, Event, LocalAction, Placement, PointerMode, Server, Settings};
+use smkvm_config::status::{Machine, MachineState, PlacedMonitor, Status};
+use smkvm_config::{paths, Config};
+use smkvm_core::{
+    Action, ClientHealth, Event, LocalAction, Placement, PointerMode, Server, Settings,
+};
 use smkvm_input::Inject;
 use smkvm_layout::DeviceId;
 use smkvm_net::identity::Identity;
 use smkvm_net::link::{Link, LinkReader, LinkWriter};
 use smkvm_net::session::Session;
 use smkvm_net::trust::Trust;
-use smkvm_proto::{ClientControl, ServerControl};
+use smkvm_proto::{Bulk, ClientControl, Role, ServerControl};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc::{self, error::TrySendError, Sender};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::platform;
+use crate::clipboard::Sharing;
+use crate::{hello, platform};
 
-/// A machine that has connected, and where to send to it.
-struct Attached {
-    outbound: Outbound,
-}
+/// How often the configuration file is looked at and the status refreshed.
+const HOUSEKEEPING: Duration = Duration::from_secs(2);
+
+/// How long two status writes are kept apart when things are changing fast.
+const STATUS_SETTLE: Duration = Duration::from_millis(250);
+
+/// How many heartbeats a machine may miss before it is given up on.
+const MISSED_HEARTBEATS: u32 = 3;
 
 /// How full each queue to a machine is allowed to get.
 ///
@@ -41,8 +60,8 @@ enum Sent {
     Dropped,
     /// There was no room for something that cannot be thrown away.
     Overflowed,
-    /// The machine is not attached; there was nowhere to send it.
-    Nowhere,
+    /// Nobody is reading the far end any more.
+    Closed,
 }
 
 /// The two queues a machine is written through.
@@ -53,7 +72,8 @@ enum Sent {
 /// of state changes that nothing repeats: lose a `Leave` or an `Enter` and the
 /// machine and the server disagree about where the cursor is, with nothing on
 /// the way to correct either of them -- which is a cursor that crossed and then
-/// vanished.
+/// vanished. Clipboard traffic is control: a lost chunk stalls a paste until it
+/// times out, and a lost offer loses the clipboard.
 ///
 /// One queue would force a single policy on both, and it is motion, arriving
 /// thousands of times a minute, that decides when a shared queue is full. So
@@ -63,64 +83,86 @@ enum Sent {
 /// position that arrives after a `Leave` is discarded by a machine that knows
 /// it no longer has the cursor, and one that arrives after an `Enter` is
 /// corrected by the next position a moment later. `Enter` carries its own.
+/// A clipboard message overtaking a position changes nothing about where the
+/// cursor is.
 struct Outbound {
     control: Sender<ServerControl>,
     motion: Sender<ServerControl>,
 }
 
 impl Outbound {
+    fn new() -> (
+        Outbound,
+        mpsc::Receiver<ServerControl>,
+        mpsc::Receiver<ServerControl>,
+    ) {
+        let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let (motion, motion_rx) = mpsc::channel(MOTION_QUEUE);
+        (Outbound { control, motion }, control_rx, motion_rx)
+    }
+
     fn send(&self, msg: ServerControl) -> Sent {
         if msg.may_be_dropped() {
             match self.motion.try_send(msg) {
                 Ok(()) => Sent::Queued,
-                Err(_) => Sent::Dropped,
+                Err(TrySendError::Full(_)) => Sent::Dropped,
+                Err(TrySendError::Closed(_)) => Sent::Closed,
             }
         } else {
             match self.control.try_send(msg) {
                 Ok(()) => Sent::Queued,
-                Err(_) => Sent::Overflowed,
+                Err(TrySendError::Full(_)) => Sent::Overflowed,
+                Err(TrySendError::Closed(_)) => Sent::Closed,
             }
         }
     }
 }
 
-/// Something a client's reader task noticed.
-enum FromClient {
-    Message(DeviceId, ClientControl),
-    Gone(DeviceId),
+/// A machine that has connected, and where to send to it.
+struct Attached {
+    name: String,
+    outbound: Outbound,
+    /// Which connection this is. A machine that connects again gets a new
+    /// one, and anything the old connection's tasks say afterwards is not
+    /// about the machine that is here now.
+    generation: u64,
+    reader: JoinHandle<()>,
+    last_heard: Instant,
 }
 
-pub async fn run(
-    identity: Identity,
-    trust: Trust,
-    config: smkvm_config::Config,
-    layout: smkvm_layout::Layout,
-) -> Result<()> {
-    let settings = Settings {
+/// Something a client's reader task noticed.
+enum FromClient {
+    Message {
+        device: DeviceId,
+        generation: u64,
+        msg: ClientControl,
+    },
+    Gone {
+        device: DeviceId,
+        generation: u64,
+    },
+}
+
+/// A machine that has finished its handshake and introduced itself.
+struct Arrival {
+    device: DeviceId,
+    name: String,
+    reader: LinkReader,
+    writer: LinkWriter,
+}
+
+/// The switching behaviour the configuration asks for.
+pub fn settings_of(config: &Config) -> Settings {
+    Settings {
         switch_delay: Duration::from_millis(u64::from(config.behavior.switch_delay_ms)),
         switch_double_tap: Duration::from_millis(u64::from(config.behavior.switch_double_tap_ms)),
         edge_overflow: config.behavior.edge_overflow,
-    };
+    }
+}
 
-    let (events_tx, mut events) = mpsc::channel::<Event>(4096);
-    let (from_clients_tx, mut from_clients) = mpsc::channel::<FromClient>(256);
-    let (arrivals_tx, mut arrivals) =
-        mpsc::channel::<(DeviceId, String, LinkReader, LinkWriter)>(8);
-
-    let mut injector = platform::injector()?;
-    let capture = platform::start_capture(events_tx.clone())?;
-
-    let mut server = Server::new(
-        identity.id(),
-        config.identity.name.clone(),
-        layout,
-        settings,
-    );
-
-    // The arrangement from the configuration, applied as machines appear.
-    // Anything it does not mention is placed automatically, so a half-written
-    // layout still leaves every screen reachable.
-    let placements: Vec<Placement> = config
+/// The arrangement the configuration asks for.
+pub fn placements_of(config: &Config) -> Vec<Placement> {
+    config
         .screen
         .iter()
         .flat_map(|screen| {
@@ -130,7 +172,54 @@ pub async fn run(
                 global: monitor.rect(),
             })
         })
-        .collect();
+        .collect()
+}
+
+fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+struct Daemon {
+    me: DeviceId,
+    server: Server,
+    config: Config,
+    config_path: PathBuf,
+    config_stamp: Option<(SystemTime, u64)>,
+    attached: HashMap<DeviceId, Attached>,
+    generation: u64,
+    injector: Box<dyn platform::InjectAndReport>,
+    capture: platform::CaptureHandle,
+    sharing: Sharing,
+    from_clients: Sender<FromClient>,
+    heartbeat: Duration,
+    status_path: PathBuf,
+    status_dirty: bool,
+    status_written: Option<Instant>,
+    last_active: DeviceId,
+}
+
+pub async fn run(
+    identity: Identity,
+    trust: Trust,
+    config: Config,
+    config_path: PathBuf,
+    layout: smkvm_layout::Layout,
+) -> Result<()> {
+    let (events_tx, mut events) = mpsc::channel::<Event>(4096);
+    let (from_clients_tx, mut from_clients) = mpsc::channel::<FromClient>(256);
+    let (arrivals_tx, mut arrivals) = mpsc::channel::<Arrival>(8);
+
+    let mut injector = platform::injector()?;
+    let capture = platform::start_capture(events_tx.clone())?;
+
+    let mut server = Server::new(
+        identity.id(),
+        config.identity.name.clone(),
+        layout,
+        settings_of(&config),
+    );
+    let placements = placements_of(&config);
     if !placements.is_empty() {
         info!(
             count = placements.len(),
@@ -151,9 +240,44 @@ pub async fn run(
         Instant::now(),
     );
 
+    let sharing = Sharing::start(
+        identity.id(),
+        &config.clipboard,
+        match platform::clipboard() {
+            Ok(backends) => Some(backends),
+            Err(e) => {
+                warn!("the clipboard on this machine cannot be shared: {e:#}");
+                None
+            }
+        },
+    );
+
+    let heartbeat = Duration::from_millis(u64::from(config.network.heartbeat_ms.max(500)));
+    let mut daemon = Daemon {
+        me: identity.id(),
+        last_active: identity.id(),
+        server,
+        config_stamp: stamp(&config_path),
+        config,
+        config_path,
+        attached: HashMap::new(),
+        generation: 0,
+        injector,
+        capture,
+        sharing,
+        from_clients: from_clients_tx,
+        heartbeat,
+        status_path: paths::status_file(),
+        status_dirty: true,
+        status_written: None,
+    };
+
     let identity = Arc::new(identity);
     let trust = Arc::new(trust);
-    let addrs = bind_addresses(&config);
+    let addrs = bind_addresses(&daemon.config);
+    if addrs.is_empty() {
+        anyhow::bail!("network.listen names no address to listen on");
+    }
     for addr in &addrs {
         let listener = TcpListener::bind(addr)
             .await
@@ -163,104 +287,392 @@ pub async fn run(
             listener,
             identity.clone(),
             trust.clone(),
+            daemon.config.identity.name.clone(),
             arrivals_tx.clone(),
         ));
     }
-    if addrs.is_empty() {
-        anyhow::bail!("network.listen names no address to listen on");
-    }
+    daemon.write_status();
 
-    let mut attached: HashMap<DeviceId, Attached> = HashMap::new();
     // The edge-hold timing needs time to pass even when nothing is happening.
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = tokio::time::interval(daemon.heartbeat);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut housekeeping = tokio::time::interval(HOUSEKEEPING);
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        let event = tokio::select! {
-            Some(event) = events.recv() => event,
+        tokio::select! {
+            Some(event) = events.recv() => daemon.handle(event),
             Some(from) = from_clients.recv() => match from {
-                FromClient::Gone(device) => {
-                    attached.remove(&device);
-                    warn!(device = %device.short(), "machine disconnected");
-                    Event::ClientDown { device }
-                }
-                FromClient::Message(device, msg) => match msg {
-                    ClientControl::Monitors { monitors } => Event::ClientMonitors { device, monitors },
-                    ClientControl::Suspended { reason } => Event::ClientSuspended { device, reason },
-                    ClientControl::Resumed => Event::ClientResumed { device },
-                    // Liveness and acknowledgements need no decision.
-                    _ => continue,
-                },
+                FromClient::Gone { device, generation } => daemon.gone(device, generation),
+                FromClient::Message { device, generation, msg } => daemon.heard(device, generation, msg),
             },
-            Some((device, name, reader, writer)) = arrivals.recv() => {
-                let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
-                let (motion_tx, motion_rx) = mpsc::channel(MOTION_QUEUE);
-                attached.insert(device, Attached {
-                    outbound: Outbound { control: control_tx, motion: motion_tx },
-                });
-                tokio::spawn(client_reader(device, reader, from_clients_tx.clone()));
-                tokio::spawn(client_writer(writer, control_rx, motion_rx));
-                info!(device = %device.short(), %name, "machine connected");
-                Event::ClientUp { device, name }
+            Some(arrival) = arrivals.recv() => daemon.arrived(arrival),
+            _ = tick.tick() => daemon.handle(Event::Tick),
+            _ = heartbeat.tick() => daemon.heartbeat(),
+            _ = housekeeping.tick() => daemon.housekeeping(),
+            happened = daemon.sharing.next() => {
+                let sends = daemon.sharing.on(happened, Instant::now());
+                daemon.send_bulk(sends);
             }
-            _ = tick.tick() => Event::Tick,
-        };
-
-        for action in server.handle(event, Instant::now()) {
-            match action {
-                Action::Send { to, msg } => {
-                    let sent = match attached.get(&to) {
-                        Some(client) => client.outbound.send(msg),
-                        None => Sent::Nowhere,
-                    };
-                    match sent {
-                        Sent::Queued | Sent::Nowhere => {}
-                        Sent::Dropped => {
-                            warn!(device = %to.short(), "machine is not keeping up")
-                        }
-                        // A thousand unread state changes is a machine that has
-                        // stopped, not one that is busy. Letting the link go
-                        // says so, and brings the cursor home -- which is a
-                        // state the rest of the system knows how to be in.
-                        Sent::Overflowed => {
-                            warn!(
-                                device = %to.short(),
-                                "machine is too far behind to be told where the cursor is; \
-                                 letting the link go"
-                            );
-                            attached.remove(&to);
-                        }
-                    }
-                }
-                Action::Local(LocalAction::SetPointerMode(mode)) => {
-                    let captured = mode == PointerMode::Captured;
-                    capture.set_swallow(captured);
-                    let moved = if captured {
-                        injector.hide_cursor()
-                    } else {
-                        injector.show_cursor()
-                    };
-                    // This machine is the one whose keyboard and mouse are
-                    // being taken away, so a pointer that will not go where it
-                    // is put is the one failure the person here cannot work
-                    // around.
-                    if let Err(e) = moved {
-                        warn!(captured, "the local pointer would not move: {e}");
-                    }
-                }
-                Action::Local(LocalAction::WarpCursor { x, y }) => {
-                    if let Err(e) = injector.move_to(x, y) {
-                        warn!("the local pointer would not go to {x},{y}: {e}");
-                    }
-                    let _ = injector.flush();
-                }
-                Action::Local(LocalAction::ReleaseAll) => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("stopping");
+                break;
             }
         }
+        daemon.maybe_write_status();
+    }
+
+    // Everything connected is told, so nothing stays held down anywhere and
+    // no pointer stays out of the way.
+    for (_, client) in daemon.attached.drain() {
+        let _ = client.outbound.send(ServerControl::Goodbye);
+        client.reader.abort();
+    }
+    Status::remove(&daemon.status_path);
+    // Returning drops the capture, which uninstalls the hooks: that is what
+    // gives the keyboard and mouse back if the cursor was elsewhere.
+    Ok(())
+}
+
+impl Daemon {
+    /// Put an event through the state machine and carry out what it says.
+    ///
+    /// Carrying it out can produce further events -- a machine too far behind
+    /// to be told something is let go, which is a departure -- so this runs
+    /// until nothing is left.
+    fn handle(&mut self, event: Event) {
+        let mut queue = vec![event];
+        while let Some(event) = queue.pop() {
+            if !matches!(
+                event,
+                Event::Tick
+                    | Event::PointerAt { .. }
+                    | Event::PointerBy { .. }
+                    | Event::Button { .. }
+                    | Event::Wheel(_)
+                    | Event::Key { .. }
+            ) {
+                self.status_dirty = true;
+            }
+            for action in self.server.handle(event, Instant::now()) {
+                self.act(action, &mut queue);
+            }
+        }
+        if self.server.active() != self.last_active {
+            self.last_active = self.server.active();
+            self.status_dirty = true;
+        }
+    }
+
+    fn act(&mut self, action: Action, queue: &mut Vec<Event>) {
+        match action {
+            Action::Send { to, msg } => self.send(to, msg, queue),
+            Action::Local(LocalAction::SetPointerMode(mode)) => {
+                let captured = mode == PointerMode::Captured;
+                self.capture.set_swallow(captured);
+                let result = if captured {
+                    self.injector.hide_cursor()
+                } else {
+                    self.injector.show_cursor()
+                };
+                // This machine is the one whose keyboard and mouse are being
+                // taken away, so a pointer that will not go where it is put is
+                // the one failure the person here cannot work around.
+                if let Err(e) = result {
+                    warn!(captured, "the local pointer would not move: {e}");
+                }
+            }
+            Action::Local(LocalAction::WarpCursor { x, y }) => {
+                if let Err(e) = self.injector.move_to(x, y) {
+                    warn!("the local pointer would not go to {x},{y}: {e}");
+                }
+                let _ = self.injector.flush();
+            }
+            Action::Local(LocalAction::ReleaseAll) => {}
+        }
+    }
+
+    fn send(&mut self, to: DeviceId, msg: ServerControl, queue: &mut Vec<Event>) {
+        let Some(client) = self.attached.get(&to) else {
+            return;
+        };
+        match client.outbound.send(msg) {
+            Sent::Queued => {}
+            // Motion gives way to keep up; the next position puts it right.
+            Sent::Dropped => warn!(machine = %client.name, "machine is not keeping up"),
+            // A thousand unread state changes is a machine that has stopped,
+            // not one that is busy. Letting the link go says so, and brings
+            // the cursor home -- a state the rest of the system knows how to
+            // be in.
+            Sent::Overflowed => {
+                self.detach(to, "too far behind to be told where the cursor is", queue)
+            }
+            Sent::Closed => self.detach(to, "its link has closed", queue),
+        }
+    }
+
+    fn send_bulk(&mut self, sends: Vec<(DeviceId, Bulk)>) {
+        let mut queue = Vec::new();
+        for (to, msg) in sends {
+            self.send(to, ServerControl::Bulk(msg), &mut queue);
+        }
+        for event in queue {
+            self.handle(event);
+        }
+    }
+
+    /// Let a machine's link go, and treat it as departed.
+    fn detach(&mut self, device: DeviceId, why: &str, queue: &mut Vec<Event>) {
+        let Some(client) = self.attached.remove(&device) else {
+            return;
+        };
+        warn!(machine = %client.name, "letting the link go: {why}");
+        // Dropping the sender ends the writer task, which closes the socket;
+        // the reader is stopped here so it cannot report the close as a
+        // second departure.
+        client.reader.abort();
+        queue.push(Event::ClientDown { device });
+        let sends = self.sharing.peer_gone(device, Instant::now());
+        for (to, msg) in sends {
+            self.send(to, ServerControl::Bulk(msg), queue);
+        }
+        self.status_dirty = true;
+    }
+
+    fn arrived(&mut self, arrival: Arrival) {
+        let Arrival {
+            device,
+            name,
+            reader,
+            writer,
+        } = arrival;
+        if self.attached.contains_key(&device) {
+            // The same machine, again. Either its old link died without
+            // saying so or a second copy of it has started; either way the
+            // old one cannot be told anything useful any more, and left in
+            // place it would keep whatever it did last -- a hidden pointer
+            // included -- for ever.
+            let mut queue = Vec::new();
+            self.detach(device, "the same machine connected again", &mut queue);
+            for event in queue {
+                self.handle(event);
+            }
+        }
+        self.generation += 1;
+        let generation = self.generation;
+        let (outbound, control_rx, motion_rx) = Outbound::new();
+        let reader = tokio::spawn(client_reader(
+            device,
+            generation,
+            reader,
+            self.from_clients.clone(),
+        ));
+        tokio::spawn(client_writer(writer, control_rx, motion_rx));
+        info!(machine = %name, device = %device.short(), "machine connected");
+        self.attached.insert(
+            device,
+            Attached {
+                name: name.clone(),
+                outbound,
+                generation,
+                reader,
+                last_heard: Instant::now(),
+            },
+        );
+        self.handle(Event::ClientUp { device, name });
+        let sends = self.sharing.peer_up(device, Instant::now());
+        self.send_bulk(sends);
+    }
+
+    fn current(&self, device: DeviceId, generation: u64) -> bool {
+        self.attached
+            .get(&device)
+            .is_some_and(|c| c.generation == generation)
+    }
+
+    fn gone(&mut self, device: DeviceId, generation: u64) {
+        if !self.current(device, generation) {
+            // An old connection's last word, about a machine that has since
+            // connected again.
+            return;
+        }
+        let mut queue = Vec::new();
+        self.detach(device, "it disconnected", &mut queue);
+        for event in queue {
+            self.handle(event);
+        }
+    }
+
+    fn heard(&mut self, device: DeviceId, generation: u64, msg: ClientControl) {
+        if !self.current(device, generation) {
+            return;
+        }
+        if let Some(client) = self.attached.get_mut(&device) {
+            client.last_heard = Instant::now();
+        }
+        match msg {
+            ClientControl::Monitors { monitors } => {
+                self.handle(Event::ClientMonitors { device, monitors })
+            }
+            ClientControl::Suspended { reason } => {
+                self.handle(Event::ClientSuspended { device, reason })
+            }
+            ClientControl::Resumed => self.handle(Event::ClientResumed { device }),
+            ClientControl::Bulk(bulk) => {
+                let sends = self.sharing.peer_said(device, bulk, Instant::now());
+                self.send_bulk(sends);
+            }
+            ClientControl::Ping { id } => {
+                let mut queue = Vec::new();
+                self.send(device, ServerControl::Pong { id }, &mut queue);
+                for event in queue {
+                    self.handle(event);
+                }
+            }
+            ClientControl::Goodbye => self.gone(device, generation),
+            // Liveness and acknowledgements need no decision; being heard
+            // from at all was the point.
+            ClientControl::Pong { .. } | ClientControl::KeyStateReport { .. } => {}
+            // Introductions happened before this machine was attached.
+            ClientControl::Hello(_) => {}
+        }
+    }
+
+    /// Ask every machine whether it is still there, and give up on any that
+    /// has not answered for a while.
+    fn heartbeat(&mut self) {
+        let limit = self.heartbeat * MISSED_HEARTBEATS;
+        let silent: Vec<DeviceId> = self
+            .attached
+            .iter()
+            .filter(|(_, c)| c.last_heard.elapsed() > limit)
+            .map(|(d, _)| *d)
+            .collect();
+        let mut queue = Vec::new();
+        for device in silent {
+            self.detach(
+                device,
+                &format!("nothing heard from it for {} s", limit.as_secs()),
+                &mut queue,
+            );
+        }
+        let live: Vec<DeviceId> = self.attached.keys().copied().collect();
+        for (n, device) in live.into_iter().enumerate() {
+            self.send(device, ServerControl::Ping { id: n as u32 }, &mut queue);
+        }
+        for event in queue {
+            self.handle(event);
+        }
+    }
+
+    fn housekeeping(&mut self) {
+        let now = stamp(&self.config_path);
+        if now != self.config_stamp {
+            self.config_stamp = now;
+            self.reload_config();
+        }
+        if self
+            .status_written
+            .is_none_or(|t| t.elapsed() >= Status::REFRESH_EVERY)
+        {
+            self.write_status();
+        }
+    }
+
+    /// Take a changed configuration file into use.
+    fn reload_config(&mut self) {
+        let fresh = match Config::load(&self.config_path) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                warn!("the configuration changed but could not be read, so the old one stays: {e}");
+                return;
+            }
+        };
+        if fresh.network != self.config.network {
+            warn!("network settings changed; those take effect when smkvm is restarted");
+        }
+        if fresh.identity != self.config.identity {
+            warn!("this machine's name changed; that takes effect when smkvm is restarted");
+        }
+        let actions = self
+            .server
+            .reconfigure(placements_of(&fresh), settings_of(&fresh));
+        let mut queue = Vec::new();
+        for action in actions {
+            self.act(action, &mut queue);
+        }
+        for event in queue {
+            self.handle(event);
+        }
+        self.sharing.reconfigure(&fresh.clipboard);
+        self.config = fresh;
+        self.status_dirty = true;
+        info!("configuration reloaded");
+    }
+
+    fn maybe_write_status(&mut self) {
+        if !self.status_dirty {
+            return;
+        }
+        let settled = self
+            .status_written
+            .is_none_or(|t| t.elapsed() >= STATUS_SETTLE);
+        if settled {
+            self.write_status();
+        }
+    }
+
+    fn write_status(&mut self) {
+        let status = self.report();
+        if let Err(e) = status.save(&self.status_path) {
+            warn!("could not write the status report: {e}");
+        }
+        self.status_dirty = false;
+        self.status_written = Some(Instant::now());
+    }
+
+    /// What the daemon knows, for anything that wants to show it.
+    fn report(&self) -> Status {
+        let layout = self.server.layout();
+        let active = self.server.active();
+        let machines = layout
+            .devices()
+            .iter()
+            .map(|device| {
+                let state = if device.id == self.me {
+                    MachineState::Connected
+                } else {
+                    match self.server.client_health(device.id) {
+                        Some(ClientHealth::Ready) => MachineState::Connected,
+                        Some(ClientHealth::Suspended) => MachineState::Suspended,
+                        None => MachineState::Away,
+                    }
+                };
+                let mut machine = Machine::new(device.name.clone(), Some(device.id), state);
+                machine.active = device.id == active;
+                machine.monitor = device
+                    .monitors
+                    .iter()
+                    .filter_map(|m| {
+                        let global = layout.placement(device.id, &m.id)?;
+                        Some(PlacedMonitor {
+                            id: m.id.as_str().to_string(),
+                            global: [global.x, global.y, global.w, global.h],
+                            label: m.label.clone(),
+                            primary: m.primary,
+                        })
+                    })
+                    .collect();
+                machine
+            })
+            .collect();
+        Status::new(Role::Server, self.config.identity.name.clone(), machines)
     }
 }
 
-fn bind_addresses(config: &smkvm_config::Config) -> Vec<String> {
+fn bind_addresses(config: &Config) -> Vec<String> {
     let port = config.network.port;
     if config.network.listen.is_empty() {
         // Listening everywhere is how a machine ends up reachable from a
@@ -286,7 +698,8 @@ async fn accept_loop(
     listener: TcpListener,
     identity: Arc<Identity>,
     trust: Arc<Trust>,
-    arrivals: Sender<(DeviceId, String, LinkReader, LinkWriter)>,
+    name: String,
+    arrivals: Sender<Arrival>,
 ) {
     loop {
         let Ok((socket, from)) = listener.accept().await else {
@@ -295,27 +708,54 @@ async fn accept_loop(
         let identity = identity.clone();
         let trust = trust.clone();
         let arrivals = arrivals.clone();
+        let name = name.clone();
         tokio::spawn(async move {
-            match Session::accept(socket, &identity, &trust).await {
-                Ok(session) => {
-                    let peer = session.peer();
-                    let name = session.peer_name().to_string();
-                    let (reader, writer) = Link::from(session).split();
-                    let _ = arrivals.send((peer, name, reader, writer)).await;
+            let session = match Session::accept(socket, &identity, &trust).await {
+                Ok(session) => session,
+                Err(e) => {
+                    warn!(%from, "refused: {e}");
+                    return;
                 }
-                Err(e) => warn!(%from, "refused: {e}"),
+            };
+            let device = session.peer();
+            let peer_name = session.peer_name().to_string();
+            let (mut reader, mut writer) = Link::from(session).split();
+            if let Err(e) = hello::as_server(&mut reader, &mut writer, &identity, &name).await {
+                warn!(machine = %peer_name, %from, "{e:#}");
+                return;
             }
+            let _ = arrivals
+                .send(Arrival {
+                    device,
+                    name: peer_name,
+                    reader,
+                    writer,
+                })
+                .await;
         });
     }
 }
 
-async fn client_reader(device: DeviceId, mut reader: LinkReader, out: Sender<FromClient>) {
+async fn client_reader(
+    device: DeviceId,
+    generation: u64,
+    mut reader: LinkReader,
+    out: Sender<FromClient>,
+) {
     while let Ok(msg) = reader.recv::<ClientControl>().await {
-        if out.send(FromClient::Message(device, msg)).await.is_err() {
+        if out
+            .send(FromClient::Message {
+                device,
+                generation,
+                msg,
+            })
+            .await
+            .is_err()
+        {
             return;
         }
     }
-    let _ = out.send(FromClient::Gone(device)).await;
+    let _ = out.send(FromClient::Gone { device, generation }).await;
 }
 
 /// Write to one machine, taking state changes ahead of pointer motion.
@@ -324,7 +764,7 @@ async fn client_reader(device: DeviceId, mut reader: LinkReader, out: Sender<Fro
 /// hundred queued positions arrives a hundred positions late, which on a link
 /// that is struggling is exactly when it is needed soonest. Motion is never
 /// starved in practice, because control messages happen at the rate a person
-/// crosses between screens.
+/// crosses between screens and pastes.
 async fn client_writer(
     mut writer: LinkWriter,
     mut control: mpsc::Receiver<ServerControl>,
@@ -348,6 +788,7 @@ async fn client_writer(
 mod tests {
     use super::*;
     use smkvm_layout::Point;
+    use smkvm_proto::{Bulk, ClipFormat, ClipSeq};
 
     /// An `Outbound` whose far end nobody is reading, which is the situation
     /// all of this is about. The receivers come back so the queues stay open
@@ -379,6 +820,19 @@ mod tests {
         }
     }
 
+    fn chunk() -> ServerControl {
+        ServerControl::Bulk(Bulk::ClipChunk {
+            seq: ClipSeq {
+                device: DeviceId::from_bytes([2; 32]),
+                counter: 1,
+            },
+            format: ClipFormat::Text,
+            offset: 0,
+            data: vec![1, 2, 3],
+            last: true,
+        })
+    }
+
     #[test]
     fn a_machine_drowning_in_motion_can_still_be_told_the_cursor_arrived() {
         // The failure this exists to prevent. Motion arrives thousands of times
@@ -397,32 +851,27 @@ mod tests {
         assert_eq!(out.send(enter()), Sent::Queued);
         assert_eq!(out.send(ServerControl::Leave), Sent::Queued);
         assert_eq!(out.send(ServerControl::ReleaseAll), Sent::Queued);
-    }
-
-    #[test]
-    fn a_machine_that_has_stopped_reading_loses_its_link_rather_than_a_state_change() {
-        let (out, _control_rx, _motion_rx) = outbound(1, 8);
-        assert_eq!(out.send(enter()), Sent::Queued);
         assert_eq!(
-            out.send(ServerControl::Leave),
-            Sent::Overflowed,
-            "there is no quiet way to lose this one"
+            out.send(chunk()),
+            Sent::Queued,
+            "the clipboard rides with control"
         );
     }
 
     #[test]
-    fn motion_and_control_do_not_share_a_queue() {
-        // Filling one must not consume room in the other, in either direction.
-        let (out, _control_rx, _motion_rx) = outbound(2, 2);
+    fn a_thousand_unread_state_changes_is_a_fault_not_a_busy_moment() {
+        let (out, _control_rx, _motion_rx) = outbound(2, 8);
         assert_eq!(out.send(enter()), Sent::Queued);
         assert_eq!(out.send(ServerControl::Leave), Sent::Queued);
-        for _ in 0..2 {
-            assert_eq!(out.send(ServerControl::MoveTo { x: 0, y: 0 }), Sent::Queued);
-        }
-        assert_eq!(
-            out.send(ServerControl::MoveTo { x: 0, y: 0 }),
-            Sent::Dropped
-        );
-        assert_eq!(out.send(ServerControl::ReleaseAll), Sent::Overflowed);
+        assert_eq!(out.send(enter()), Sent::Overflowed);
+    }
+
+    #[test]
+    fn a_link_nobody_reads_is_reported_as_such_whatever_is_sent() {
+        let (out, control_rx, motion_rx) = outbound(8, 8);
+        drop(control_rx);
+        drop(motion_rx);
+        assert_eq!(out.send(ServerControl::MoveTo { x: 1, y: 1 }), Sent::Closed);
+        assert_eq!(out.send(enter()), Sent::Closed);
     }
 }

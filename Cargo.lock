@@ -2761,6 +2761,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "smkvm-clipboard",
  "smkvm-config",
  "smkvm-core",
  "smkvm-input",

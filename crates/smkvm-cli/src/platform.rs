@@ -10,6 +10,8 @@ use smkvm_core::Event;
 use smkvm_input::{Inject, Monitors};
 use tokio::sync::mpsc::Sender;
 
+use crate::clipboard::Backends;
+
 /// Open the backend that puts input on this machine's screen.
 pub fn injector() -> Result<Box<dyn InjectAndReport>> {
     #[cfg(windows)]
@@ -31,6 +33,45 @@ pub fn injector() -> Result<Box<dyn InjectAndReport>> {
 /// An injector that can also say what displays it has.
 pub trait InjectAndReport: Inject + Monitors + Send {}
 impl<T: Inject + Monitors + Send> InjectAndReport for T {}
+
+/// Open this machine's clipboard for watching, reading and offering.
+pub fn clipboard() -> Result<Backends> {
+    #[cfg(windows)]
+    {
+        let clipboard = smkvm_clipboard::platform::windows::WindowsClipboard::start()
+            .context("watching the clipboard")?;
+        let handle = clipboard.handle();
+        Ok(Backends {
+            watch: Box::new(clipboard),
+            read: Box::new(handle.clone()),
+            write: Box::new(handle),
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use smkvm_clipboard::platform::x11::{X11Clipboard, X11Writer};
+        // Three connections: one blocks waiting for changes, one answers
+        // pastes for as long as an offer stands, and one reads on demand.
+        // None of them can wait on another.
+        let writer = X11Writer::open().context("opening the display to offer the clipboard")?;
+        let mut watcher =
+            X11Clipboard::open().context("opening the display to watch the clipboard")?;
+        watcher.ignore_changes_by(writer.owner_window());
+        watcher
+            .watch()
+            .context("asking to be told of clipboard changes")?;
+        let reader = X11Clipboard::open().context("opening the display to read the clipboard")?;
+        Ok(Backends {
+            watch: Box::new(watcher),
+            read: Box::new(reader),
+            write: Box::new(writer),
+        })
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        bail!("this platform has no clipboard backend yet")
+    }
+}
 
 /// Start watching the local keyboard and mouse, feeding events to the server.
 ///

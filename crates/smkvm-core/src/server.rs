@@ -137,12 +137,15 @@ impl Default for Settings {
     }
 }
 
+/// How a connected machine stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Health {
+pub enum ClientHealth {
     Ready,
     /// Connected but unable to act on input, so the cursor must stay away.
     Suspended,
 }
+
+type Health = ClientHealth;
 
 /// A pointer pressed against an edge that it has not yet been allowed through.
 #[derive(Debug, Clone, PartialEq)]
@@ -308,6 +311,32 @@ impl Server {
 
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// Whether a machine is connected, and whether it can act on input.
+    /// `None` for a machine that is not connected, this one included.
+    pub fn client_health(&self, device: DeviceId) -> Option<ClientHealth> {
+        self.clients.get(&device).copied()
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+
+    /// Take a changed configuration into use without restarting.
+    ///
+    /// Placements are re-applied to every machine already known, the switching
+    /// behaviour changes at once, and the cursor is put somewhere real if the
+    /// screen it was on has moved from under it.
+    pub fn reconfigure(&mut self, placements: Vec<Placement>, settings: Settings) -> Vec<Action> {
+        self.settings = settings;
+        self.layout.edge_overflow = settings.edge_overflow;
+        self.pending = None;
+        self.last_tap = None;
+        self.set_placements(placements);
+        let mut out = Vec::new();
+        self.resettle(&mut out);
+        out
     }
 
     pub fn layout_mut(&mut self) -> &mut Layout {
