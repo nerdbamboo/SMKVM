@@ -55,9 +55,15 @@ pub trait Inject {
     /// reading, looking for all the world as though it were still theirs to
     /// move. The default does nothing, for backends with no way to do it.
     ///
-    /// Whatever this does, [`Inject::show_cursor`] must undo it. A backend
-    /// that overrides one and not the other leaves the person without a
-    /// pointer and no way to ask for it back.
+    /// Two rules, and the second is the one that saves people.
+    ///
+    /// [`Inject::show_cursor`] must undo whatever this does -- a backend that
+    /// overrides one and not the other leaves the pointer wherever hiding put
+    /// it, for good. But undoing is itself something that can fail, so it is
+    /// never the whole answer: nothing done here may be something the person
+    /// cannot undo for themselves. Moving the pointer is allowed, because
+    /// their own mouse brings it back. Confining it is not, and neither is
+    /// anything else that outlives this process without its cooperation.
     fn hide_cursor(&mut self) -> Result<()> {
         Ok(())
     }

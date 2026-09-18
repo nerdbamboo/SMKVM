@@ -453,11 +453,6 @@ impl Server {
     /// waits there. Leaving it where it was would make the screen feel like it
     /// ended early.
     fn stop_at_edge(&mut self, beyond: Point, out: &mut Vec<Action>) {
-        tracing::debug!(
-            at = ?(self.cursor.x, self.cursor.y),
-            wanted = ?(beyond.x, beyond.y),
-            "stopped at an edge"
-        );
         let cells = self.layout.cells();
         let mine: Vec<_> = cells.iter().filter(|c| c.device == self.active).collect();
         let Some(cell) = mine
@@ -469,8 +464,17 @@ impl Server {
         };
         let at = cell.global.clamp_point(beyond);
         if at == self.cursor {
+            // Already against the wall and still being pushed. Saying so again
+            // would be a line for every movement for as long as someone leans
+            // on the edge, which buries whatever the log was opened to find.
             return;
         }
+        tracing::debug!(
+            from = ?(self.cursor.x, self.cursor.y),
+            to = ?(at.x, at.y),
+            wanted = ?(beyond.x, beyond.y),
+            "stopped at an edge"
+        );
         self.cursor = at;
         if let Some(located) = self.layout.locate(at) {
             self.deliver_position(&located, out);

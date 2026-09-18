@@ -231,9 +231,14 @@ impl Inject for WindowsInput {
         // turned out not to take the cursor. Parking is recoverable; a cage is
         // not.
         //
-        // Recoverable only if the position it was taken from is kept, though,
-        // which is what `parked` is for: the corner is where the pointer goes,
-        // not where it belongs.
+        // Recoverable in two senses, and the weaker one is the one that
+        // actually holds. `parked` keeps the position this was taken from so
+        // [`Inject::show_cursor`] can put it back -- but that putting back is
+        // an injection like any other and can be refused, so it is a courtesy,
+        // not a guarantee. The guarantee is the one that matters: nothing here
+        // takes the pointer away from the person. It has been moved, not
+        // caged, so their own mouse brings it back whatever this program
+        // manages to do.
         let desk = virtual_desktop();
         if desk.is_empty() {
             return Ok(());
@@ -251,10 +256,28 @@ impl Inject for WindowsInput {
     }
 
     fn show_cursor(&mut self) -> Result<()> {
-        // Only the parking is undone. Windows has no desktop-wide hiding to
-        // reverse -- and a pointer hidden by whatever application is in front
-        // is that application's to show again, not this program's to wrestle
-        // for.
+        // Only the parking is undone, because on Windows that is all a
+        // different process can undo.
+        //
+        // The tempting extra is `ShowCursor(TRUE)` to force a pointer some
+        // other program hid. It does not work, and it fails quietly, which is
+        // worse. Measured on a machine whose pointer another KVM program was
+        // holding hidden:
+        //
+        //   * Called plainly, it counts up this thread's own queue -- the
+        //     first call returned 0, then 1, 2, 3, 4 -- and the desktop's
+        //     cursor never appeared. The display count belongs to a thread
+        //     input queue, not to the screen.
+        //   * Attached to the shell's queue with `AttachThreadInput`, the
+        //     first call returned -1, so that queue really was at -2 and the
+        //     other program really had driven it there. Raising it to 0 still
+        //     left the cursor hidden, because the program holding it down goes
+        //     on holding it down.
+        //
+        // So the loop everyone writes -- `while ShowCursor(TRUE) < 0 {}` --
+        // would exit immediately having achieved nothing, and report success.
+        // A pointer hidden by another program is that program's to show, and
+        // the answer is to close it.
         let Some((x, y)) = self.parked.restore() else {
             return Ok(());
         };
