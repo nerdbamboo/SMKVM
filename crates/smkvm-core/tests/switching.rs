@@ -526,3 +526,143 @@ fn a_machine_the_arrangement_does_not_mention_is_still_placed() {
     assert!(server.layout().unplaced().is_empty());
     assert!(server.layout().cells().iter().any(|c| c.device == stranger));
 }
+
+/// The arrangement this project was built for, with the second machine along
+/// the top configured but not switched on.
+fn desk_with_one_machine_missing() -> (Server, DeviceId, DeviceId) {
+    use smkvm_core::Placement;
+    use smkvm_layout::Rect;
+
+    let (win, desk) = (dev(1), dev(3));
+    let mut layout = Layout::new(EdgeOverflow::Clamp);
+    layout.report_monitors(
+        win,
+        "WIN-STUDY",
+        vec![Monitor {
+            id: "primary".into(),
+            local: Rect::new(0, 0, 1920, 1080),
+            scale: 1.0,
+            primary: true,
+            label: None,
+        }],
+    );
+    let mut server = Server::new(win, "WIN-STUDY", layout, Settings::default());
+    server.set_placements(vec![
+        Placement {
+            machine: "WIN-STUDY".into(),
+            monitor: Placement::PRIMARY.into(),
+            global: Rect::new(640, 0, 1920, 1080),
+        },
+        // Configured, and never connects.
+        Placement {
+            machine: "WIN-LAPTOP".into(),
+            monitor: Placement::PRIMARY.into(),
+            global: Rect::new(2560, 0, 1920, 1080),
+        },
+        Placement {
+            machine: "ubuntu-box".into(),
+            monitor: "DP-2".into(),
+            global: Rect::new(0, 1080, 2560, 1440),
+        },
+        Placement {
+            machine: "ubuntu-box".into(),
+            monitor: "DP-0".into(),
+            global: Rect::new(2560, 1080, 2560, 1440),
+        },
+    ]);
+    server.handle(
+        Event::ClientUp {
+            device: desk,
+            name: "ubuntu-box".into(),
+        },
+        now(),
+    );
+    server.handle(
+        Event::ClientMonitors {
+            device: desk,
+            monitors: vec![
+                Monitor::new("DP-2", Rect::new(0, 0, 2560, 1440)),
+                Monitor::new("DP-0", Rect::new(2560, 0, 2560, 1440)),
+            ],
+        },
+        now(),
+    );
+    (server, win, desk)
+}
+
+#[test]
+fn a_machine_that_is_not_here_leaves_a_wall_rather_than_a_gap() {
+    // The right-hand desktop monitor has a machine configured above it that
+    // is switched off. Pushing up there must stop, not slide the cursor
+    // sideways onto the machine above the *other* monitor -- which from the
+    // person's seat looks like the pointer leaping across the desk.
+    let (server, win, desk) = desk_with_one_machine_missing();
+
+    let m = server
+        .layout()
+        .resolve(Point::new(4000, 1085), 0, -50)
+        .unwrap();
+    assert_eq!(
+        m.located.device, desk,
+        "the cursor left the desktop for a machine that is not there"
+    );
+    assert!(m.adjusted, "it stopped at the edge");
+
+    // Further right still, past the absent machine's slot entirely.
+    let m = server
+        .layout()
+        .resolve(Point::new(5000, 1085), 0, -50)
+        .unwrap();
+    assert_eq!(m.located.device, desk);
+
+    // And the machine that *is* there remains reachable from beneath it.
+    let m = server
+        .layout()
+        .resolve(Point::new(1500, 1085), 0, -50)
+        .unwrap();
+    assert_eq!(m.located.device, win);
+    assert!(!m.adjusted, "straight up needs no adjusting");
+}
+
+#[test]
+fn the_wall_appears_when_a_machine_goes_and_lifts_when_it_returns() {
+    let (mut server, win, desk) = desk_with_one_machine_missing();
+    let absent = dev(2);
+
+    // With the second machine present, its space is its own.
+    server.handle(
+        Event::ClientUp {
+            device: absent,
+            name: "WIN-LAPTOP".into(),
+        },
+        now(),
+    );
+    server.handle(
+        Event::ClientMonitors {
+            device: absent,
+            monitors: vec![smkvm_layout::Monitor {
+                id: "primary".into(),
+                local: smkvm_layout::Rect::new(0, 0, 1920, 1080),
+                scale: 1.0,
+                primary: true,
+                label: None,
+            }],
+        },
+        now(),
+    );
+    let m = server
+        .layout()
+        .resolve(Point::new(4000, 1085), 0, -50)
+        .unwrap();
+    assert_eq!(m.located.device, absent, "it should be reachable now");
+
+    // And when it goes away again the wall comes back, rather than the cursor
+    // starting to leap to the machine beside it.
+    server.handle(Event::ClientDown { device: absent }, now());
+    let m = server
+        .layout()
+        .resolve(Point::new(4000, 1085), 0, -50)
+        .unwrap();
+    assert_eq!(m.located.device, desk);
+    assert_ne!(m.located.device, win);
+}

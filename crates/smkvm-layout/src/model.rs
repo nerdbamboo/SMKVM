@@ -256,6 +256,14 @@ pub struct Layout {
     /// losing where the user put it.
     #[serde(default)]
     placements: BTreeMap<String, Rect>,
+    /// Space that belongs to a screen which is not here at the moment.
+    ///
+    /// A machine that is configured but switched off leaves a hole, and a hole
+    /// is not the same as open space. Without this the cursor slides across
+    /// the gap onto whatever machine happens to be nearest, which from the far
+    /// side of a desk means it leaps somewhere else entirely.
+    #[serde(skip, default)]
+    reserved: Vec<Rect>,
 }
 
 fn key(device: DeviceId, monitor: &MonitorId) -> String {
@@ -268,7 +276,21 @@ impl Layout {
             edge_overflow,
             devices: Vec::new(),
             placements: BTreeMap::new(),
+            reserved: Vec::new(),
         }
+    }
+
+    /// Say which parts of the desktop belong to screens that are not here.
+    ///
+    /// Motion into one of these stops at the edge instead of sliding past, so
+    /// a machine being switched off leaves a wall where its screen was rather
+    /// than a shortcut to somewhere across the desk.
+    pub fn set_reserved(&mut self, rects: Vec<Rect>) {
+        self.reserved = rects.into_iter().filter(|r| !r.is_empty()).collect();
+    }
+
+    pub fn reserved(&self) -> &[Rect] {
+        &self.reserved
     }
 
     pub fn devices(&self) -> &[Device] {

@@ -9,7 +9,7 @@
 //! moved-to point simply falls inside a different rect. Only motion into empty
 //! space consults [`EdgeOverflow`].
 
-use crate::geom::{map_point, segment_exit, Dir, Point};
+use crate::geom::{map_point, segment_exit, Dir, Point, Rect};
 use crate::model::{Cell, EdgeOverflow, Layout, Located};
 
 /// The outcome of a pointer motion.
@@ -40,11 +40,15 @@ fn perp_dist((start, end): (i32, i32), coord: i32) -> i64 {
 
 /// Is `other` on the far side of `cur`'s edge in direction `dir`?
 fn is_beyond(cur: &Cell, other: &Cell, dir: Dir) -> bool {
+    is_beyond_rect(&cur.global, &other.global, dir)
+}
+
+fn is_beyond_rect(cur: &Rect, other: &Rect, dir: Dir) -> bool {
     match dir {
-        Dir::Up => other.global.bottom() <= cur.global.top(),
-        Dir::Down => other.global.top() >= cur.global.bottom(),
-        Dir::Left => other.global.right() <= cur.global.left(),
-        Dir::Right => other.global.left() >= cur.global.right(),
+        Dir::Up => other.bottom() <= cur.top(),
+        Dir::Down => other.top() >= cur.bottom(),
+        Dir::Left => other.right() <= cur.left(),
+        Dir::Right => other.left() >= cur.right(),
     }
 }
 
@@ -127,6 +131,12 @@ impl Layout {
             return Some(finish(cell, cand, cand, origin_device));
         }
 
+        // A screen that is configured but not here leaves a hole. Walking into
+        // one stops at its edge, because the alternative -- sliding on to
+        // whatever machine is nearest -- sends the cursor somewhere the person
+        // was not heading.
+        let into_a_hole = self.reserved().iter().any(|r| r.contains(cand));
+
         // The cursor is heading into empty space. Work out which edge of the
         // current monitor it left through.
         let cur_idx = cells
@@ -166,6 +176,11 @@ impl Layout {
             return Some(finish(cell, p, cand, origin_device));
         }
 
+        if into_a_hole {
+            let p = cur.global.clamp_point(cand);
+            return Some(finish(cur, p, cand, origin_device));
+        }
+
         match self.edge_overflow {
             EdgeOverflow::Block => {
                 let p = cur.global.clamp_point(cand);
@@ -175,12 +190,25 @@ impl Layout {
                 // Nothing lines up, so slide onto whichever monitor in this
                 // direction is closest to the exit point. This is what keeps
                 // the outer stretches of a wide screen from being dead ends.
+                let nearest_hole = self
+                    .reserved()
+                    .iter()
+                    .filter(|r| is_beyond_rect(&cur.global, r, dir))
+                    .map(|r| perp_dist(r.perp_span(dir), coord))
+                    .min();
                 let target = beyond.iter().min_by_key(|c| {
                     (
                         perp_dist(c.global.perp_span(dir), coord),
                         along_gap(cur, c, dir),
                     )
                 });
+                // A hole nearer than any live screen is the one in the way.
+                if let (Some(hole), Some(cell)) = (nearest_hole, target) {
+                    if hole < perp_dist(cell.global.perp_span(dir), coord) {
+                        let p = cur.global.clamp_point(cand);
+                        return Some(finish(cur, p, cand, origin_device));
+                    }
+                }
                 match target {
                     Some(cell) => {
                         let (s, e) = cell.global.perp_span(dir);

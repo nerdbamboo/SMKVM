@@ -225,6 +225,41 @@ impl Server {
             self.apply_placements(device);
         }
         self.layout.auto_place();
+        self.refresh_reserved();
+    }
+
+    /// Mark the space belonging to screens that are configured but not here.
+    ///
+    /// A machine that is switched off, or has not been set up yet, still has a
+    /// place on the desk. Leaving its space open makes the cursor slide across
+    /// it onto whatever machine is nearest, which from the far side of the
+    /// arrangement means it leaps somewhere the person was not heading. Marked
+    /// as spoken for, it is a wall instead -- which is what the empty space
+    /// looks like to the person sitting there.
+    fn refresh_reserved(&mut self) {
+        let live: Vec<(String, MonitorId)> = self
+            .layout
+            .cells()
+            .into_iter()
+            .filter_map(|cell| {
+                self.layout
+                    .device(cell.device)
+                    .map(|d| (d.name.clone(), cell.monitor))
+            })
+            .collect();
+
+        let mut holes = Vec::new();
+        for placement in &self.placements {
+            let filled = live.iter().any(|(machine, monitor)| {
+                *machine == placement.machine
+                    && (monitor.as_str() == placement.monitor
+                        || placement.monitor == Placement::PRIMARY)
+            });
+            if !filled {
+                holes.push(placement.global);
+            }
+        }
+        self.layout.set_reserved(holes);
     }
 
     /// Put this machine's monitors where the configuration says.
@@ -604,6 +639,7 @@ impl Server {
         self.layout.report_monitors(device, name, monitors);
         self.apply_placements(device);
         self.layout.auto_place();
+        self.refresh_reserved();
         for cell in self.layout.cells() {
             tracing::info!(
                 machine = %self.name_of(cell.device),
@@ -621,6 +657,7 @@ impl Server {
     fn client_down(&mut self, device: DeviceId, out: &mut Vec<Action>) {
         self.clients.remove(&device);
         self.layout.set_online(device, false);
+        self.refresh_reserved();
         if let Some(p) = &self.pending {
             if p.target == device {
                 self.pending = None;
