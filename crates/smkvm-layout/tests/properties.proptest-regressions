@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc df651f2bb5488fd6cad16e9aacaf393f41051a1924dddc60f01c4077cb81a398 # shrinks to layout = Layout { edge_overflow: Clamp, devices: [Device { id: DeviceId([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]), name: "machine-0", monitors: [Monitor { id: MonitorId("m0"), local: Rect { x: 0, y: 0, w: 320, h: 730 }, scale: 1.0, primary: false, label: None }, Monitor { id: MonitorId("m1"), local: Rect { x: 320, y: 0, w: 320, h: 240 }, scale: 1.0, primary: false, label: None }], online: true }, Device { id: DeviceId([2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]), name: "machine-1", monitors: [Monitor { id: MonitorId("m0"), local: Rect { x: 0, y: 0, w: 320, h: 366 }, scale: 1.0, primary: false, label: None }], online: true }], placements: {"0101010101010101010101010101010101010101010101010101010101010101/m0": Rect { x: 0, y: 0, w: 320, h: 730 }, "0101010101010101010101010101010101010101010101010101010101010101/m1": Rect { x: 320, y: 0, w: 320, h: 240 }, "0202020202020202020202020202020202020202020202020202020202020202/m0": Rect { x: 640, y: 0, w: 320, h: 366 }} }

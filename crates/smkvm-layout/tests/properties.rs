@@ -9,7 +9,7 @@ mod common;
 
 use common::dev;
 use proptest::prelude::*;
-use smkvm_layout::{EdgeOverflow, Layout, Monitor, Point, Rect};
+use smkvm_layout::{Dir, EdgeOverflow, Layout, Monitor, Point, Rect};
 
 /// One machine's monitors, tiled left to right in its own coordinate space,
 /// the way a real desktop arrangement reports them.
@@ -238,5 +238,56 @@ proptest! {
             x_overlap || y_overlap,
             "jumped from {a:?} to {b:?}, which do not face each other"
         );
+    }
+
+    /// An edge with a monitor squarely beyond it must be crossable from the
+    /// very last pixel of the screen.
+    ///
+    /// Landing on the boundary and being unable to go further is a dead end
+    /// the cursor cannot escape, because every further push resolves to the
+    /// position it is already at. Asserting only that the cursor stays on some
+    /// monitor does not catch it: standing still satisfies that perfectly.
+    #[test]
+    fn an_edge_pixel_is_never_a_dead_end(layout in any_layout()) {
+        let cells = layout.cells();
+        for cell in &cells {
+            for dir in [Dir::Left, Dir::Right, Dir::Up, Dir::Down] {
+                let mid_y = cell.global.y + cell.global.h / 2;
+                let mid_x = cell.global.x + cell.global.w / 2;
+                let (from, dx, dy) = match dir {
+                    Dir::Left => (Point::new(cell.global.left(), mid_y), -30, 0),
+                    Dir::Right => (Point::new(cell.global.right() - 1, mid_y), 30, 0),
+                    Dir::Up => (Point::new(mid_x, cell.global.top()), 0, -30),
+                    Dir::Down => (Point::new(mid_x, cell.global.bottom() - 1), 0, 30),
+                };
+
+                // Is there a monitor directly facing this edge?
+                let facing = cells.iter().any(|other| {
+                    if other.global == cell.global {
+                        return false;
+                    }
+                    let (s, e) = other.global.perp_span(dir);
+                    let coord = if dir.is_horizontal() { from.y } else { from.x };
+                    let beyond = match dir {
+                        Dir::Left => other.global.right() <= cell.global.left(),
+                        Dir::Right => other.global.left() >= cell.global.right(),
+                        Dir::Up => other.global.bottom() <= cell.global.top(),
+                        Dir::Down => other.global.top() >= cell.global.bottom(),
+                    };
+                    beyond && coord >= s && coord < e
+                });
+                if !facing {
+                    continue;
+                }
+
+                let m = layout.resolve(from, dx, dy).unwrap();
+                prop_assert!(
+                    m.global != from,
+                    "pushing {dir:?} from {from:?} on {:?} went nowhere, \
+                     though a monitor faces that edge",
+                    cell.global
+                );
+            }
+        }
     }
 }

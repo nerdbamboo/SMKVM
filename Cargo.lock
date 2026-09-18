@@ -463,6 +463,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smkvm-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "smkvm-layout",
+ "smkvm-proto",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "smkvm-input"
 version = "0.1.0"
 dependencies = [

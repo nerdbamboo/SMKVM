@@ -133,3 +133,47 @@ fn an_offline_machine_never_receives_the_cursor() {
     assert_ne!(m.located.device, dev(1));
     assert!(layout.locate(m.global).is_some());
 }
+
+#[test]
+fn a_cursor_resting_on_the_very_edge_can_still_cross() {
+    // Pushing outward from the last pixel of a screen must cross, not clamp
+    // back to where it already is. Getting this wrong pins the cursor at the
+    // boundary: it arrives at the edge and then nothing gets it any further.
+    //
+    // The push has to overshoot every monitor, so that the crossing is decided
+    // by working out which edge was left through. A short push lands inside
+    // the neighbour directly and never exercises that.
+    let layout = stacked_desks(EdgeOverflow::Clamp);
+
+    let edge = Point::new(1500, 1080);
+    assert_eq!(
+        layout.locate(edge).unwrap().device,
+        dev(3),
+        "on the top edge"
+    );
+    let m = layout.resolve(edge, 0, -5000).unwrap();
+    assert_eq!(m.located.device, dev(1), "stuck on the top edge");
+
+    // The same going sideways, from the last pixel of the left-hand monitor.
+    let seam = Point::new(2559, 1500);
+    let m = layout.resolve(seam, 9000, 0).unwrap();
+    assert_eq!(m.located.monitor, mid("DP-0"), "stuck on the seam");
+
+    // Repeating the push keeps making progress rather than settling into a
+    // position that resolves to itself.
+    let mut at = Point::new(1500, 1080);
+    let mut seen = vec![at];
+    for _ in 0..3 {
+        at = layout.resolve(at, 0, -5000).unwrap().global;
+        assert!(!seen.contains(&at) || seen.len() > 2, "went in a circle");
+        seen.push(at);
+    }
+    assert_eq!(layout.locate(at).unwrap().device, dev(1));
+
+    // An edge with genuinely nothing beyond it does stay put, which is the
+    // behaviour the case above must not be confused with.
+    let right = Point::new(5119, 1500);
+    let m = layout.resolve(right, 40, 0).unwrap();
+    assert_eq!(m.global, right);
+    assert!(m.adjusted);
+}

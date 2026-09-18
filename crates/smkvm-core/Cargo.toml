@@ -1,0 +1,18 @@
+[package]
+name = "smkvm-core"
+description = "The server and client state machines that decide where the cursor is"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smkvm-layout = { path = "../smkvm-layout" }
+smkvm-proto = { path = "../smkvm-proto" }
+thiserror = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"

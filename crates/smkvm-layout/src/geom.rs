@@ -203,7 +203,12 @@ pub fn segment_exit(rect: &Rect, from: Point, to: Point) -> Option<Exit> {
     // a diagonal exit through a corner is attributed to the dominant motion.
     let mut best: Option<(f64, Dir)> = None;
     let mut consider = |t: f64, dir: Dir, travel: f64| {
-        if !(t > 0.0 && t <= 1.0) || !t.is_finite() {
+        // Zero counts. A cursor already resting on the last pixel of an edge
+        // and pushed further crosses at t = 0, and excluding that would pin it
+        // there: every subsequent push would clamp back to where it already
+        // is. The direction guards below mean t = 0 can only arise for the
+        // edge actually being travelled towards.
+        if !(0.0..=1.0).contains(&t) || !t.is_finite() {
             return;
         }
         match best {
