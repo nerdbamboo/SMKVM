@@ -10,7 +10,7 @@ mod table;
 
 use smkvm_proto::Key;
 
-pub use table::HID_TO_EVDEV;
+pub use table::{HID_TO_EVDEV, HID_TO_SCANCODE};
 
 /// The Linux keycode for a HID usage.
 pub fn hid_to_evdev(key: Key) -> Option<u16> {
@@ -40,6 +40,19 @@ pub fn evdev_to_hid(code: u16) -> Option<Key> {
 pub fn hid_to_x11_keycode(key: Key) -> Option<u8> {
     let code = hid_to_evdev(key)?;
     u8::try_from(code + 8).ok()
+}
+
+/// The PS/2 set 1 scan code for a HID usage, as Windows wants it.
+///
+/// A value of `0xE0xx` is sent with the extended prefix. Usages with no
+/// established scan code return `None` and are refused: a key that will not
+/// press is a visible failure, where a guessed code silently types something
+/// else.
+pub fn hid_to_scancode(key: Key) -> Option<u16> {
+    HID_TO_SCANCODE
+        .binary_search_by_key(&key.0, |(usage, _)| *usage)
+        .ok()
+        .map(|i| HID_TO_SCANCODE[i].1)
 }
 
 /// The HID usage for an X11 keycode.
@@ -105,5 +118,55 @@ mod tests {
                 "usage {usage:#06x} maps to keycode {code}, which X11 cannot express"
             );
         }
+    }
+
+    #[test]
+    fn every_modifier_has_a_scan_code_too() {
+        for key in Key::MODIFIERS {
+            assert!(hid_to_scancode(key).is_some(), "{key:?} has no scan code");
+        }
+    }
+
+    #[test]
+    fn the_scancode_table_is_sorted_too() {
+        assert!(HID_TO_SCANCODE.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn the_two_tables_agree_where_the_numbering_is_shared() {
+        // Below 0x59 the kernel's AT keyboard driver maps set 1 straight
+        // through, so a key's Linux code and its scan code are the same
+        // number. Anywhere the two tables disagree there, one of them is
+        // wrong -- which is the point of generating both from one source.
+        for (usage, evdev) in HID_TO_EVDEV {
+            let Some(scan) = hid_to_scancode(Key(usage)) else {
+                continue;
+            };
+            if scan & 0xFF00 == 0 && evdev <= 0x58 {
+                assert_eq!(
+                    scan, evdev,
+                    "usage {usage:#06x}: scan code {scan:#x} but Linux code {evdev}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extended_keys_carry_the_prefix() {
+        // Right-hand modifiers and the navigation block are sent with 0xE0.
+        for key in [Key::RIGHT_CTRL, Key::RIGHT_ALT, Key(0x4A), Key(0x52)] {
+            let scan = hid_to_scancode(key).unwrap();
+            assert_eq!(scan & 0xFF00, 0xE000, "{key:?} is {scan:#x}");
+        }
+        // The left-hand ones are not.
+        assert_eq!(hid_to_scancode(Key::LEFT_CTRL).unwrap(), 0x1D);
+    }
+
+    #[test]
+    fn a_key_with_no_established_scan_code_is_refused() {
+        // Pause needs a two-byte prefix this does not express, and the upper
+        // function keys have no settled code. Better refused than wrong.
+        assert_eq!(hid_to_scancode(Key(0x48)), None, "Pause");
+        assert_eq!(hid_to_scancode(Key(0x68)), None, "F13");
     }
 }

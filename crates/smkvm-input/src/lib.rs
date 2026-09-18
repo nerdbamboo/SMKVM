@@ -9,7 +9,10 @@
 //! the cursor moves to another machine, or a link that drops mid-chord, leaves
 //! a key down forever unless something knows what it pressed and lets go.
 
-#![forbid(unsafe_code)]
+// Talking to a platform's input APIs means calling into them, which is the one
+// place unsafe is unavoidable. It is confined to the platform backends; every
+// other module is held to the same rule this crate started with.
+#![deny(unsafe_code)]
 
 pub mod keymap;
 pub mod platform;

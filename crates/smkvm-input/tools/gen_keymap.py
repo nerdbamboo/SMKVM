@@ -88,6 +88,55 @@ def load_header(path):
     return codes
 
 
+# Linux keycode -> PS/2 scan code set 1, for keys whose value differs.
+#
+# For the main block the two numbering schemes agree: the kernel's AT keyboard
+# driver maps set-1 codes 0x01..0x58 straight through, so KEY_A is 30 and the
+# scan code is 0x1E. Only the keys that arrived later, and are sent with an
+# 0xE0 prefix, need stating.
+#
+# A key that is not listed and not in that range gets no mapping at all rather
+# than a guess. An unmapped key refuses to be pressed, which is a visible
+# failure; a wrong scan code silently types something else.
+EXTENDED = {
+    "KEY_KPENTER":    0xE01C,
+    "KEY_RIGHTCTRL":  0xE01D,
+    "KEY_KPSLASH":    0xE035,
+    "KEY_SYSRQ":      0xE037,
+    "KEY_RIGHTALT":   0xE038,
+    "KEY_HOME":       0xE047,
+    "KEY_UP":         0xE048,
+    "KEY_PAGEUP":     0xE049,
+    "KEY_LEFT":       0xE04B,
+    "KEY_RIGHT":      0xE04D,
+    "KEY_END":        0xE04F,
+    "KEY_DOWN":       0xE050,
+    "KEY_PAGEDOWN":   0xE051,
+    "KEY_INSERT":     0xE052,
+    "KEY_DELETE":     0xE053,
+    "KEY_MUTE":       0xE020,
+    "KEY_VOLUMEDOWN": 0xE02E,
+    "KEY_VOLUMEUP":   0xE030,
+    "KEY_POWER":      0xE05E,
+    "KEY_LEFTMETA":   0xE05B,
+    "KEY_RIGHTMETA":  0xE05C,
+    "KEY_COMPOSE":    0xE05D,
+    "KEY_KPEQUAL":    0x0059,
+}
+
+# The top of the range the two schemes share.
+SHARED_MAX = 0x58
+
+
+def scan_code(name, code):
+    """The set-1 scan code for a Linux keycode, or None if not established."""
+    if name in EXTENDED:
+        return EXTENDED[name]
+    if 1 <= code <= SHARED_MAX:
+        return code
+    return None
+
+
 def main():
     codes = load_header(HEADER)
     missing = sorted({n for n in USAGES.values() if n not in codes})
@@ -105,6 +154,26 @@ def main():
     for usage, name, code in rows:
         print(f"    (0x{usage:04X}, {code}), // {name}")
     print("];")
+    print()
+
+    scans = [(u, n, scan_code(n, c)) for u, n, c in rows]
+    known = [(u, n, s) for u, n, s in scans if s is not None]
+    print("/// `(HID usage, PS/2 set 1 scan code)`, sorted by usage.")
+    print("///")
+    print("/// A code of `0xE0xx` is sent with the extended prefix. Usages")
+    print("/// absent from this table have no established scan code and are")
+    print("/// refused rather than guessed at.")
+    print(f"pub const HID_TO_SCANCODE: [(u16, u16); {len(known)}] = [")
+    for usage, name, code in known:
+        print(f"    (0x{usage:04X}, 0x{code:04X}), // {name}")
+    print("];")
+
+    missing = [n for _, n, s in scans if s is None]
+    if missing:
+        print()
+        print("// Deliberately unmapped, for want of an established scan code:")
+        for name in missing:
+            print(f"//   {name}")
 
 
 if __name__ == "__main__":
