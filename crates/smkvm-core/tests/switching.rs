@@ -406,3 +406,123 @@ fn a_machine_arriving_is_told_to_let_go_of_everything() {
     );
     assert_eq!(sent_to(&actions, newcomer), vec![ServerControl::ReleaseAll]);
 }
+
+#[test]
+fn the_configured_arrangement_is_used_where_it_applies() {
+    use smkvm_core::Placement;
+    use smkvm_layout::Rect;
+
+    let (local, client) = (dev(1), dev(2));
+    let mut layout = Layout::new(EdgeOverflow::Clamp);
+    layout.report_monitors(
+        local,
+        "server",
+        vec![Monitor {
+            id: "\\\\?\\DISPLAY#LONG#PATH".into(),
+            local: Rect::new(0, 0, 1920, 1080),
+            scale: 1.0,
+            primary: true,
+            label: None,
+        }],
+    );
+    let mut server = Server::new(local, "server", layout, Settings::default());
+
+    // The machine underneath is placed by name; the one above is named by
+    // `primary`, because its own identifier is a device path nobody would
+    // want to write down.
+    server.set_placements(vec![
+        Placement {
+            machine: "server".into(),
+            monitor: Placement::PRIMARY.into(),
+            global: Rect::new(640, 0, 1920, 1080),
+        },
+        Placement {
+            machine: "desk".into(),
+            monitor: "DP-2".into(),
+            global: Rect::new(0, 1080, 2560, 1440),
+        },
+        Placement {
+            machine: "desk".into(),
+            monitor: "DP-0".into(),
+            global: Rect::new(2560, 1080, 2560, 1440),
+        },
+    ]);
+
+    server.handle(
+        Event::ClientUp {
+            device: client,
+            name: "desk".into(),
+        },
+        now(),
+    );
+    server.handle(
+        Event::ClientMonitors {
+            device: client,
+            monitors: vec![
+                Monitor::new("DP-2", Rect::new(0, 0, 2560, 1440)),
+                Monitor::new("DP-0", Rect::new(2560, 0, 2560, 1440)),
+            ],
+        },
+        now(),
+    );
+
+    let at = |device, monitor: &str| {
+        server
+            .layout()
+            .placement(device, &monitor.into())
+            .unwrap_or_else(|| panic!("{monitor} was never placed"))
+    };
+    assert_eq!(
+        at(local, "\\\\?\\DISPLAY#LONG#PATH"),
+        Rect::new(640, 0, 1920, 1080)
+    );
+    assert_eq!(at(client, "DP-2"), Rect::new(0, 1080, 2560, 1440));
+    assert_eq!(at(client, "DP-0"), Rect::new(2560, 1080, 2560, 1440));
+
+    // And the arrangement behaves: straight up from the left-hand desktop
+    // monitor reaches the machine above it.
+    let m = server
+        .layout()
+        .resolve(Point::new(1500, 1085), 0, -10)
+        .unwrap();
+    assert_eq!(m.located.device, local);
+}
+
+#[test]
+fn a_machine_the_arrangement_does_not_mention_is_still_placed() {
+    use smkvm_core::Placement;
+    use smkvm_layout::Rect;
+
+    let (local, stranger) = (dev(1), dev(5));
+    let mut layout = Layout::new(EdgeOverflow::Clamp);
+    layout.report_monitors(
+        local,
+        "server",
+        vec![Monitor::new("m0", Rect::new(0, 0, 1920, 1080))],
+    );
+    let mut server = Server::new(local, "server", layout, Settings::default());
+    server.set_placements(vec![Placement {
+        machine: "server".into(),
+        monitor: "m0".into(),
+        global: Rect::new(0, 0, 1920, 1080),
+    }]);
+
+    server.handle(
+        Event::ClientUp {
+            device: stranger,
+            name: "laptop".into(),
+        },
+        now(),
+    );
+    server.handle(
+        Event::ClientMonitors {
+            device: stranger,
+            monitors: vec![Monitor::new("eDP-1", Rect::new(0, 0, 1920, 1200))],
+        },
+        now(),
+    );
+
+    // A half-written layout must still leave every screen reachable.
+    assert!(server.layout().unplaced().is_empty());
+    assert!(server.layout().cells().iter().any(|c| c.device == stranger));
+}

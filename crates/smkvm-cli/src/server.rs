@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use smkvm_core::{Action, Event, LocalAction, PointerMode, Server, Settings};
+use smkvm_core::{Action, Event, LocalAction, Placement, PointerMode, Server, Settings};
 use smkvm_input::Inject;
 use smkvm_layout::DeviceId;
 use smkvm_net::identity::Identity;
@@ -50,7 +50,34 @@ pub async fn run(
     let mut injector = platform::injector()?;
     let capture = platform::start_capture(events_tx.clone())?;
 
-    let mut server = Server::new(identity.id(), config.identity.name.clone(), layout, settings);
+    let mut server = Server::new(
+        identity.id(),
+        config.identity.name.clone(),
+        layout,
+        settings,
+    );
+
+    // The arrangement from the configuration, applied as machines appear.
+    // Anything it does not mention is placed automatically, so a half-written
+    // layout still leaves every screen reachable.
+    let placements: Vec<Placement> = config
+        .screen
+        .iter()
+        .flat_map(|screen| {
+            screen.monitor.iter().map(|monitor| Placement {
+                machine: screen.name.clone(),
+                monitor: monitor.id.clone(),
+                global: monitor.rect(),
+            })
+        })
+        .collect();
+    if !placements.is_empty() {
+        info!(
+            count = placements.len(),
+            "using the arrangement from the configuration"
+        );
+    }
+    server.set_placements(placements);
     // This machine's own displays, so it has a place on the desktop.
     let monitors = injector
         .monitors()

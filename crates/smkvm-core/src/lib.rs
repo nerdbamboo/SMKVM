@@ -17,4 +17,4 @@ mod client;
 mod server;
 
 pub use client::{Client, ClientAction};
-pub use server::{Action, Event, LocalAction, PointerMode, Server, Settings};
+pub use server::{Action, Event, LocalAction, Placement, PointerMode, Server, Settings};
