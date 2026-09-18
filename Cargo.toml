@@ -7,6 +7,7 @@ members = [
     "crates/smkvm-input",
     "crates/smkvm-core",
     "crates/smkvm-net",
+    "crates/smkvm-cli",
 ]
 
 [workspace.package]

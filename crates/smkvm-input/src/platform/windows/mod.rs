@@ -11,7 +11,8 @@ use smkvm_layout::{Monitor, Rect};
 use smkvm_proto::{Key, MouseButton, Scroll};
 use windows::Win32::Foundation::{BOOL, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -22,8 +23,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
 use crate::keymap::hid_to_scancode;
@@ -229,13 +230,11 @@ unsafe extern "system" fn collect(
     }
 
     let r = info.monitorInfo.rcMonitor;
-    let name = String::from_utf16_lossy(&info.szDevice)
+    let adapter = String::from_utf16_lossy(&info.szDevice)
         .trim_end_matches('\0')
         .to_string();
     collector.monitors.push(Monitor {
-        // The device name is stable across restarts for a given port, which is
-        // what placements are keyed on.
-        id: name.into(),
+        id: stable_id(&info.szDevice).unwrap_or(adapter).into(),
         local: Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top),
         scale: 1.0,
         primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
@@ -271,6 +270,40 @@ impl Monitors for WindowsInput {
         }
         Ok(collector.monitors)
     }
+}
+
+/// A name for a monitor that survives being unplugged and plugged back in.
+///
+/// The obvious name, `\\.\DISPLAY3`, is a slot number: it depends on the order
+/// displays were detected and shifts when one is added or removed. Placements
+/// are keyed on this, so using it would quietly move a monitor's position on
+/// the global desktop whenever Windows renumbered it.
+///
+/// The device interface path contains the monitor's own hardware identity and
+/// the port it is on, so it stays put.
+fn stable_id(adapter: &[u16; 32]) -> Option<String> {
+    let mut device = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: both arguments are correctly sized and live for the call.
+    let ok = unsafe {
+        EnumDisplayDevicesW(
+            windows::core::PCWSTR(adapter.as_ptr()),
+            0,
+            &mut device,
+            EDD_GET_DEVICE_INTERFACE_NAME,
+        )
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let id = String::from_utf16_lossy(&device.DeviceID);
+    let id = id.trim_end_matches('\0').trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 /// Where the pointer is now, in desktop coordinates.

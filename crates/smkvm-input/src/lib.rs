@@ -54,6 +54,32 @@ pub trait Monitors {
     fn monitors(&mut self) -> Result<Vec<smkvm_layout::Monitor>>;
 }
 
+// A backend chosen at run time arrives in a box, and a box should be as usable
+// as the thing inside it.
+impl<T: Inject + ?Sized> Inject for Box<T> {
+    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        (**self).move_to(x, y)
+    }
+    fn button(&mut self, button: MouseButton, down: bool) -> Result<()> {
+        (**self).button(button, down)
+    }
+    fn wheel(&mut self, scroll: Scroll) -> Result<()> {
+        (**self).wheel(scroll)
+    }
+    fn key(&mut self, key: Key, down: bool) -> Result<()> {
+        (**self).key(key, down)
+    }
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+}
+
+impl<T: Monitors + ?Sized> Monitors for Box<T> {
+    fn monitors(&mut self) -> Result<Vec<smkvm_layout::Monitor>> {
+        (**self).monitors()
+    }
+}
+
 /// An injector that remembers what it has pressed.
 ///
 /// Every press and release goes through here, so at any moment the set of keys

@@ -1,0 +1,26 @@
+[package]
+name = "smkvm-cli"
+description = "The smkvm command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "smkvm"
+path = "src/main.rs"
+
+[dependencies]
+smkvm-layout = { path = "../smkvm-layout" }
+smkvm-proto = { path = "../smkvm-proto" }
+smkvm-config = { path = "../smkvm-config" }
+smkvm-input = { path = "../smkvm-input" }
+smkvm-core = { path = "../smkvm-core" }
+smkvm-net = { path = "../smkvm-net" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

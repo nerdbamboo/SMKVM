@@ -150,38 +150,38 @@ impl SecureWriter {
     /// Encrypt and send. Payloads too large for one record are split; the far
     /// side sees a byte stream either way.
     pub async fn send(&mut self, plaintext: &[u8]) -> Result<()> {
-        let mut chunks = plaintext.chunks(MAX_NOISE_PAYLOAD);
-        // An empty payload still deserves one record, so that a caller sending
-        // nothing does not silently send nothing at all.
-        let empty = [][..].into();
-        let mut once = std::iter::once(empty);
-        let iter: &mut dyn Iterator<Item = &[u8]> = if plaintext.is_empty() {
-            &mut once
+        if plaintext.is_empty() {
+            // An empty payload still deserves one record, so that a caller
+            // sending nothing does not silently send nothing at all.
+            self.record(&[]).await?;
         } else {
-            &mut chunks
-        };
-
-        for chunk in iter {
-            let n = self
-                .cipher
-                .0
-                .write_message(self.nonce, chunk, &mut self.scratch)
-                .map_err(Error::Crypto)?;
-            self.nonce += 1;
-            let len = u16::try_from(n).map_err(|_| Error::MessageTooLarge {
-                len: n,
-                max: u16::MAX as usize,
-            })?;
-            self.writer
-                .write_all(&len.to_le_bytes())
-                .await
-                .map_err(|_| Error::Disconnected)?;
-            self.writer
-                .write_all(&self.scratch[..n])
-                .await
-                .map_err(|_| Error::Disconnected)?;
+            for chunk in plaintext.chunks(MAX_NOISE_PAYLOAD) {
+                self.record(chunk).await?;
+            }
         }
         self.writer.flush().await.map_err(|_| Error::Disconnected)?;
+        Ok(())
+    }
+
+    async fn record(&mut self, chunk: &[u8]) -> Result<()> {
+        let n = self
+            .cipher
+            .0
+            .write_message(self.nonce, chunk, &mut self.scratch)
+            .map_err(Error::Crypto)?;
+        self.nonce += 1;
+        let len = u16::try_from(n).map_err(|_| Error::MessageTooLarge {
+            len: n,
+            max: u16::MAX as usize,
+        })?;
+        self.writer
+            .write_all(&len.to_le_bytes())
+            .await
+            .map_err(|_| Error::Disconnected)?;
+        self.writer
+            .write_all(&self.scratch[..n])
+            .await
+            .map_err(|_| Error::Disconnected)?;
         Ok(())
     }
 

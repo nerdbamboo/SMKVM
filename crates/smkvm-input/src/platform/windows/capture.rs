@@ -185,16 +185,19 @@ fn button(button: MouseButton, down: bool) {
     emit(Captured::Button { button, down });
 }
 
-/// A running capture, and the events it produces.
+/// A running capture.
+///
+/// The events it produces come back on a separate channel rather than through
+/// here, so the thread that consumes them and the code that decides whether to
+/// swallow input need not be the same one.
 pub struct Capture {
-    events: Receiver<Captured>,
     thread_id: u32,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Capture {
     /// Install the hooks on a thread of their own and start delivering events.
-    pub fn start() -> Result<Capture> {
+    pub fn start() -> Result<(Capture, Receiver<Captured>)> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
 
@@ -204,11 +207,13 @@ impl Capture {
             .map_err(|e| InputError::Display(format!("could not start the capture thread: {e}")))?;
 
         match ready_rx.recv() {
-            Ok(Ok(thread_id)) => Ok(Capture {
-                events: rx,
-                thread_id,
-                handle: Some(handle),
-            }),
+            Ok(Ok(thread_id)) => Ok((
+                Capture {
+                    thread_id,
+                    handle: Some(handle),
+                },
+                rx,
+            )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(InputError::Display(
                 "the capture thread stopped before it started".into(),
@@ -223,16 +228,6 @@ impl Capture {
     /// longer acts on them.
     pub fn set_swallow(&self, swallow: bool) {
         SWALLOW.store(swallow, Ordering::Relaxed);
-    }
-
-    /// Take the next event, waiting for one.
-    pub fn recv(&self) -> Option<Captured> {
-        self.events.recv().ok()
-    }
-
-    /// Take an event if one is waiting.
-    pub fn try_recv(&self) -> Option<Captured> {
-        self.events.try_recv().ok()
     }
 
     /// Which mouse buttons the system says are down.
