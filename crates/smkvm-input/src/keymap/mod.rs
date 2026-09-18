@@ -55,6 +55,34 @@ pub fn hid_to_scancode(key: Key) -> Option<u16> {
         .map(|i| HID_TO_SCANCODE[i].1)
 }
 
+/// The modifier a Windows virtual key stands for, if it is one.
+///
+/// Modifiers are the one group of keys worth identifying this way. Windows
+/// names the left and right of each pair unambiguously in a low-level hook,
+/// whereas their scan codes are not agreed on: keyboards exist that report the
+/// right shift with the extended prefix and ones that do not, and a table can
+/// only hold one of those.
+///
+/// It also settles a second problem. When a number-pad key is used with
+/// NumLock on, Windows manufactures shift presses around it, and those carry
+/// the same extended scan codes a real right shift might. They arrive as the
+/// undifferentiated `VK_SHIFT` rather than a side, so declining to recognise
+/// that keeps a manufactured shift from being passed on as a real one -- which
+/// would turn an Insert into a Shift+Insert on the far machine.
+pub fn vk_to_modifier(virtual_key: u16) -> Option<Key> {
+    Some(match virtual_key {
+        0xA0 => Key::LEFT_SHIFT,
+        0xA1 => Key::RIGHT_SHIFT,
+        0xA2 => Key::LEFT_CTRL,
+        0xA3 => Key::RIGHT_CTRL,
+        0xA4 => Key::LEFT_ALT,
+        0xA5 => Key::RIGHT_ALT,
+        0x5B => Key::LEFT_META,
+        0x5C => Key::RIGHT_META,
+        _ => return None,
+    })
+}
+
 /// The HID usage for a PS/2 set 1 scan code.
 ///
 /// The reverse of [`hid_to_scancode`], for turning what a keyboard hook
@@ -179,5 +207,47 @@ mod tests {
         // function keys have no settled code. Better refused than wrong.
         assert_eq!(hid_to_scancode(Key(0x48)), None, "Pause");
         assert_eq!(hid_to_scancode(Key(0x68)), None, "F13");
+    }
+
+    #[test]
+    fn each_side_of_a_modifier_is_told_from_the_other() {
+        assert_eq!(vk_to_modifier(0xA0), Some(Key::LEFT_SHIFT));
+        assert_eq!(vk_to_modifier(0xA1), Some(Key::RIGHT_SHIFT));
+        assert_eq!(vk_to_modifier(0xA2), Some(Key::LEFT_CTRL));
+        assert_eq!(vk_to_modifier(0xA3), Some(Key::RIGHT_CTRL));
+        assert_eq!(vk_to_modifier(0xA4), Some(Key::LEFT_ALT));
+        assert_eq!(vk_to_modifier(0xA5), Some(Key::RIGHT_ALT));
+        assert_eq!(vk_to_modifier(0x5B), Some(Key::LEFT_META));
+        assert_eq!(vk_to_modifier(0x5C), Some(Key::RIGHT_META));
+    }
+
+    #[test]
+    fn an_undifferentiated_modifier_is_not_recognised() {
+        // VK_SHIFT, VK_CONTROL and VK_MENU name no side. A real press always
+        // names one, so these come from the shift presses Windows manufactures
+        // around the number pad -- passing those on would turn an Insert into
+        // a Shift+Insert on the far machine.
+        assert_eq!(vk_to_modifier(0x10), None, "VK_SHIFT");
+        assert_eq!(vk_to_modifier(0x11), None, "VK_CONTROL");
+        assert_eq!(vk_to_modifier(0x12), None, "VK_MENU");
+    }
+
+    #[test]
+    fn ordinary_keys_are_left_to_their_scan_codes() {
+        // Letters and digits must not go through the virtual key, which is
+        // translated through whatever layout is active. Only modifiers, whose
+        // virtual keys mean the same everywhere, are identified this way.
+        for vk in [0x41u16, 0x5A, 0x30, 0x39, 0x70, 0x1B, 0x20] {
+            assert_eq!(vk_to_modifier(vk), None, "{vk:#04x}");
+        }
+    }
+
+    #[test]
+    fn every_modifier_is_reachable_from_a_virtual_key() {
+        let mut found: Vec<Key> = (0u16..=0xFF).filter_map(vk_to_modifier).collect();
+        found.sort();
+        let mut expected = Key::MODIFIERS.to_vec();
+        expected.sort();
+        assert_eq!(found, expected);
     }
 }

@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
 };
 
-use crate::keymap::scancode_to_hid;
+use crate::keymap::{scancode_to_hid, vk_to_modifier};
 use crate::platform::windows::is_ours;
 use crate::{InputError, Result};
 
@@ -119,15 +119,43 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         info.scanCode & 0xFF
     };
 
-    if let Some(key) = scancode_to_hid(scan as u16) {
-        emit(Captured::Key {
-            key,
-            down,
-            // The hook gives no repeat flag, so a press of a key already held
-            // is what a repeat looks like. Working that out belongs with the
-            // state that knows what is held, not here.
-            repeat: false,
-        });
+    // Modifiers are identified by their virtual key, everything else by its
+    // scan code. Keyboards do not agree on the scan codes for the right-hand
+    // modifiers -- this was found on one that sends the right shift with the
+    // extended prefix, which a scan code table has no room to express both
+    // ways -- whereas Windows names each side unambiguously here. Ordinary
+    // keys keep to scan codes, since their virtual keys depend on the layout.
+    let identified = vk_to_modifier(info.vkCode as u16).or_else(|| scancode_to_hid(scan as u16));
+
+    match identified {
+        Some(key) => {
+            tracing::debug!(
+                usage = format_args!("{:#06x}", key.0),
+                scan = format_args!("{scan:#06x}"),
+                vk = format_args!("{:#04x}", info.vkCode),
+                down,
+                "key"
+            );
+            emit(Captured::Key {
+                key,
+                down,
+                // The hook gives no repeat flag, so a press of a key already
+                // held is what a repeat looks like. Working that out belongs
+                // with the state that knows what is held, not here.
+                repeat: false,
+            });
+        }
+        // A key with no mapping does nothing at all on the far machine, and
+        // says nothing about why. Keyboards differ in what they report, so
+        // this is how an unexpected one gets noticed rather than shrugged off.
+        None if down => tracing::warn!(
+            scan = format_args!("{scan:#06x}"),
+            raw = format_args!("{:#06x}", info.scanCode),
+            vk = format_args!("{:#04x}", info.vkCode),
+            extended,
+            "a key was pressed that this does not know how to send"
+        ),
+        None => {}
     }
 
     if SWALLOW.load(Ordering::Relaxed) {
