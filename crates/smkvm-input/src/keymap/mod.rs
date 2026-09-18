@@ -55,6 +55,17 @@ pub fn hid_to_scancode(key: Key) -> Option<u16> {
         .map(|i| HID_TO_SCANCODE[i].1)
 }
 
+/// The HID usage for a PS/2 set 1 scan code.
+///
+/// The reverse of [`hid_to_scancode`], for turning what a keyboard hook
+/// reports back into something that crosses the wire.
+pub fn scancode_to_hid(scan: u16) -> Option<Key> {
+    HID_TO_SCANCODE
+        .iter()
+        .find(|(_, code)| *code == scan)
+        .map(|(usage, _)| Key(*usage))
+}
+
 /// The HID usage for an X11 keycode.
 pub fn x11_keycode_to_hid(keycode: u8) -> Option<Key> {
     evdev_to_hid(u16::from(keycode).checked_sub(8)?)

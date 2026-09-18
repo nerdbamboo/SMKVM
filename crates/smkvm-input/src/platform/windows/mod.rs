@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::keymap::hid_to_scancode;
 use crate::{Inject, InputError, Monitors, Result};
 
+pub mod capture;
 pub mod desktop;
 
 /// Stamped on every event this process injects.
