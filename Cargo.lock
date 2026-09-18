@@ -1017,6 +1017,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smkvm-clipboard"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "smkvm-proto",
+ "thiserror",
+ "tracing",
+ "x11rb",
+]
+
+[[package]]
 name = "smkvm-config"
 version = "0.1.0"
 dependencies = [
