@@ -330,3 +330,29 @@ fn a_trust_store_whose_identifier_does_not_match_its_key_is_refused() {
         "a tampered store was accepted: {result:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_machine_that_answers_and_then_says_nothing_does_not_hold_the_link() {
+    // A firewall that drops packets rather than refusing them, or a peer that
+    // accepts a connection and stalls, would otherwise leave the caller
+    // waiting for ever -- and reconnect logic never runs, because the first
+    // attempt has not finished failing.
+    let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let (peer_b, _) = pair(&a, &b).await;
+
+    let (l, addr) = listener().await;
+    let silent = async {
+        let (socket, _) = l.accept().await.unwrap();
+        // Hold it open and say nothing at all.
+        std::future::pending::<()>().await;
+        drop(socket);
+    };
+    let caller = async { Session::connect(addr, &a, &peer_b).await };
+
+    tokio::select! {
+        result = caller => {
+            assert!(result.is_err(), "a silent peer produced a session");
+        }
+        _ = silent => unreachable!("the silent side never finishes"),
+    }
+}

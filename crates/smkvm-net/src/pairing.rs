@@ -10,6 +10,7 @@
 //! to each other and not through anybody.
 
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::time::timeout;
 
 use crate::identity::{device_id, Identity};
 use crate::stream::{read_framed, split, write_framed, SecureReader, SecureWriter};
@@ -103,7 +104,15 @@ impl Pairing {
         identity: &Identity,
         my_name: &str,
     ) -> Result<Pairing> {
-        let stream = TcpStream::connect(addr).await.map_err(|source| Error::Io {
+        // As for an ordinary session: somewhere unreachable must fail rather
+        // than leave the person waiting with nothing to look at.
+        let stream = timeout(
+            crate::session::Session::CONNECT_TIMEOUT,
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| Error::Disconnected)?
+        .map_err(|source| Error::Io {
             path: Default::default(),
             source,
         })?;

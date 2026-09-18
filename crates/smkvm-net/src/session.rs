@@ -12,7 +12,10 @@
 //! afterwards turned away.
 
 use smkvm_layout::DeviceId;
+use std::time::Duration;
+
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::time::timeout;
 
 use crate::identity::{device_id, Identity};
 use crate::stream::{read_framed, split, write_framed, SecureReader, SecureWriter};
@@ -53,17 +56,35 @@ impl Session {
         split(self.stream, self.transport)
     }
 
+    /// How long to wait for a machine that is not answering.
+    ///
+    /// Without a limit, connecting to somewhere unreachable waits for ever
+    /// rather than failing. A firewall that drops packets instead of refusing
+    /// them produces exactly that, and no amount of retrying helps when the
+    /// first attempt never finishes.
+    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Open a session with a machine this one is paired with.
     pub async fn connect(
         addr: impl ToSocketAddrs,
         identity: &Identity,
         peer: &Peer,
     ) -> Result<Session> {
-        let stream = TcpStream::connect(addr).await.map_err(|source| Error::Io {
-            path: Default::default(),
-            source,
-        })?;
-        Session::start(stream, identity, peer).await
+        let stream = timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Disconnected)?
+            .map_err(|source| Error::Io {
+                path: Default::default(),
+                source,
+            })?;
+        // The handshake is two messages; a machine that accepts a connection
+        // and then says nothing must not hold the link open either.
+        timeout(
+            Self::CONNECT_TIMEOUT,
+            Session::start(stream, identity, peer),
+        )
+        .await
+        .map_err(|_| Error::Disconnected)?
     }
 
     /// Run the handshake as initiator over an existing connection.

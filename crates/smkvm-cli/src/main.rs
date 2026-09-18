@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     start_logging(cli.verbose, cli.log_file.clone())?;
 
-    match cli.command {
+    let result = match cli.command {
         Command::Monitors => monitors(),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
@@ -95,7 +95,15 @@ fn main() -> Result<()> {
         Command::Pair { host, yes } => block_on(pair(host, yes)),
         Command::Serve => block_on(serve(cli.config)),
         Command::Connect { host } => block_on(connect(cli.config, host)),
+    };
+
+    // Whatever went wrong has to reach the log as well. Started by a scheduled
+    // task or a service there is no console, so an error reported only by
+    // returning it goes nowhere and the program merely appears to do nothing.
+    if let Err(e) = &result {
+        tracing::error!("{e:#}");
     }
+    result
 }
 
 /// Send the log somewhere it will actually be read.
@@ -110,7 +118,9 @@ fn start_logging(verbose: bool, explicit: Option<PathBuf>) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_env("SMKVM_LOG").unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(if verbose { "debug" } else { "info" })
     });
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false);
 
     let path = match explicit {
         Some(path) => Some(path),
