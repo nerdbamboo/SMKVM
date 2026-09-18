@@ -251,6 +251,59 @@ fn a_dropped_link_mid_chord_does_not_strand_a_key() {
 }
 
 #[test]
+fn a_dropped_link_does_not_strand_the_pointer_in_a_corner_either() {
+    // Leaving puts the pointer out of the way, and on a platform that cannot
+    // hide it that means moving it. If the link then goes, nothing further
+    // will arrive to undo that -- so the client has to, or the person is left
+    // looking at their own screen with the pointer in the far corner.
+    let mut w = Wired::new();
+    w.cross_to_client();
+    let arrived = w.client.input().inner().pointer();
+
+    w.feed(Event::PointerBy { dx: -1000, dy: 0 });
+    assert_eq!(w.server.active(), dev(1), "the cursor did not come home");
+    assert!(
+        w.client.input().inner().is_parked(),
+        "leaving should have moved the pointer out of the way"
+    );
+
+    w.client.disconnected();
+
+    assert!(!w.client.input().inner().is_parked());
+    assert_eq!(
+        w.client.input().inner().pointer(),
+        arrived,
+        "the pointer belongs back where this machine's own user left it"
+    );
+}
+
+#[test]
+fn arriving_leaves_the_pointer_where_the_cursor_arrived() {
+    // Arriving places the pointer and then asks for it back, in that order.
+    // Undoing the parking at that point would drag it away from the edge it
+    // just came in at, which looks exactly like a cursor that crossed and then
+    // jumped somewhere else.
+    let mut w = Wired::new();
+    w.cross_to_client();
+    let first_visit = w.client.input().inner().pointer();
+    w.feed(Event::PointerBy { dx: -1000, dy: 0 });
+    w.clear();
+
+    w.cross_to_client();
+
+    let entered = match w.injected().first() {
+        Some(Injected::MoveTo { x, y }) => (*x, *y),
+        other => panic!("arriving must place the pointer first, got {other:?}"),
+    };
+    assert_eq!(
+        w.client.input().inner().pointer(),
+        entered,
+        "the pointer must stay where the cursor arrived, not go back to {first_visit:?}"
+    );
+    assert!(!w.client.input().inner().is_parked());
+}
+
+#[test]
 fn a_client_that_cannot_act_says_so_and_the_cursor_comes_home() {
     // The Windows secure-desktop case, end to end.
     let mut w = Wired::new();

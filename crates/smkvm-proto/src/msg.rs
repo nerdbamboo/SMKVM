@@ -155,6 +155,26 @@ pub enum ServerControl {
     Goodbye,
 }
 
+impl ServerControl {
+    /// May this be thrown away when a machine has stopped keeping up?
+    ///
+    /// Pointer motion may, because the next one supersedes it: a machine that
+    /// misses a position is a few pixels behind for a moment and then right
+    /// again. A wheel notch may, for the same reason a scroll that stutters is
+    /// better than one that arrives a second late.
+    ///
+    /// Nothing else may. The rest either change what a machine believes about
+    /// itself or move something that stays moved, and no later message repeats
+    /// them. A lost [`ServerControl::Enter`] is the worst of them: the machine
+    /// goes on thinking the cursor is elsewhere and silently discards
+    /// everything sent afterwards, while the server swallows the keyboard and
+    /// mouse on its behalf. From the outside that is a cursor that crossed and
+    /// then vanished, and nothing short of another crossing puts it right.
+    pub fn may_be_dropped(&self) -> bool {
+        matches!(self, Self::MoveTo { .. } | Self::Wheel(_))
+    }
+}
+
 /// Monotonic clipboard generation, scoped to the device that produced it.
 ///
 /// Ordering is by counter within a device. Nothing is ever dropped for being

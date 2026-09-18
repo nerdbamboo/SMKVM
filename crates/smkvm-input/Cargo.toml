@@ -31,3 +31,12 @@ x11rb = { version = "0.13", features = ["randr", "xfixes", "xtest"] }
 
 [dev-dependencies]
 proptest = "1"
+
+# Tests that ask what the capture hook sees need a way to produce input the
+# hook will report, which means injecting without this crate's marker on it.
+# Nothing in the public API can do that, and nothing should.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

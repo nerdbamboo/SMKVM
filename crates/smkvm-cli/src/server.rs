@@ -146,25 +146,48 @@ pub async fn run(
         for action in server.handle(event, Instant::now()) {
             match action {
                 Action::Send { to, msg } => {
-                    if let Some(client) = attached.get(&to) {
-                        // Dropping a message beats stalling every other machine
-                        // behind one that has stopped reading.
-                        if client.outbound.try_send(msg).is_err() {
-                            warn!(device = %to.short(), "machine is not keeping up");
-                        }
+                    // Dropping a message beats stalling every other machine
+                    // behind one that has stopped reading -- but only the ones
+                    // a later message puts right.
+                    let droppable = msg.may_be_dropped();
+                    let lost =
+                        matches!(attached.get(&to), Some(c) if c.outbound.try_send(msg).is_err());
+                    if lost && droppable {
+                        warn!(device = %to.short(), "machine is not keeping up");
+                    } else if lost {
+                        // Carrying on without it would leave that machine and
+                        // the server disagreeing about where the cursor is,
+                        // with nothing on the way to correct either of them.
+                        // Letting the link go says so out loud, and brings the
+                        // cursor home.
+                        warn!(
+                            device = %to.short(),
+                            "machine is too far behind to be told where the cursor is; \
+                             letting the link go"
+                        );
+                        attached.remove(&to);
                     }
                 }
                 Action::Local(LocalAction::SetPointerMode(mode)) => {
                     let captured = mode == PointerMode::Captured;
                     capture.set_swallow(captured);
-                    let _ = if captured {
+                    let moved = if captured {
                         injector.hide_cursor()
                     } else {
                         injector.show_cursor()
                     };
+                    // This machine is the one whose keyboard and mouse are
+                    // being taken away, so a pointer that will not go where it
+                    // is put is the one failure the person here cannot work
+                    // around.
+                    if let Err(e) = moved {
+                        warn!(captured, "the local pointer would not move: {e}");
+                    }
                 }
                 Action::Local(LocalAction::WarpCursor { x, y }) => {
-                    let _ = injector.move_to(x, y);
+                    if let Err(e) = injector.move_to(x, y) {
+                        warn!("the local pointer would not go to {x},{y}: {e}");
+                    }
                     let _ = injector.flush();
                 }
                 Action::Local(LocalAction::ReleaseAll) => {}

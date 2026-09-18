@@ -199,10 +199,14 @@ fn pointer_motion_and_scrolling_pass_straight_through() {
 }
 
 #[test]
-fn the_pointer_is_put_out_of_sight_and_brought_back() {
-    // A backend with no way to hide the pointer must not fail for being
-    // asked: the cursor still crosses, it is simply left where it was.
+fn putting_the_pointer_out_of_the_way_is_not_tracked_state() {
+    // Hiding and showing go straight to the backend: they move a pointer, they
+    // do not hold anything down, so nothing here should start believing they
+    // did. What they actually do to the pointer is `cursor.rs`.
     let mut t = tracked();
-    assert!(t.inner_mut().hide_cursor().is_ok());
-    assert!(t.inner_mut().show_cursor().is_ok());
+    t.inner_mut().hide_cursor().unwrap();
+    t.inner_mut().show_cursor().unwrap();
+    assert!(!t.is_holding_anything());
+    assert_eq!(t.held_keys(), Vec::new());
+    assert_eq!(t.held_buttons(), Vec::new());
 }

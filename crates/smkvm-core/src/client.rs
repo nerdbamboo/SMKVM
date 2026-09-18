@@ -85,8 +85,11 @@ impl<I: Inject> Client<I> {
         self.active = false;
         let _ = self.input.release_all();
         // Whatever happened to the link, this machine's own pointer is its own
-        // again: leaving it hidden would strand the person without one.
-        let _ = self.input.inner_mut().show_cursor();
+        // again: leaving it out of the way would strand the person without one,
+        // and this is the last moment anything will be done about it.
+        if let Err(e) = self.input.inner_mut().show_cursor() {
+            tracing::warn!("the pointer could not be brought back: {e}");
+        }
     }
 
     pub fn handle(&mut self, msg: ServerControl) -> Vec<ClientAction> {
@@ -97,26 +100,33 @@ impl<I: Inject> Client<I> {
                 buttons,
             } => {
                 self.active = true;
+                tracing::info!(at = ?(at.x, at.y), "the cursor arrived");
                 // Position first, then state: a press that lands before the
                 // pointer has arrived goes to whatever was under it.
-                let moved = self.input.move_to(at.x, at.y);
-                let shown = self.input.inner_mut().show_cursor();
-                tracing::info!(
-                    at = ?(at.x, at.y),
-                    moved = moved.is_ok(),
-                    shown = shown.is_ok(),
-                    "the cursor arrived"
-                );
+                if let Err(e) = self.input.move_to(at.x, at.y) {
+                    // Worth saying: this is the person watching a machine they
+                    // have just been given not show them a pointer.
+                    tracing::warn!("the pointer could not be put where it arrived: {e}");
+                }
+                // After the placement, not before. Anything owed from being
+                // parked is settled by having been put somewhere on purpose --
+                // unless the placement failed, in which case going back to
+                // where it was parked from beats leaving it in a corner.
+                if let Err(e) = self.input.inner_mut().show_cursor() {
+                    tracing::warn!("the pointer could not be brought back: {e}");
+                }
                 let _ = self.input.sync(&pressed, &buttons);
                 Vec::new()
             }
             ServerControl::Leave => {
                 self.active = false;
                 let _ = self.input.release_all();
+                tracing::info!("the cursor left");
                 // Out of sight, so it stops looking like a pointer the person
                 // could still move.
-                let hidden = self.input.inner_mut().hide_cursor();
-                tracing::info!(hidden = hidden.is_ok(), "the cursor left");
+                if let Err(e) = self.input.inner_mut().hide_cursor() {
+                    tracing::warn!("the pointer could not be put out of the way: {e}");
+                }
                 Vec::new()
             }
             ServerControl::MoveTo { x, y } => {

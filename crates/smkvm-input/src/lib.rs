@@ -54,13 +54,62 @@ pub trait Inject {
     /// Left where it was, it sits in the middle of whatever the person is
     /// reading, looking for all the world as though it were still theirs to
     /// move. The default does nothing, for backends with no way to do it.
+    ///
+    /// Whatever this does, [`Inject::show_cursor`] must undo it. A backend
+    /// that overrides one and not the other leaves the person without a
+    /// pointer and no way to ask for it back.
     fn hide_cursor(&mut self) -> Result<()> {
         Ok(())
     }
 
     /// Put the pointer back, because the cursor has returned.
+    ///
+    /// Called on arrival, and again whenever this machine stops being anyone's
+    /// to drive -- a dropped link, a goodbye, a server that went away. Those
+    /// last are the ones that matter: no further message will arrive, so if
+    /// this does nothing the pointer stays wherever hiding left it, for good.
     fn show_cursor(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Where the pointer was before it was moved out of the way.
+///
+/// A backend with no way to hide the pointer can only move it somewhere
+/// harmless, and then it owes the person the position it took. The rule is
+/// narrow -- park once, restore once, and any deliberate placement supersedes
+/// both -- but getting it wrong strands someone with a pointer in a corner, so
+/// it lives here where it can be tested without a desktop to move a pointer on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Parked(Option<(i32, i32)>);
+
+impl Parked {
+    /// Note that the pointer is about to be moved out of the way from `from`.
+    ///
+    /// Answers whether it should move at all: a pointer already parked is
+    /// parked, and taking its corner as the position to go back to would lose
+    /// the real one.
+    pub fn park(&mut self, from: (i32, i32)) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(from);
+        true
+    }
+
+    /// Where the pointer should go back to, if it owes anyone a position.
+    pub fn restore(&mut self) -> Option<(i32, i32)> {
+        self.0.take()
+    }
+
+    /// The pointer was put somewhere on purpose, which settles the debt: going
+    /// back to where it was parked from would now undo that placement.
+    pub fn placed(&mut self) {
+        self.0 = None;
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.0.is_some()
     }
 }
 

@@ -23,13 +23,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SetCursorPos, EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1,
-    XBUTTON2,
+    GetSystemMetrics, EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
 };
 
 use crate::keymap::hid_to_scancode;
-use crate::{Inject, InputError, Monitors, Result};
+use crate::{Inject, InputError, Monitors, Parked, Result};
 
 pub mod capture;
 pub mod desktop;
@@ -62,6 +61,8 @@ fn virtual_desktop() -> Rect {
 pub struct WindowsInput {
     /// Scroll finer than one notch, kept until it adds up to one.
     wheel_remainder: (i32, i32),
+    /// Where the pointer was before it was moved out of the way.
+    parked: Parked,
 }
 
 impl Default for WindowsInput {
@@ -74,6 +75,7 @@ impl WindowsInput {
     pub fn new() -> Self {
         Self {
             wheel_remainder: (0, 0),
+            parked: Parked::default(),
         }
     }
 
@@ -111,8 +113,14 @@ impl WindowsInput {
     }
 }
 
-impl Inject for WindowsInput {
-    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+impl WindowsInput {
+    /// Put the pointer at a desktop position, without touching the record of
+    /// where it is owed back to.
+    ///
+    /// Injected rather than set with `SetCursorPos`, so it carries
+    /// [`INJECTED_MARKER`] and the capture hook knows not to read this
+    /// program's own placements back as though the person had moved the mouse.
+    fn place(&self, x: i32, y: i32) -> Result<()> {
         let desk = virtual_desktop();
         if desk.w <= 1 || desk.h <= 1 {
             return Err(InputError::Display("no usable display".into()));
@@ -128,6 +136,16 @@ impl Inject for WindowsInput {
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         );
         self.send(&[input])
+    }
+}
+
+impl Inject for WindowsInput {
+    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        self.place(x, y)?;
+        // Being told where the pointer goes settles any debt from parking it:
+        // putting it back afterwards would undo the position just asked for.
+        self.parked.placed();
+        Ok(())
     }
 
     fn button(&mut self, button: MouseButton, down: bool) -> Result<()> {
@@ -212,15 +230,35 @@ impl Inject for WindowsInput {
         // could strand someone with no pointer at all if the far machine
         // turned out not to take the cursor. Parking is recoverable; a cage is
         // not.
+        //
+        // Recoverable only if the position it was taken from is kept, though,
+        // which is what `parked` is for: the corner is where the pointer goes,
+        // not where it belongs.
         let desk = virtual_desktop();
         if desk.is_empty() {
             return Ok(());
         }
-        // SAFETY: plain values, no pointers.
-        unsafe {
-            let _ = SetCursorPos(desk.right() - 1, desk.bottom() - 1);
+        if !self.parked.park(cursor_position()?) {
+            return Ok(());
+        }
+        let corner = (desk.right() - 1, desk.bottom() - 1);
+        if let Err(e) = self.place(corner.0, corner.1) {
+            // Nothing was moved, so nothing is owed back.
+            self.parked.placed();
+            return Err(e);
         }
         Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        // Only the parking is undone. Windows has no desktop-wide hiding to
+        // reverse -- and a pointer hidden by whatever application is in front
+        // is that application's to show again, not this program's to wrestle
+        // for.
+        let Some((x, y)) = self.parked.restore() else {
+            return Ok(());
+        };
+        self.place(x, y)
     }
 }
 

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use smkvm_layout::{Monitor, Rect};
 use smkvm_proto::{Key, MouseButton, Scroll};
 
-use crate::{Inject, InputError, Monitors, Result};
+use crate::{Inject, InputError, Monitors, Parked, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -22,12 +22,22 @@ pub enum Event {
 }
 
 /// Records what it is asked to do.
+///
+/// It also stands in for a backend that cannot hide the pointer and can only
+/// move it out of the way, which is what Windows is. That behaviour is the one
+/// part of injection with no second chance -- nothing arrives later to correct
+/// a pointer left in a corner -- so it is worth being able to exercise here
+/// rather than only on the machine it happens on.
 #[derive(Debug, Default)]
 pub struct Loopback {
     events: Vec<Event>,
     monitors: Vec<Monitor>,
     /// Keys whose injection fails, so error handling can be exercised.
     failing: BTreeSet<Key>,
+    /// Where the pointer has been put. A recording backend has no pointer of
+    /// its own, but parking one needs somewhere to put it back.
+    at: (i32, i32),
+    parked: Parked,
 }
 
 impl Loopback {
@@ -76,11 +86,42 @@ impl Loopback {
     pub fn clear(&mut self) {
         self.events.clear();
     }
+
+    /// Where the pointer has been put.
+    pub fn pointer(&self) -> (i32, i32) {
+        self.at
+    }
+
+    /// Whether the pointer is currently out of the way.
+    pub fn is_parked(&self) -> bool {
+        self.parked.is_parked()
+    }
+
+    /// The far corner of everything this machine can display, which is where a
+    /// parked pointer goes.
+    fn corner(&self) -> Option<(i32, i32)> {
+        let bounds = self
+            .monitors
+            .iter()
+            .map(|m| m.local)
+            .reduce(|acc, r| acc.union(&r))?;
+        if bounds.is_empty() {
+            return None;
+        }
+        Some((bounds.right() - 1, bounds.bottom() - 1))
+    }
+
+    /// Put the pointer somewhere without touching what is owed back.
+    fn place(&mut self, x: i32, y: i32) {
+        self.events.push(Event::MoveTo { x, y });
+        self.at = (x, y);
+    }
 }
 
 impl Inject for Loopback {
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
-        self.events.push(Event::MoveTo { x, y });
+        self.place(x, y);
+        self.parked.placed();
         Ok(())
     }
 
@@ -107,6 +148,25 @@ impl Inject for Loopback {
 
     fn flush(&mut self) -> Result<()> {
         self.events.push(Event::Flush);
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> Result<()> {
+        let Some(corner) = self.corner() else {
+            return Ok(());
+        };
+        if !self.parked.park(self.at) {
+            return Ok(());
+        }
+        self.place(corner.0, corner.1);
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        let Some((x, y)) = self.parked.restore() else {
+            return Ok(());
+        };
+        self.place(x, y);
         Ok(())
     }
 }
