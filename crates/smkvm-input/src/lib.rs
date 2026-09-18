@@ -47,6 +47,21 @@ pub trait Inject {
     fn key(&mut self, key: Key, down: bool) -> Result<()>;
     /// Push anything buffered to the display server.
     fn flush(&mut self) -> Result<()>;
+
+    /// Take the pointer out of sight, because this machine no longer has the
+    /// cursor.
+    ///
+    /// Left where it was, it sits in the middle of whatever the person is
+    /// reading, looking for all the world as though it were still theirs to
+    /// move. The default does nothing, for backends with no way to do it.
+    fn hide_cursor(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Put the pointer back, because the cursor has returned.
+    fn show_cursor(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Reports the monitors attached to this machine.
@@ -71,6 +86,12 @@ impl<T: Inject + ?Sized> Inject for Box<T> {
     }
     fn flush(&mut self) -> Result<()> {
         (**self).flush()
+    }
+    fn hide_cursor(&mut self) -> Result<()> {
+        (**self).hide_cursor()
+    }
+    fn show_cursor(&mut self) -> Result<()> {
+        (**self).show_cursor()
     }
 }
 

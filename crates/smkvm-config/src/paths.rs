@@ -54,6 +54,15 @@ pub fn log_file() -> PathBuf {
     state_dir().join("smkvm.log")
 }
 
+/// Where the running daemon reports what it is connected to.
+///
+/// A file rather than a socket: anything that wants to show the state only
+/// needs to read it, on any platform, with nothing to connect to and nothing
+/// to fail when the daemon is not running.
+pub fn status_file() -> PathBuf {
+    state_dir().join("status.toml")
+}
+
 /// This machine's name, when the configuration does not give one.
 pub fn default_name() -> String {
     std::env::var("SMKVM_NAME")

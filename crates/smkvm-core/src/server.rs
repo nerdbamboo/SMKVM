@@ -174,6 +174,10 @@ pub struct Server {
     /// The arrangement the configuration asks for. Applied as each machine
     /// reports what it has; anything not mentioned is placed automatically.
     placements: Vec<Placement>,
+    /// How many times the cursor has been moved, for occasional reporting.
+    moves: u64,
+    /// The furthest the cursor has reached, as `(min x, min y, max x, max y)`.
+    reach: (i32, i32, i32, i32),
 }
 
 impl Server {
@@ -211,6 +215,8 @@ impl Server {
             pending: None,
             last_tap: None,
             placements: Vec::new(),
+            moves: 0,
+            reach: (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
         }
     }
 
@@ -283,11 +289,17 @@ impl Server {
                     || (placement.monitor == Placement::PRIMARY && *primary)
             });
             let Some((id, _)) = wanted else {
-                tracing::warn!(
-                    machine = %name,
-                    monitor = %placement.monitor,
-                    "the configuration places a monitor this machine does not have"
-                );
+                // A machine that has not reported its displays yet has nothing
+                // to match, and will be placed the moment it does. Only a
+                // machine that has told us what it has and still does not have
+                // this one is worth mentioning.
+                if !monitors.is_empty() {
+                    tracing::warn!(
+                        machine = %name,
+                        monitor = %placement.monitor,
+                        "the configuration places a monitor this machine does not have"
+                    );
+                }
                 continue;
             };
             self.layout.place_rect(device, id, placement.global);
@@ -375,9 +387,37 @@ impl Server {
     /// Move the authoritative cursor and deal with whatever that implies.
     fn advance(&mut self, dx: i32, dy: i32, now: Instant, out: &mut Vec<Action>) {
         let Some(motion) = self.layout.resolve(self.cursor, dx, dy) else {
+            tracing::debug!(
+                at = ?(self.cursor.x, self.cursor.y),
+                "there is nowhere for the cursor to be"
+            );
             return;
         };
         let target = motion.located.device;
+
+        // Where the cursor has got to, now and then. A pointer that will not
+        // leave its screen and one that is being told it already has look the
+        // same from outside, and this tells them apart.
+        self.moves = self.moves.wrapping_add(1);
+        self.reach = (
+            self.reach.0.min(self.cursor.x),
+            self.reach.1.min(self.cursor.y),
+            self.reach.2.max(self.cursor.x),
+            self.reach.3.max(self.cursor.y),
+        );
+        if self.moves % 400 == 0 {
+            // How far the cursor has actually got. A pointer that never
+            // reaches an edge cannot cross one, and from outside that looks
+            // identical to a crossing that is being refused.
+            tracing::debug!(
+                at = ?(self.cursor.x, self.cursor.y),
+                by = ?(dx, dy),
+                reach = ?self.reach,
+                on = %self.name_of(target),
+                active = %self.name_of(self.active),
+                "where the cursor is"
+            );
+        }
 
         if target == self.active {
             self.pending = None;
@@ -390,6 +430,10 @@ impl Server {
             // The machine beyond that edge cannot take the cursor, so the
             // cursor does not go there. Better a wall than a pointer that
             // disappears onto a screen that will not move it.
+            tracing::debug!(
+                target = %self.name_of(target),
+                "the machine beyond this edge cannot take the cursor"
+            );
             self.pending = None;
             self.stop_at_edge(motion.global, out);
             return;
@@ -409,6 +453,11 @@ impl Server {
     /// waits there. Leaving it where it was would make the screen feel like it
     /// ended early.
     fn stop_at_edge(&mut self, beyond: Point, out: &mut Vec<Action>) {
+        tracing::debug!(
+            at = ?(self.cursor.x, self.cursor.y),
+            wanted = ?(beyond.x, beyond.y),
+            "stopped at an edge"
+        );
         let cells = self.layout.cells();
         let mine: Vec<_> = cells.iter().filter(|c| c.device == self.active).collect();
         let Some(cell) = mine
@@ -502,6 +551,13 @@ impl Server {
         out: &mut Vec<Action>,
     ) {
         let leaving = self.active;
+        tracing::info!(
+            from = %self.name_of(leaving),
+            to = %self.name_of(target),
+            monitor = %located.monitor,
+            at = ?(located.local.x, located.local.y),
+            "cursor crossed"
+        );
         self.pending = None;
         self.last_tap = None;
         self.cursor = global;

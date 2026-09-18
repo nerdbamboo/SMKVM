@@ -6,7 +6,7 @@
 //! timing but to know, exactly, what has been pressed and to let go of it.
 
 use smkvm_input::platform::loopback::{Event, Loopback};
-use smkvm_input::Tracked;
+use smkvm_input::{Inject as _, Tracked};
 use smkvm_proto::{Key, MouseButton, Scroll};
 
 const A: Key = Key(0x04);
@@ -196,4 +196,13 @@ fn pointer_motion_and_scrolling_pass_straight_through() {
             },
         ]
     );
+}
+
+#[test]
+fn the_pointer_is_put_out_of_sight_and_brought_back() {
+    // A backend with no way to hide the pointer must not fail for being
+    // asked: the cursor still crosses, it is simply left where it was.
+    let mut t = tracked();
+    assert!(t.inner_mut().hide_cursor().is_ok());
+    assert!(t.inner_mut().show_cursor().is_ok());
 }

@@ -9,6 +9,8 @@
 
 pub mod barrier;
 pub mod ini;
+pub mod paths;
+pub mod status;
 
 use std::path::{Path, PathBuf};
 

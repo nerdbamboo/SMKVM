@@ -155,7 +155,13 @@ pub async fn run(
                     }
                 }
                 Action::Local(LocalAction::SetPointerMode(mode)) => {
-                    capture.set_swallow(mode == PointerMode::Captured);
+                    let captured = mode == PointerMode::Captured;
+                    capture.set_swallow(captured);
+                    let _ = if captured {
+                        injector.hide_cursor()
+                    } else {
+                        injector.show_cursor()
+                    };
                 }
                 Action::Local(LocalAction::WarpCursor { x, y }) => {
                     let _ = injector.move_to(x, y);

@@ -43,14 +43,34 @@ pub fn start_capture(events: Sender<Event>) -> Result<CaptureHandle> {
     std::thread::Builder::new()
         .name("smkvm-capture-pump".into())
         .spawn(move || {
+            // Counted, because two separate sources feed this and a fault in
+            // either is invisible from the outside: the pointer simply never
+            // leaves the screen. Raw motion is what decides crossings, so
+            // silence from it looks exactly like a cursor that will not go.
+            let (mut moves, mut raw, mut keys) = (0u64, 0u64, 0u64);
+            let mut reported = std::time::Instant::now();
+
             while let Ok(event) = incoming.recv() {
                 let event = match event {
-                    Captured::PointerAt { x, y } => Event::PointerAt { x, y },
-                    Captured::PointerBy { dx, dy } => Event::PointerBy { dx, dy },
+                    Captured::PointerAt { x, y } => {
+                        moves += 1;
+                        Event::PointerAt { x, y }
+                    }
+                    Captured::PointerBy { dx, dy } => {
+                        raw += 1;
+                        Event::PointerBy { dx, dy }
+                    }
                     Captured::Button { button, down } => Event::Button { button, down },
                     Captured::Wheel(scroll) => Event::Wheel(scroll),
-                    Captured::Key { key, down, repeat } => Event::Key { key, down, repeat },
+                    Captured::Key { key, down, repeat } => {
+                        keys += 1;
+                        Event::Key { key, down, repeat }
+                    }
                 };
+                if reported.elapsed() >= std::time::Duration::from_secs(10) {
+                    tracing::debug!(pointer = moves, raw_motion = raw, keys, "captured so far");
+                    reported = std::time::Instant::now();
+                }
                 if events.blocking_send(event).is_err() {
                     break;
                 }

@@ -13,6 +13,7 @@ use smkvm_layout::{Monitor, Rect};
 use smkvm_proto::{Key, MouseButton, Scroll};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     ConnectionExt as _, Window, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT,
     KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT,
@@ -57,6 +58,8 @@ pub struct X11Input {
     /// would make a touchpad or a high-resolution wheel scroll short.
     wheel_remainder: (i32, i32),
     has_randr_monitors: bool,
+    has_xfixes: bool,
+    cursor_hidden: bool,
 }
 
 impl X11Input {
@@ -79,6 +82,14 @@ impl X11Input {
             ));
         }
 
+        // Hiding the pointer needs XFixes. Without it the pointer simply
+        // stays where it was, which is worse than hiding it but better than
+        // refusing to run.
+        let has_xfixes = match conn.xfixes_query_version(4, 0) {
+            Ok(cookie) => cookie.reply().is_ok(),
+            Err(_) => false,
+        };
+
         // RandR 1.5 introduced monitors, which is the view that matches what
         // the user sees: one entry per panel, already combined.
         let has_randr_monitors = match conn.randr_query_version(1, 5) {
@@ -95,6 +106,8 @@ impl X11Input {
             screen_num,
             wheel_remainder: (0, 0),
             has_randr_monitors,
+            has_xfixes,
+            cursor_hidden: false,
         })
     }
 
@@ -204,6 +217,36 @@ impl Inject for X11Input {
     }
 
     fn flush(&mut self) -> Result<()> {
+        self.conn.flush().map_err(display_err)?;
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> Result<()> {
+        // XFixes hides it for the whole screen while this client asks, and
+        // puts it back the moment the request is withdrawn -- so nothing is
+        // left in a strange state if this process disappears.
+        if !self.has_xfixes {
+            return Ok(());
+        }
+        if !self.cursor_hidden {
+            self.conn
+                .xfixes_hide_cursor(self.root)
+                .map_err(display_err)?;
+            self.cursor_hidden = true;
+            self.conn.flush().map_err(display_err)?;
+        }
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        if !self.has_xfixes || !self.cursor_hidden {
+            return Ok(());
+        }
+        // Hiding is counted, so every hide needs exactly one show.
+        self.conn
+            .xfixes_show_cursor(self.root)
+            .map_err(display_err)?;
+        self.cursor_hidden = false;
         self.conn.flush().map_err(display_err)?;
         Ok(())
     }

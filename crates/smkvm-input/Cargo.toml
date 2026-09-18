@@ -27,7 +27,7 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-x11rb = { version = "0.13", features = ["randr", "xtest"] }
+x11rb = { version = "0.13", features = ["randr", "xfixes", "xtest"] }
 
 [dev-dependencies]
 proptest = "1"

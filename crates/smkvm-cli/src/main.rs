@@ -1,9 +1,12 @@
 //! The `smkvm` command.
 
 mod client;
-mod paths;
 mod platform;
 mod server;
+
+// Where things live is the daemon's agreement with anything else that reads
+// the same files, so it belongs with the configuration rather than in here.
+use smkvm_config::paths;
 
 use std::io::Write as _;
 use std::path::PathBuf;

@@ -84,6 +84,9 @@ impl<I: Inject> Client<I> {
     pub fn disconnected(&mut self) {
         self.active = false;
         let _ = self.input.release_all();
+        // Whatever happened to the link, this machine's own pointer is its own
+        // again: leaving it hidden would strand the person without one.
+        let _ = self.input.inner_mut().show_cursor();
     }
 
     pub fn handle(&mut self, msg: ServerControl) -> Vec<ClientAction> {
@@ -96,13 +99,24 @@ impl<I: Inject> Client<I> {
                 self.active = true;
                 // Position first, then state: a press that lands before the
                 // pointer has arrived goes to whatever was under it.
-                let _ = self.input.move_to(at.x, at.y);
+                let moved = self.input.move_to(at.x, at.y);
+                let shown = self.input.inner_mut().show_cursor();
+                tracing::info!(
+                    at = ?(at.x, at.y),
+                    moved = moved.is_ok(),
+                    shown = shown.is_ok(),
+                    "the cursor arrived"
+                );
                 let _ = self.input.sync(&pressed, &buttons);
                 Vec::new()
             }
             ServerControl::Leave => {
                 self.active = false;
                 let _ = self.input.release_all();
+                // Out of sight, so it stops looking like a pointer the person
+                // could still move.
+                let hidden = self.input.inner_mut().hide_cursor();
+                tracing::info!(hidden = hidden.is_ok(), "the cursor left");
                 Vec::new()
             }
             ServerControl::MoveTo { x, y } => {

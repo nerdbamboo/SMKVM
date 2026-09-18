@@ -73,6 +73,23 @@ pub enum Captured {
 /// lock on a path that runs for every mouse movement.
 static SWALLOW: AtomicBool = AtomicBool::new(false);
 
+/// Scan codes already reported as unrecognised.
+///
+/// A key that cannot be sent is worth one line, not one per press: held down,
+/// it repeats many times a second.
+static UNKNOWN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+fn first_sighting(scan: u16) -> bool {
+    match UNKNOWN.lock() {
+        Ok(mut seen) if !seen.contains(&scan) => {
+            seen.push(scan);
+            true
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
+}
+
 /// Where captured events are delivered.
 ///
 /// Hook callbacks are plain functions the system calls with no room for a
@@ -128,29 +145,25 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     let identified = vk_to_modifier(info.vkCode as u16).or_else(|| scancode_to_hid(scan as u16));
 
     match identified {
-        Some(key) => {
-            tracing::debug!(
-                usage = format_args!("{:#06x}", key.0),
-                scan = format_args!("{scan:#06x}"),
-                vk = format_args!("{:#04x}", info.vkCode),
-                down,
-                "key"
-            );
-            emit(Captured::Key {
-                key,
-                down,
-                // The hook gives no repeat flag, so a press of a key already
-                // held is what a repeat looks like. Working that out belongs
-                // with the state that knows what is held, not here.
-                repeat: false,
-            });
-        }
-        // A key with no mapping does nothing at all on the far machine, and
-        // says nothing about why. Keyboards differ in what they report, so
-        // this is how an unexpected one gets noticed rather than shrugged off.
-        None if down => tracing::warn!(
+        Some(key) => emit(Captured::Key {
+            key,
+            down,
+            // The hook gives no repeat flag, so a press of a key already held
+            // is what a repeat looks like. Working that out belongs with the
+            // state that knows what is held, not here.
+            repeat: false,
+        }),
+        // A key with no mapping does nothing on the far machine and says
+        // nothing about why, so it is worth reporting -- once. Keyboards
+        // differ in what they report, and this is how an unexpected one gets
+        // noticed instead of shrugged off.
+        //
+        // Note what is *not* logged: which key was pressed. Recording that for
+        // keys that do work would put everything typed, passwords included,
+        // into a file on disk. An unmapped key produces no text anywhere, so
+        // its code can be reported without doing that.
+        None if down && first_sighting(scan as u16) => tracing::warn!(
             scan = format_args!("{scan:#06x}"),
-            raw = format_args!("{:#06x}", info.scanCode),
             vk = format_args!("{:#04x}", info.vkCode),
             extended,
             "a key was pressed that this does not know how to send"

@@ -23,8 +23,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, SetCursorPos, EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1,
+    XBUTTON2,
 };
 
 use crate::keymap::hid_to_scancode;
@@ -197,6 +198,28 @@ impl Inject for WindowsInput {
 
     fn flush(&mut self) -> Result<()> {
         // SendInput has already delivered; there is nothing held back.
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> Result<()> {
+        // Windows offers no way to hide the pointer for the whole desktop from
+        // outside the application drawing it, so it goes to the very corner
+        // instead of sitting in the middle of whatever is being read.
+        //
+        // It is deliberately not confined there. Confining it added nothing --
+        // the hook already swallows movement while the cursor belongs to
+        // another machine, so the pointer does not drift anyway -- and it
+        // could strand someone with no pointer at all if the far machine
+        // turned out not to take the cursor. Parking is recoverable; a cage is
+        // not.
+        let desk = virtual_desktop();
+        if desk.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: plain values, no pointers.
+        unsafe {
+            let _ = SetCursorPos(desk.right() - 1, desk.bottom() - 1);
+        }
         Ok(())
     }
 }
