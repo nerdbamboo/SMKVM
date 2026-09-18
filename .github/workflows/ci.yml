@@ -33,8 +33,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The X11 injection tests run against a private virtual server rather
+      # than any real session. Without it they skip, which would quietly stop
+      # covering the backend.
+      - name: install a virtual X server
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
+
+  cross:
+    name: compiles for windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      # Catches Windows-only compile breakage without needing a Windows
+      # runner or a linker: `check` does not link.
+      - run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
 
   msrv:
     name: minimum supported rust version

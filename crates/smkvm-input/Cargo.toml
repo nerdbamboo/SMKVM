@@ -1,0 +1,21 @@
+[package]
+name = "smkvm-input"
+description = "Keyboard and pointer capture and injection, per platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smkvm-layout = { path = "../smkvm-layout" }
+smkvm-proto = { path = "../smkvm-proto" }
+thiserror = { workspace = true }
+tracing = "0.1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = { version = "0.13", features = ["randr", "xtest"] }
+
+[dev-dependencies]
+proptest = "1"
