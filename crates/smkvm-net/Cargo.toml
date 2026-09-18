@@ -1,0 +1,28 @@
+[package]
+name = "smkvm-net"
+description = "Device identity, pairing, and the encrypted link between machines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smkvm-proto = { path = "../smkvm-proto" }
+smkvm-layout = { path = "../smkvm-layout" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+snow = "0.9"
+# The `pure` feature keeps BLAKE3 to portable Rust. Its assembly paths need
+# MASM, which is not available when cross-compiling to Windows from Linux --
+# the way these binaries are built. Hashing here is identities and content
+# digests, never a hot path, so the portable version costs nothing that shows.
+blake3 = { version = "1", features = ["pure"] }
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+toml = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+proptest = "1"
