@@ -23,6 +23,8 @@ pub struct Listed {
     pub paired: bool,
     /// What the daemon says, when one is running.
     pub state: Option<MachineState>,
+    /// Whether the cursor is on it right now.
+    pub active: bool,
     /// Whether it has any screens on the desk.
     pub placed: bool,
 }
@@ -41,12 +43,11 @@ pub fn listed(trust: &Trust, config: &Config, status: Option<&Status>, here: &st
             .iter()
             .any(|s| s.name == name && !s.monitor.is_empty())
     };
-    let state = |name: &str| {
-        status?
-            .machines
-            .iter()
-            .find(|m| m.name == name)
-            .map(|m| m.state)
+    let state = |name: &str| status?.machine(name).map(|m| m.state);
+    let active = |name: &str| {
+        status
+            .and_then(|s| s.machine(name))
+            .is_some_and(|m| m.active)
     };
 
     let mut machines: Vec<Listed> = trust
@@ -57,6 +58,7 @@ pub fn listed(trust: &Trust, config: &Config, status: Option<&Status>, here: &st
             device: Some(peer.id),
             paired: true,
             state: state(&peer.name),
+            active: active(&peer.name),
             placed: placed(&peer.name),
         })
         .collect();
@@ -73,6 +75,7 @@ pub fn listed(trust: &Trust, config: &Config, status: Option<&Status>, here: &st
             device: screen.device,
             paired: false,
             state: state(&screen.name),
+            active: active(&screen.name),
             placed: !screen.monitor.is_empty(),
         });
     }
@@ -199,7 +202,10 @@ fn row(ui: &mut egui::Ui, palette: &Palette, machine: &Listed, running: bool) ->
             // why the column is empty.
             if running {
                 let (word, colour) = match machine.state {
-                    Some(MachineState::Connected) => ("Connected", palette.accent),
+                    Some(MachineState::Connected) if machine.active => {
+                        ("Has the cursor", palette.accent)
+                    }
+                    Some(MachineState::Connected) => ("Connected", palette.text),
                     Some(MachineState::Suspended) => ("Not taking input", palette.warn),
                     _ => ("Away", palette.dim),
                 };
@@ -324,11 +330,7 @@ mod tests {
         let status = Status::new(
             Role::Server,
             "this-one",
-            vec![Machine {
-                name: "over-there".into(),
-                device: None,
-                state: MachineState::Suspended,
-            }],
+            vec![Machine::new("over-there", None, MachineState::Suspended)],
         );
         let listed = listed(
             &trust_with(&["over-there", "elsewhere"]),

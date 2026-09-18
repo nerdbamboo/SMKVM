@@ -10,8 +10,13 @@
 //! space is reserved rather than empty -- the server treats it as a wall, and a
 //! desk that showed open ground there would be describing a different machine
 //! from the one the person is sitting at.
+//!
+//! A machine the configuration says nothing about is drawn where the daemon
+//! has put it, when a daemon is running to say. That is the only way a
+//! freshly paired machine can appear at all, and dragging it is what writes it
+//! into the configuration for good.
 
-use smkvm_config::status::{MachineState, Status};
+use smkvm_config::status::{MachineState, PlacedMonitor, Status};
 use smkvm_config::{Config, MonitorPlacement};
 use smkvm_layout::{DeviceId, Layout, Monitor, Point, Rect};
 
@@ -44,6 +49,11 @@ pub struct Screen {
     pub presence: Presence,
     /// What the monitor calls itself, where the machine knows.
     pub label: Option<String>,
+    /// Whether the cursor is on this machine right now.
+    pub active: bool,
+    /// Placed by the daemon rather than the configuration: it will land
+    /// somewhere else next time unless somebody drags it and pins it.
+    pub provisional: bool,
 }
 
 /// Every screen on the desk, in a stable order: this machine first, then the
@@ -63,18 +73,45 @@ impl Desk {
         config: &Config,
         status: Option<&Status>,
     ) -> Desk {
-        let mut screens = local(here, device, displays, config);
+        let mut screens = local(here, device, displays, config, status);
         for machine in config.screen.iter().filter(|s| s.name != here) {
             let presence = presence_of(&machine.name, status);
+            let active = is_active(&machine.name, status);
             screens.extend(machine.monitor.iter().map(|placement| Screen {
                 machine: machine.name.clone(),
                 monitor: placement.id.clone(),
                 global: placement.rect(),
                 presence,
-                // Only the machine itself knows what its monitors are called,
-                // and the configuration does not carry it.
-                label: None,
+                // The configuration does not carry what a monitor calls
+                // itself; the daemon's report does, when there is one.
+                label: reported(status, &machine.name, &placement.id).and_then(|m| m.label.clone()),
+                active,
+                provisional: false,
             }));
+        }
+        // Whatever the daemon has placed that the configuration has not.
+        for machine in status.iter().flat_map(|s| s.machines.iter()) {
+            if machine.name == here {
+                continue;
+            }
+            let presence = presence_of(&machine.name, status);
+            for placed in &machine.monitor {
+                let pinned = screens
+                    .iter()
+                    .any(|s| s.machine == machine.name && names(&s.monitor, placed));
+                if pinned {
+                    continue;
+                }
+                screens.push(Screen {
+                    machine: machine.name.clone(),
+                    monitor: placed.id.clone(),
+                    global: placed.rect(),
+                    presence,
+                    label: placed.label.clone(),
+                    active: machine.active,
+                    provisional: true,
+                });
+            }
         }
         Desk {
             screens,
@@ -137,8 +174,15 @@ impl Desk {
 
 /// This machine's own screens: the displays it has, where the configuration
 /// puts them, and anything the configuration places that is not plugged in.
-fn local(here: &str, device: DeviceId, displays: &[Monitor], config: &Config) -> Vec<Screen> {
+fn local(
+    here: &str,
+    device: DeviceId,
+    displays: &[Monitor],
+    config: &Config,
+    status: Option<&Status>,
+) -> Vec<Screen> {
     let configured = config.screen.iter().find(|s| s.name == here);
+    let active = is_active(here, status);
 
     // Built through the same type the daemon arranges with, so a machine whose
     // screens the configuration says nothing about lands where it would land
@@ -148,6 +192,24 @@ fn local(here: &str, device: DeviceId, displays: &[Monitor], config: &Config) ->
     for placement in configured.iter().flat_map(|s| s.monitor.iter()) {
         if let Some(display) = attached(displays, &placement.id) {
             layout.place_rect(device, &display.id, placement.rect());
+        }
+    }
+    // Where the configuration is silent, a running daemon knows better than
+    // this window where the screens actually are: its arrangement is the one
+    // the cursor is moving over right now.
+    let mut provisional = Vec::new();
+    for placed in status
+        .and_then(|s| s.machine(here))
+        .iter()
+        .flat_map(|m| m.monitor.iter())
+    {
+        let Some(display) = attached(displays, &placed.id) else {
+            continue;
+        };
+        if layout.placement(device, &display.id).is_none()
+            && layout.place_rect(device, &display.id, placed.rect())
+        {
+            provisional.push(display.id.clone());
         }
     }
     layout.auto_place();
@@ -164,6 +226,8 @@ fn local(here: &str, device: DeviceId, displays: &[Monitor], config: &Config) ->
                 global,
                 presence: Presence::Here,
                 label: display.label.clone(),
+                active,
+                provisional: provisional.contains(&display.id),
             })
         })
         .collect();
@@ -182,9 +246,34 @@ fn local(here: &str, device: DeviceId, displays: &[Monitor], config: &Config) ->
                 global: placement.rect(),
                 presence: Presence::Away,
                 label: None,
+                active: false,
+                provisional: false,
             }),
     );
     screens
+}
+
+/// Does a configured placement name this reported monitor?
+fn names(configured: &str, placed: &PlacedMonitor) -> bool {
+    configured == placed.id || (configured == PRIMARY && placed.primary)
+}
+
+fn reported<'a>(
+    status: Option<&'a Status>,
+    machine: &str,
+    monitor: &str,
+) -> Option<&'a PlacedMonitor> {
+    status?
+        .machine(machine)?
+        .monitor
+        .iter()
+        .find(|m| names(monitor, m))
+}
+
+fn is_active(machine: &str, status: Option<&Status>) -> bool {
+    status
+        .and_then(|s| s.machine(machine))
+        .is_some_and(|m| m.active)
 }
 
 fn attached<'a>(displays: &'a [Monitor], id: &str) -> Option<&'a Monitor> {
@@ -223,7 +312,7 @@ fn presence_of(machine: &str, status: Option<&Status>) -> Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smkvm_config::status::Machine;
+    use smkvm_config::status::{Machine, PlacedMonitor};
     use smkvm_proto::Role;
 
     fn here() -> DeviceId {
@@ -336,11 +425,7 @@ mod tests {
             let status = Status::new(
                 Role::Server,
                 "this-one",
-                vec![Machine {
-                    name: "up-there".into(),
-                    device: None,
-                    state,
-                }],
+                vec![Machine::new("up-there", None, state)],
             );
             let desk = Desk::build("this-one", here(), &displays, &config, Some(&status));
             let theirs = desk.screens.iter().find(|s| s.machine == "up-there");
@@ -417,6 +502,111 @@ mod tests {
         for screen in &desk.screens {
             assert!(bounds.contains(screen.global.origin()), "{screen:?}");
         }
+    }
+
+    fn reported_machine(name: &str, active: bool, monitors: Vec<(&str, Rect, bool)>) -> Machine {
+        let mut machine = Machine::new(name, None, MachineState::Connected);
+        machine.active = active;
+        machine.monitor = monitors
+            .into_iter()
+            .map(|(id, rect, primary)| PlacedMonitor {
+                id: id.into(),
+                global: [rect.x, rect.y, rect.w, rect.h],
+                label: None,
+                primary,
+            })
+            .collect();
+        machine
+    }
+
+    #[test]
+    fn a_machine_the_configuration_does_not_place_is_drawn_where_the_daemon_put_it() {
+        // A freshly paired machine: the daemon arranged it automatically and
+        // the configuration has never heard of it. Without this it would be
+        // invisible, with no way to drag it anywhere.
+        let displays = vec![display("DP-2", Rect::new(0, 0, 2560, 1440), true)];
+        let status = Status::new(
+            Role::Server,
+            "this-one",
+            vec![reported_machine(
+                "newcomer",
+                false,
+                vec![("HDMI-1", Rect::new(2560, 0, 1920, 1080), true)],
+            )],
+        );
+        let desk = Desk::build(
+            "this-one",
+            here(),
+            &displays,
+            &config(vec![]),
+            Some(&status),
+        );
+        let theirs = desk
+            .screens
+            .iter()
+            .find(|s| s.machine == "newcomer")
+            .unwrap();
+        assert_eq!(theirs.global, Rect::new(2560, 0, 1920, 1080));
+        assert_eq!(theirs.presence, Presence::Here);
+        assert!(theirs.provisional, "not pinned until somebody drags it");
+
+        // Dragging it writes the machine into the configuration like any other.
+        let index = desk.find("newcomer", "HDMI-1").unwrap();
+        let (machine, placements) = desk.moved(index, Point::new(2560, 1440)).unwrap();
+        assert_eq!(machine, "newcomer");
+        assert_eq!(placements[0].id, "HDMI-1");
+        assert_eq!(placements[0].rect(), Rect::new(2560, 1440, 1920, 1080));
+    }
+
+    #[test]
+    fn the_configuration_wins_over_the_daemon_for_a_screen_it_places() {
+        let displays = vec![display("DP-2", Rect::new(0, 0, 2560, 1440), true)];
+        let config = config(vec![machine(
+            "up-there",
+            vec![at(PRIMARY, Rect::new(0, -1080, 1920, 1080))],
+        )]);
+        let status = Status::new(
+            Role::Server,
+            "this-one",
+            vec![reported_machine(
+                "up-there",
+                false,
+                vec![("HDMI-1", Rect::new(9000, 9000, 1920, 1080), true)],
+            )],
+        );
+        let desk = Desk::build("this-one", here(), &displays, &config, Some(&status));
+        let theirs: Vec<_> = desk
+            .screens
+            .iter()
+            .filter(|s| s.machine == "up-there")
+            .collect();
+        assert_eq!(theirs.len(), 1, "one screen, drawn once");
+        assert_eq!(theirs[0].global, Rect::new(0, -1080, 1920, 1080));
+        assert!(!theirs[0].provisional);
+    }
+
+    #[test]
+    fn this_machines_own_unconfigured_screens_sit_where_the_daemon_has_them() {
+        let displays = vec![display("DP-2", Rect::new(0, 0, 2560, 1440), true)];
+        let status = Status::new(
+            Role::Server,
+            "this-one",
+            vec![reported_machine(
+                "this-one",
+                true,
+                vec![("DP-2", Rect::new(640, 1080, 2560, 1440), true)],
+            )],
+        );
+        let desk = Desk::build(
+            "this-one",
+            here(),
+            &displays,
+            &config(vec![]),
+            Some(&status),
+        );
+        assert_eq!(desk.screens[0].global, Rect::new(640, 1080, 2560, 1440));
+        assert!(desk.screens[0].active, "the cursor is here");
+        assert!(desk.screens[0].provisional);
     }
 
     #[test]

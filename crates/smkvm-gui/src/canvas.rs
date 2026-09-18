@@ -271,6 +271,11 @@ impl Canvas {
                         screen.machine
                     )
                 }
+                Presence::Here if screen.provisional => format!(
+                    "{} was arranged automatically. Drag it to decide where it goes.",
+                    screen.machine
+                ),
+                Presence::Here if screen.active => "The cursor is here.".into(),
                 Presence::Here => "Drag a screen to arrange it.".into(),
             },
             None => "Drag a screen to arrange it.".into(),
@@ -346,8 +351,27 @@ fn draw(
                 Stroke::new(if lifted { 2.0 } else { 1.5 }, hue),
                 StrokeKind::Inside,
             );
+            // A screen the daemon placed on its own is drawn with a dashed
+            // edge inside the solid one: it is real and reachable, but where
+            // it sits is nobody's decision yet.
+            if screen.provisional && !lifted {
+                for dash in dashed(at.shrink(4.0), Stroke::new(1.0, palette.dim)) {
+                    painter.add(dash);
+                }
+            }
+            // The machine holding the cursor gets a second, heavier edge, so
+            // a glance at the window says where the pointer is.
+            if screen.active {
+                painter.rect_stroke(
+                    at.shrink(1.0),
+                    theme::SCREEN_RADIUS,
+                    Stroke::new(3.0, palette.accent),
+                    StrokeKind::Inside,
+                );
+            }
             let second = match screen.presence {
                 Presence::Held => Some("not taking input"),
+                _ if screen.active => Some("cursor is here"),
                 _ => screen.label.as_deref().or(Some(screen.monitor.as_str())),
             };
             write(painter, at, palette, screen, hue, second);
@@ -432,6 +456,8 @@ mod tests {
             global,
             presence,
             label: None,
+            active: false,
+            provisional: false,
         }
     }
 
