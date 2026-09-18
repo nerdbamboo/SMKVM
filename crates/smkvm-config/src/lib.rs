@@ -36,8 +36,11 @@ pub enum ConfigError {
     #[error("{path} is not valid configuration: {source}")]
     Parse {
         path: PathBuf,
+        // Boxed because the parser's error carries a span and a copy of the
+        // input, and every function that can fail this way would otherwise
+        // return a value that size whether it fails or not.
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("configuration could not be written: {0}")]
     Serialize(#[from] toml::ser::Error),
@@ -262,7 +265,7 @@ impl Config {
     pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
         if cfg.version > CONFIG_VERSION {
             return Err(ConfigError::TooNew {

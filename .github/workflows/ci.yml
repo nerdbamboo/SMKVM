@@ -50,10 +50,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Catches Windows-only compile breakage without needing a Windows
-      # runner or a linker: `check` does not link.
+      # Catches Windows-only breakage without needing a Windows runner or a
+      # linker, since neither `check` nor `clippy` links. Linting for the
+      # target as well as checking it matters because most of the
+      # platform-specific code only exists there.
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+      - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc
 
   msrv:
     name: minimum supported rust version

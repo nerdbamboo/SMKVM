@@ -14,8 +14,12 @@
 //! is large enough. Nothing here is ever dropped for being too big -- it is
 //! fetched when it is wanted, and until then it costs nothing.
 
+// Reaching a platform's clipboard means calling into it, which is the one
+// place unsafe is unavoidable. It is confined to the platform backends; the
+// format conversions and everything above them are held to the original rule.
 #![deny(unsafe_code)]
 
+pub mod files;
 pub mod html;
 pub mod image;
 pub mod platform;

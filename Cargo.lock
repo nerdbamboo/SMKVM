@@ -1105,6 +1105,7 @@ dependencies = [
  "smkvm-proto",
  "thiserror",
  "tracing",
+ "windows",
  "x11rb",
 ]
 

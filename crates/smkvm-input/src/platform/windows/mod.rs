@@ -185,7 +185,7 @@ impl Inject for WindowsInput {
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0),
-                    wScan: (scan & 0x00FF) as u16,
+                    wScan: scan & 0x00FF,
                     dwFlags: KEYBD_EVENT_FLAGS(flags.0),
                     time: 0,
                     dwExtraInfo: INJECTED_MARKER,
