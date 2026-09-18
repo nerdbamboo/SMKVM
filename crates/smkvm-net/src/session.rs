@@ -15,7 +15,7 @@ use smkvm_layout::DeviceId;
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::identity::{device_id, Identity};
-use crate::stream::{read_framed, write_framed, SecureStream};
+use crate::stream::{read_framed, split, write_framed, SecureReader, SecureWriter};
 use crate::trust::{Peer, Trust};
 use crate::{Error, Result, NOISE_PARAMS};
 
@@ -24,11 +24,19 @@ use crate::{Error, Result, NOISE_PARAMS};
 const PROLOGUE: &[u8] = b"smkvm session v1";
 
 /// An authenticated, encrypted connection to one machine.
-#[derive(Debug)]
 pub struct Session {
-    stream: SecureStream,
+    stream: TcpStream,
+    transport: snow::StatelessTransportState,
     peer: DeviceId,
     peer_name: String,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("peer", &self.peer_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Session {
@@ -40,12 +48,9 @@ impl Session {
         &self.peer_name
     }
 
-    pub fn stream(&mut self) -> &mut SecureStream {
-        &mut self.stream
-    }
-
-    pub fn into_stream(self) -> SecureStream {
-        self.stream
+    /// Separate the two directions so they can be driven independently.
+    pub fn split(self) -> (SecureReader, SecureWriter) {
+        split(self.stream, self.transport)
     }
 
     /// Open a session with a machine this one is paired with.
@@ -87,9 +92,12 @@ impl Session {
             .read_message(&reply, &mut scratch)
             .map_err(|_| Error::NotPaired)?;
 
-        let noise = noise.into_transport_mode().map_err(Error::Crypto)?;
+        let transport = noise
+            .into_stateless_transport_mode()
+            .map_err(Error::Crypto)?;
         Ok(Session {
-            stream: SecureStream::new(stream, noise),
+            stream,
+            transport,
             peer: peer.id,
             peer_name: peer.name.clone(),
         })
@@ -129,9 +137,12 @@ impl Session {
             .map_err(Error::Crypto)?;
         write_framed(&mut stream, &scratch[..n]).await?;
 
-        let noise = noise.into_transport_mode().map_err(Error::Crypto)?;
+        let transport = noise
+            .into_stateless_transport_mode()
+            .map_err(Error::Crypto)?;
         Ok(Session {
-            stream: SecureStream::new(stream, noise),
+            stream,
+            transport,
             peer: id,
             peer_name,
         })

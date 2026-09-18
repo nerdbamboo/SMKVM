@@ -12,7 +12,7 @@
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 use crate::identity::{device_id, Identity};
-use crate::stream::{read_framed, write_framed, SecureStream};
+use crate::stream::{read_framed, split, write_framed, SecureReader, SecureWriter};
 use crate::trust::Peer;
 use crate::{Error, Result, PAIRING_PARAMS};
 
@@ -63,12 +63,22 @@ impl std::fmt::Display for Code {
 /// Holding one proves the far machine possesses the key it presented. It does
 /// not mean anybody wants to talk to it, which is what [`Pairing::confirm`] is
 /// for.
-#[derive(Debug)]
 pub struct Pairing {
-    stream: SecureStream,
+    reader: SecureReader,
+    writer: SecureWriter,
+    addr: Option<std::net::SocketAddr>,
     code: Code,
     peer_key: Vec<u8>,
     peer_name: String,
+}
+
+impl std::fmt::Debug for Pairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pairing")
+            .field("code", &self.code)
+            .field("peer_name", &self.peer_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Pairing {
@@ -84,7 +94,7 @@ impl Pairing {
     }
 
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.stream.peer_addr()
+        self.addr
     }
 
     /// Offer to pair with a machine that is waiting for one.
@@ -172,9 +182,15 @@ impl Pairing {
     ) -> Result<Pairing> {
         let code = Code::from_handshake(noise.get_handshake_hash());
         let peer_key = noise.get_remote_static().ok_or(Error::NotPaired)?.to_vec();
-        let noise = noise.into_transport_mode().map_err(Error::Crypto)?;
+        let addr = stream.peer_addr().ok();
+        let transport = noise
+            .into_stateless_transport_mode()
+            .map_err(Error::Crypto)?;
+        let (reader, writer) = split(stream, transport);
         Ok(Pairing {
-            stream: SecureStream::new(stream, noise),
+            reader,
+            writer,
+            addr,
             code,
             peer_key,
             peer_name,
@@ -186,9 +202,9 @@ impl Pairing {
     /// Both ends must accept. One person confirming a code the other never saw
     /// is exactly the situation this is meant to prevent.
     pub async fn confirm(mut self) -> Result<Peer> {
-        self.stream.send(&[ACCEPT]).await?;
-        let reply = self.stream.recv().await?;
-        self.stream.shutdown().await;
+        self.writer.send(&[ACCEPT]).await?;
+        let reply = self.reader.recv().await?;
+        self.writer.shutdown().await;
         if reply.first() != Some(&ACCEPT) {
             return Err(Error::NotPaired);
         }
@@ -201,8 +217,8 @@ impl Pairing {
 
     /// Say no, and tell the other end so it can stop waiting.
     pub async fn reject(mut self) -> Result<()> {
-        let _ = self.stream.send(&[REJECT]).await;
-        self.stream.shutdown().await;
+        let _ = self.writer.send(&[REJECT]).await;
+        self.writer.shutdown().await;
         Ok(())
     }
 }
