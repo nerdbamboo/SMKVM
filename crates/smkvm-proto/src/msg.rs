@@ -57,7 +57,7 @@ pub enum Reject {
 }
 
 /// Why a client cannot accept input right now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuspendReason {
     /// Windows switched to the secure desktop, for a UAC prompt or

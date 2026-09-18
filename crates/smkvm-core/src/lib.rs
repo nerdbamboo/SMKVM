@@ -13,6 +13,8 @@
 
 #![forbid(unsafe_code)]
 
+mod client;
 mod server;
 
+pub use client::{Client, ClientAction};
 pub use server::{Action, Event, LocalAction, PointerMode, Server, Settings};

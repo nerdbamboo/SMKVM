@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 smkvm-layout = { path = "../smkvm-layout" }
 smkvm-proto = { path = "../smkvm-proto" }
+smkvm-input = { path = "../smkvm-input" }
 thiserror = { workspace = true }
 tracing = "0.1"
 

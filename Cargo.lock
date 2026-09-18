@@ -467,6 +467,7 @@ name = "smkvm-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "smkvm-input",
  "smkvm-layout",
  "smkvm-proto",
  "thiserror",
