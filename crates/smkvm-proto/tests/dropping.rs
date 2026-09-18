@@ -10,7 +10,10 @@
 //! cursor is somewhere it is not, with nothing on the way to correct it.
 
 use smkvm_layout::{DeviceId, Point};
-use smkvm_proto::{Hello, Key, MouseButton, Reject, Role, Scroll, ServerControl, PROTO_VERSION};
+use smkvm_proto::{
+    Bulk, ClipFormat, ClipSeq, Hello, Key, MouseButton, Reject, Role, Scroll, ServerControl,
+    PROTO_VERSION,
+};
 
 fn every_kind() -> Vec<ServerControl> {
     vec![
@@ -48,6 +51,14 @@ fn every_kind() -> Vec<ServerControl> {
         ServerControl::Ping { id: 1 },
         ServerControl::Pong { id: 1 },
         ServerControl::Goodbye,
+        ServerControl::Bulk(Bulk::ClipRequest {
+            seq: ClipSeq {
+                device: DeviceId::from_bytes([2; 32]),
+                counter: 1,
+            },
+            format: ClipFormat::Text,
+            offset: 0,
+        }),
     ]
 }
 
@@ -76,6 +87,14 @@ fn only_the_messages_a_later_one_repeats_may_be_lost() {
             ServerControl::Hello(_) | ServerControl::Rejected { .. } | ServerControl::Goodbye => {
                 false
             }
+            // Clipboard traffic is control, not motion. A lost chunk would
+            // stall a paste until it timed out and a lost offer or request
+            // would lose the clipboard outright, and nothing later repeats
+            // any of them. It is also paced -- one chunk asked for at a time,
+            // the next only once that one has arrived -- so it cannot fill
+            // the control queue by itself; that queue overflowing is a machine
+            // that has stopped reading, and the link is dropped and recovers.
+            ServerControl::Bulk(_) => false,
         };
         assert_eq!(
             msg.may_be_dropped(),
