@@ -39,7 +39,7 @@ impl Wired {
         layout.place(local, &"m0".into(), Point::new(0, 0));
 
         let mut wired = Wired {
-            server: Server::new(local, layout, Settings::default()),
+            server: Server::new(local, "server", layout, Settings::default()),
             client: Client::new(Loopback::single_screen()),
             client_id,
         };

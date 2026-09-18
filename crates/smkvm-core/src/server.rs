@@ -156,8 +156,13 @@ pub struct Server {
 
 impl Server {
     /// Start a server whose own machine is `local`.
-    pub fn new(local: DeviceId, layout: Layout, settings: Settings) -> Self {
+    pub fn new(local: DeviceId, name: impl Into<String>, layout: Layout, settings: Settings) -> Self {
         let mut layout = layout;
+        // Seed the machine's own entry so it is known by its name from the
+        // first log line, rather than by an identifier nobody can read.
+        if layout.device(local).is_none() {
+            layout.report_monitors(local, name, Vec::new());
+        }
         layout.edge_overflow = settings.edge_overflow;
         layout.set_online(local, true);
         let cursor = layout
@@ -516,6 +521,14 @@ impl Server {
             .unwrap_or_else(|| device.short());
         self.layout.report_monitors(device, name, monitors);
         self.layout.auto_place();
+        for cell in self.layout.cells() {
+            tracing::info!(
+                machine = %self.name_of(cell.device),
+                monitor = %cell.monitor,
+                at = ?(cell.global.x, cell.global.y, cell.global.w, cell.global.h),
+                "placed on the desktop"
+            );
+        }
         self.clients.entry(device).or_insert(Health::Ready);
         // The arrangement just changed under the cursor; make sure it is still
         // somewhere real.
@@ -560,6 +573,13 @@ impl Server {
             self.clients.insert(device, Health::Ready);
         }
         let _ = out;
+    }
+
+    fn name_of(&self, device: DeviceId) -> String {
+        self.layout
+            .device(device)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| device.short())
     }
 
     /// Bring the cursor back to the server's own screen.

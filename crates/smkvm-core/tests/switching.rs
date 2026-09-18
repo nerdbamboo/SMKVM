@@ -35,7 +35,7 @@ fn two_machines(settings: Settings) -> (Server, DeviceId, DeviceId) {
     layout.place(local, &"m0".into(), Point::new(0, 0));
     layout.place(client, &"m0".into(), Point::new(1920, 0));
 
-    let mut server = Server::new(local, layout, settings);
+    let mut server = Server::new(local, "server", layout, settings);
     // Until a machine finishes its handshake it has no session, however much
     // the layout knows about it.
     server.handle(
@@ -219,7 +219,7 @@ fn an_edge_with_no_session_beyond_it_is_a_wall() {
     );
     layout.place(local, &"m0".into(), Point::new(0, 0));
     layout.place(absent, &"m0".into(), Point::new(1920, 0));
-    let mut server = Server::new(local, layout, Settings::default());
+    let mut server = Server::new(local, "server", layout, Settings::default());
 
     server.handle(Event::PointerBy { dx: 960, dy: 540 }, now());
     let actions = server.handle(Event::PointerBy { dx: 5000, dy: 0 }, now());

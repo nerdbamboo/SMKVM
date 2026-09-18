@@ -50,7 +50,7 @@ pub async fn run(
     let mut injector = platform::injector()?;
     let capture = platform::start_capture(events_tx.clone())?;
 
-    let mut server = Server::new(identity.id(), layout, settings);
+    let mut server = Server::new(identity.id(), config.identity.name.clone(), layout, settings);
     // This machine's own displays, so it has a place on the desktop.
     let monitors = injector
         .monitors()
