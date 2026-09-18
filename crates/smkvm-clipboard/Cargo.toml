@@ -12,9 +12,11 @@ authors.workspace = true
 smkvm-proto = { path = "../smkvm-proto" }
 thiserror = { workspace = true }
 tracing = "0.1"
+png = "0.17"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb = { version = "0.13", features = ["xfixes"] }
 
 [dev-dependencies]
 proptest = "1"
+png = "0.17"

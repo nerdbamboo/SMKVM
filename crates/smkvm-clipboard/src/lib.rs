@@ -16,6 +16,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod html;
+pub mod image;
 pub mod platform;
 
 use smkvm_proto::ClipFormat;
