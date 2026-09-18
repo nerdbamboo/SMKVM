@@ -1,11 +1,17 @@
 //! The messages two SMKVM peers exchange.
 //!
-//! Traffic is split across two connections that share one authenticated
-//! session. [`ClientControl`] and [`ServerControl`] ride the control link and
-//! are all small; [`Bulk`] carries clipboard contents and file data on a
-//! separate link. Keeping them apart is what stops a large paste or a file
-//! transfer from stalling pointer motion, which is a single-stream design's
-//! unavoidable head-of-line blocking.
+//! Everything travels on one authenticated link. [`ClientControl`] and
+//! [`ServerControl`] are the small messages that decide where the cursor is;
+//! [`Bulk`] carries clipboard contents and file data, and rides inside them.
+//!
+//! One link, deliberately. A second connection for bulk data was the first
+//! design, and it buys nothing that pacing does not: contents move one chunk
+//! at a time, each requested only once the last has arrived, so however large
+//! a paste is, at most one chunk is ever queued ahead of a pointer movement. A
+//! chunk is [`crate::MAX_CHUNK_DATA`] bytes, well under a millisecond on any
+//! network these machines share, and a second link would have meant a second
+//! handshake, a second thing to fail, and a way to tell the two apart on
+//! arrival.
 
 use serde::{Deserialize, Serialize};
 use smkvm_layout::{DeviceId, Monitor, Point};
@@ -13,7 +19,7 @@ use smkvm_layout::{DeviceId, Monitor, Point};
 use crate::keys::{Key, MouseButton, Scroll};
 
 /// Wire format version. Bumped whenever a change would confuse an older peer.
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 
 /// Which side of the session a peer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +104,8 @@ pub enum ClientControl {
         id: u32,
     },
     Goodbye,
+    /// Clipboard or file traffic.
+    Bulk(Bulk),
 }
 
 /// Messages a server sends.
@@ -153,6 +161,8 @@ pub enum ServerControl {
         id: u32,
     },
     Goodbye,
+    /// Clipboard or file traffic.
+    Bulk(Bulk),
 }
 
 impl ServerControl {
@@ -191,7 +201,7 @@ pub struct ClipSeq {
 /// PNG is the interchange form for images: Windows holds device-independent
 /// bitmaps and X11 clients overwhelmingly ask for `image/png`, so converting
 /// at the edges is what makes an image copied on one machine paste on another.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipFormat {
     /// UTF-8 text.
@@ -268,12 +278,20 @@ pub struct FileOffer {
 }
 
 /// Clipboard and file traffic. Symmetric: either peer may send any of these.
+///
+/// Contents move one chunk per request. A [`Bulk::ClipRequest`] names an
+/// offset and is answered by exactly one [`Bulk::ClipChunk`] starting there,
+/// of at most [`crate::MAX_CHUNK_DATA`] bytes; the requester asks for the next
+/// once it has that one. That single rule is what keeps a large paste from
+/// ever queuing more than one chunk ahead of the pointer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Bulk {
     ClipOffer(ClipOffer),
+    /// Ask for the chunk of `format` beginning at `offset`.
     ClipRequest {
         seq: ClipSeq,
         format: ClipFormat,
+        offset: u64,
     },
     ClipChunk {
         seq: ClipSeq,

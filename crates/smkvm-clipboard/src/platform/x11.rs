@@ -11,6 +11,9 @@
 //! of a browser, since browsers use it readily.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smkvm_proto::ClipFormat;
@@ -25,7 +28,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
 
-use crate::{Available, ClipboardError, Read, Result, Watch};
+use crate::{Available, ClipboardError, Fetch, Read, Result, Watch, Write};
 
 /// How long to wait for the application holding the selection to answer.
 ///
@@ -111,6 +114,9 @@ pub struct X11Clipboard {
     atoms: Atoms,
     /// Events seen while waiting for something else, kept so nothing is lost.
     deferred: Vec<Event>,
+    /// A window whose taking of the clipboard is not news: this program's own
+    /// offer, made through another connection. Zero for none.
+    ignore_owner: Option<Arc<AtomicU32>>,
 }
 
 impl X11Clipboard {
@@ -149,7 +155,18 @@ impl X11Clipboard {
             window,
             atoms,
             deferred: Vec::new(),
+            ignore_owner: None,
         })
+    }
+
+    /// Do not report a change when the clipboard is taken by this window.
+    ///
+    /// An offer made on another machine's behalf is a change of owner like
+    /// any other, and reporting it would send that machine's clipboard
+    /// straight back to it. The writer publishes the window it owns through,
+    /// and the watcher is told to look away from it.
+    pub fn ignore_changes_by(&mut self, owner: Arc<AtomicU32>) {
+        self.ignore_owner = Some(owner);
     }
 
     /// Ask to be told whenever the clipboard changes hands.
@@ -351,7 +368,14 @@ impl Watch for X11Clipboard {
     fn next_change(&mut self) -> Option<Available> {
         loop {
             let event = self.next_event().ok()?;
-            if matches!(event, Event::XfixesSelectionNotify(_)) {
+            if let Event::XfixesSelectionNotify(notice) = &event {
+                let ours = self
+                    .ignore_owner
+                    .as_ref()
+                    .is_some_and(|w| w.load(Ordering::Relaxed) == notice.owner);
+                if ours {
+                    continue;
+                }
                 return self.available().ok();
             }
             // Requests aimed at us are somebody else's concern here; hold them
@@ -432,6 +456,11 @@ impl X11Owner {
 
     pub fn owns_clipboard(&self) -> bool {
         self.owns
+    }
+
+    /// The window the clipboard is held through.
+    pub fn window(&self) -> Window {
+        self.clipboard.window
     }
 
     /// Deal with one event, waiting until one arrives.
@@ -654,4 +683,159 @@ impl X11Owner {
         }
         Ok(self.clipboard)
     }
+}
+
+/// Something to do on the owner's thread.
+enum Command {
+    Offer(Vec<ClipFormat>, Box<dyn Fetch>),
+    Release,
+}
+
+/// Holds the clipboard on other machines' behalf, from a thread of its own.
+///
+/// An X11 owner has to keep answering for as long as its offer stands, and an
+/// answer may mean fetching from another machine, which takes as long as it
+/// takes. None of that belongs on the thread deciding where the cursor is, so
+/// the owner lives here and is spoken to through a channel.
+pub struct X11Writer {
+    commands: mpsc::Sender<Command>,
+    owner_window: Arc<AtomicU32>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl X11Writer {
+    /// Open a connection of its own and stand ready to take the clipboard.
+    pub fn open() -> Result<X11Writer> {
+        Self::open_display(None)
+    }
+
+    pub fn open_display(display: Option<&str>) -> Result<X11Writer> {
+        let display = display.map(str::to_string);
+        // Connected here rather than on the thread, so a display that cannot
+        // be reached is reported to the caller instead of to a log nobody is
+        // watching yet.
+        let clipboard = X11Clipboard::open_display(display.as_deref())?;
+        let (commands, inbox) = mpsc::channel();
+        let owner_window = Arc::new(AtomicU32::new(0));
+        let published = owner_window.clone();
+        let thread = std::thread::Builder::new()
+            .name("smkvm-clipboard-owner".into())
+            .spawn(move || owner_thread(clipboard, display, inbox, published))
+            .map_err(|e| ClipboardError::Display(format!("could not start a thread: {e}")))?;
+        Ok(X11Writer {
+            commands,
+            owner_window,
+            thread: Some(thread),
+        })
+    }
+
+    /// The window this program holds the clipboard through, or zero when it
+    /// holds nothing. For a watcher to look away from.
+    pub fn owner_window(&self) -> Arc<AtomicU32> {
+        self.owner_window.clone()
+    }
+
+    fn send(&self, command: Command) -> Result<()> {
+        self.commands
+            .send(command)
+            .map_err(|_| ClipboardError::Display("the clipboard owner thread has stopped".into()))
+    }
+}
+
+impl Write for X11Writer {
+    fn offer(&mut self, formats: &[ClipFormat], source: Box<dyn Fetch>) -> Result<()> {
+        self.send(Command::Offer(formats.to_vec(), source))
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.send(Command::Release)
+    }
+}
+
+impl Drop for X11Writer {
+    fn drop(&mut self) {
+        // Closing the channel is the signal to stop; the owner lets go of the
+        // clipboard on its way out.
+        let (stop, _) = mpsc::channel();
+        self.commands = stop;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// How long the owner thread waits for an instruction before looking after the
+/// clipboard again. Short, because a paste is somebody waiting.
+const OWNER_TICK: Duration = Duration::from_millis(5);
+
+fn owner_thread(
+    clipboard: X11Clipboard,
+    display: Option<String>,
+    inbox: mpsc::Receiver<Command>,
+    published: Arc<AtomicU32>,
+) {
+    let mut owner: Option<X11Owner> = None;
+    // The connection an offer is made through, between offers.
+    let mut idle: Option<X11Clipboard> = Some(clipboard);
+    let reconnect = || X11Clipboard::open_display(display.as_deref()).ok();
+
+    // Let go of whatever is held, and get the connection back for next time.
+    let take_back = |owner: &mut Option<X11Owner>, idle: &mut Option<X11Clipboard>| {
+        if let Some(held) = owner.take() {
+            published.store(0, Ordering::Relaxed);
+            match held.release() {
+                Ok(conn) => *idle = Some(conn),
+                Err(e) => {
+                    tracing::warn!("could not give the clipboard back: {e}");
+                    *idle = reconnect();
+                }
+            }
+        }
+    };
+
+    loop {
+        let command = match inbox.recv_timeout(OWNER_TICK) {
+            Ok(command) => Some(command),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        match command {
+            Some(Command::Offer(formats, source)) => {
+                take_back(&mut owner, &mut idle);
+                let Some(conn) = idle.take().or_else(reconnect) else {
+                    tracing::warn!("cannot reach the display to offer the clipboard");
+                    continue;
+                };
+                match X11Owner::take(conn, &formats, source) {
+                    Ok(taken) => {
+                        published.store(taken.window(), Ordering::Relaxed);
+                        owner = Some(taken);
+                    }
+                    Err(e) => {
+                        tracing::warn!("could not take the clipboard: {e}");
+                        idle = reconnect();
+                    }
+                }
+            }
+            Some(Command::Release) => take_back(&mut owner, &mut idle),
+            None => {}
+        }
+
+        if let Some(held) = owner.as_mut() {
+            match held.serve_pending() {
+                Ok(true) => {}
+                // Something else copied; the clipboard is theirs now and there
+                // is nothing left to answer.
+                Ok(false) => take_back(&mut owner, &mut idle),
+                Err(e) => {
+                    tracing::warn!("serving the clipboard failed: {e}");
+                    published.store(0, Ordering::Relaxed);
+                    owner = None;
+                    idle = reconnect();
+                }
+            }
+        }
+    }
+    take_back(&mut owner, &mut idle);
 }

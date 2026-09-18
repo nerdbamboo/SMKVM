@@ -14,7 +14,11 @@
 #![forbid(unsafe_code)]
 
 mod client;
+pub mod exchange;
 mod server;
 
 pub use client::{Client, ClientAction};
-pub use server::{Action, Event, LocalAction, Placement, PointerMode, Server, Settings};
+pub use exchange::Exchange;
+pub use server::{
+    Action, ClientHealth, Event, LocalAction, Placement, PointerMode, Server, Settings,
+};

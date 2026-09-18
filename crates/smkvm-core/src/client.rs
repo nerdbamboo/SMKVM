@@ -179,8 +179,12 @@ impl<I: Inject> Client<I> {
                 self.disconnected();
                 Vec::new()
             }
-            // Handshake messages are the session layer's business.
-            ServerControl::Hello(_) | ServerControl::Rejected { .. } => Vec::new(),
+            // Handshake messages are the session layer's business, and the
+            // clipboard is the exchange's: both are dealt with before anything
+            // reaches here.
+            ServerControl::Hello(_) | ServerControl::Rejected { .. } | ServerControl::Bulk(_) => {
+                Vec::new()
+            }
         }
     }
 

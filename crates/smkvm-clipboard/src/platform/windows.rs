@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
 };
 
-use crate::{files, html, image, Available, ClipboardError, Fetch, Result};
+use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
 
 /// How long to keep trying to open the clipboard.
 ///
@@ -451,15 +451,46 @@ impl WindowsClipboard {
     }
 
     /// Offer another machine's clipboard here.
-    pub fn offer(&mut self, formats: &[ClipFormat], source: Box<dyn Fetch>) -> Result<()> {
+    pub fn offer(&self, formats: &[ClipFormat], source: Box<dyn Fetch>) -> Result<()> {
+        self.handle().offer(formats, source)
+    }
+
+    /// Stop offering, leaving the clipboard to whatever takes it next.
+    pub fn release(&self) -> Result<()> {
+        self.handle().release()
+    }
+
+    /// A way to offer and read from another thread, while this one watches.
+    ///
+    /// Watching blocks on the next change, so whoever needs to read the
+    /// clipboard or put an offer on it cannot be the same holder. The handle
+    /// reaches the same window thread and the same clipboard.
+    pub fn handle(&self) -> WindowsHandle {
+        WindowsHandle {
+            formats: self.formats,
+            offers: self.offers.clone(),
+            thread_id: self.thread_id,
+        }
+    }
+}
+
+/// Offers to and reads from the clipboard, from any thread.
+#[derive(Clone)]
+pub struct WindowsHandle {
+    formats: Formats,
+    offers: Sender<(Vec<ClipFormat>, Box<dyn Fetch>)>,
+    thread_id: u32,
+}
+
+impl WindowsHandle {
+    pub fn offer(&self, formats: &[ClipFormat], source: Box<dyn Fetch>) -> Result<()> {
         self.offers
             .send((formats.to_vec(), source))
             .map_err(|_| ClipboardError::Display("the clipboard thread has stopped".into()))?;
         self.post(WM_OFFER)
     }
 
-    /// Stop offering, leaving the clipboard to whatever takes it next.
-    pub fn release(&mut self) -> Result<()> {
+    pub fn release(&self) -> Result<()> {
         self.post(WM_RELEASE)
     }
 
@@ -468,6 +499,22 @@ impl WindowsClipboard {
         // running.
         unsafe { PostThreadMessageW(self.thread_id, message, WPARAM(0), LPARAM(0)) }
             .map_err(|_| last_error("reaching the clipboard thread"))
+    }
+}
+
+impl crate::Read for WindowsHandle {
+    fn read(&mut self, format: &ClipFormat) -> Result<Vec<u8>> {
+        read_format(self.formats, format)
+    }
+}
+
+impl Write for WindowsHandle {
+    fn offer(&mut self, formats: &[ClipFormat], source: Box<dyn Fetch>) -> Result<()> {
+        WindowsHandle::offer(self, formats, source)
+    }
+
+    fn release(&mut self) -> Result<()> {
+        WindowsHandle::release(self)
     }
 }
 
@@ -488,7 +535,7 @@ pub struct WindowsWatcher(pub WindowsClipboard);
 
 impl Drop for WindowsClipboard {
     fn drop(&mut self) {
-        let _ = self.post(WM_QUIT);
+        let _ = self.handle().post(WM_QUIT);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

@@ -197,3 +197,87 @@ fn something_far_too_large_for_one_message_still_arrives_whole() {
     assert_eq!(got[0].1.len(), big.len(), "arrived short");
     assert_eq!(got[0].1, big, "arrived corrupted");
 }
+
+/// The owner thread, driven the way the daemon drives it: an offer goes in
+/// through the `Write` trait, and a second connection pastes.
+#[test]
+fn the_owner_thread_serves_an_offer_and_hides_its_own_change_from_the_watcher() {
+    use smkvm_clipboard::platform::x11::X11Writer;
+    use smkvm_clipboard::{Watch as _, Write as _};
+
+    let Some(server) = start_server() else {
+        eprintln!("skipping: could not start Xvfb");
+        return;
+    };
+    let display = server.display.clone();
+
+    let mut writer = X11Writer::open_display(Some(&display)).expect("writer connects");
+    let mut watcher = X11Clipboard::open_display(Some(&display)).expect("watcher connects");
+    watcher.ignore_changes_by(writer.owner_window());
+    watcher.watch().expect("watches the clipboard");
+
+    writer
+        .offer(
+            &[ClipFormat::Text],
+            Box::new(Canned(vec![(ClipFormat::Text, b"served".to_vec())])),
+        )
+        .expect("offers");
+
+    // The offer is served to whoever pastes.
+    let mut reader = X11Clipboard::open_display(Some(&display)).expect("reader connects");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let got = loop {
+        if let Ok(bytes) = reader.read(&ClipFormat::Text) {
+            break bytes;
+        }
+        assert!(Instant::now() < deadline, "the offer was never served");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(got, b"served");
+
+    // The watcher, told to look away from the owner window, saw nothing: our
+    // own offer is not a copy. The reader's requests are not changes of
+    // ownership either. Probed by handing the watcher a real change next and
+    // checking that is the first thing it reports.
+    let (tell, heard) = mpsc::channel();
+    let watching = std::thread::spawn(move || {
+        let change = watcher.next_change();
+        let _ = tell.send(change);
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        heard.try_recv().is_err(),
+        "the watcher should not have reported our own offer"
+    );
+
+    // Something else copies: that is a change, and it ends our ownership.
+    // Like any application that copies, it has to answer for what it holds
+    // -- the watcher asks it what formats it offers -- so it serves from a
+    // thread until told to stop.
+    let other = X11Clipboard::open_display(Some(&display)).expect("another app connects");
+    let (stop, stopped) = mpsc::channel::<()>();
+    let serving = std::thread::spawn(move || {
+        let mut other_owner = X11Owner::take(
+            other,
+            &[ClipFormat::Html],
+            Box::new(Canned(vec![(ClipFormat::Html, b"<i>x</i>".to_vec())])),
+        )
+        .expect("takes the clipboard");
+        while stopped.try_recv().is_err() {
+            match other_owner.serve_pending() {
+                Ok(true) => std::thread::sleep(Duration::from_millis(2)),
+                Ok(false) | Err(_) => break,
+            }
+        }
+    });
+    let announced = heard
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the watcher reports the change")
+        .expect("the display is still there");
+    assert_eq!(announced.formats, vec![ClipFormat::Html]);
+    let _ = stop.send(());
+    let _ = serving.join();
+    let _ = watching.join();
+    drop(writer);
+    drop(server);
+}
