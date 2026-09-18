@@ -9,6 +9,7 @@ members = [
     "crates/smkvm-net",
     "crates/smkvm-clipboard",
     "crates/smkvm-cli",
+    "crates/smkvm-gui",
 ]
 
 [workspace.package]
