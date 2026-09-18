@@ -1,0 +1,18 @@
+[package]
+name = "smkvm-proto"
+description = "SMKVM wire protocol: message types, framing, and codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smkvm-layout = { path = "../smkvm-layout" }
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,19 @@
+[package]
+name = "smkvm-config"
+description = "SMKVM configuration, and migration from an existing Barrier setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+smkvm-layout = { path = "../smkvm-layout" }
+smkvm-proto = { path = "../smkvm-proto" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+proptest = "1"

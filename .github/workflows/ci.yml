@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+
+  test:
+    name: test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+
+  msrv:
+    name: minimum supported rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      # Pure crates only: the platform crates pull in newer toolchain needs.
+      - run: cargo check -p smkvm-layout -p smkvm-proto
