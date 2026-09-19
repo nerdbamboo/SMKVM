@@ -68,3 +68,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Pure crates only: the platform crates pull in newer toolchain needs.
       - run: cargo check -p smkvm-layout -p smkvm-proto
+
+  readmes:
+    name: the readmes move together
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The English, Korean and Japanese READMEs are one document. A change to
+      # one of them that never reaches the others leaves the repository saying
+      # different things in different languages, quietly.
+      - name: translations keep up with the english
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            echo "no earlier commit to compare against; nothing to check"
+            exit 0
+          fi
+          scripts/check-readmes.sh "$BASE" "$HEAD"
