@@ -80,25 +80,40 @@ invisible, look for other KVM software first.
 
 ## What is still wrong
 
-**Nothing on `feat/clipboard-status` has run on the real machines.** First
-things to watch when it does, in the log on each end:
+Everything on `main` has now run on the real machines, with the clipboard
+exercised in both directions and the log read on both ends. Found and fixed
+so far, each with a test that failed first: the X11 watcher going deaf after
+its first look (an event it held back was fed straight back to itself, for
+ever, at full CPU), and the bitmap handed to Windows under `CF_DIB` having a
+v5 header Windows will not turn into a `CF_BITMAP` (the paste came up empty
+while the log said it had been handed over). What remains:
 
-- `machine connected` followed by nothing: the Hello exchange is refusing
-  an older build. Both ends must be the same build.
-- `offering another machine's clipboard here` on a copy, then a paste that
-  produces nothing within a few seconds: read `could not supply the
-  clipboard` on the far end, and `the other machine did not hand the
-  clipboard over in time` here. On Windows the render happens on the
-  clipboard window thread, blocking it for up to 30 s per format if the far
-  end does not answer.
-- A copy on one machine that comes straight back as an offer to it is the
-  echo suppression failing: the watcher ignores changes by the writer's own
-  window on X11 and `state.ours` on Windows, with a 750 ms window in the
-  exchange as the backstop.
-- `letting the link go: too far behind` on the server: a client's control
-  queue filled, which takes a thousand unread state changes. It reconnects
-  on its own; frequent occurrences mean the client has genuinely stopped
-  reading.
+- **One copy on Windows arrives as two offers.** `WM_CLIPBOARDUPDATE` fires
+  twice for a single `SetText`, about 8 ms apart, and each becomes a new
+  sequence number and a new offer to every machine. Harmless so far -- the
+  second supersedes the first -- but it doubles the X11 ownership dance on
+  every client and is the first thing to suspect in any "stale" report.
+- **A change notice with nothing usable in it erases what is held.**
+  `Exchange::local_changed` takes `local` and `remote` away before noticing
+  the formats are empty, and announces nothing. A peer then keeps offering a
+  sequence the holder has forgotten, and the next paste there is refused as
+  stale. Either ignore such notices or announce a release; the wire has no
+  release message yet.
+- **The X11 owner thread blocks on the network.** Serving a paste calls
+  `Fetch::fetch`, which waits up to 30 s for the far machine, and no new offer
+  is taken up until it returns -- so a slow or failed fetch leaves the owner
+  answering with the sequence number of an offer the exchange has already
+  replaced. The Windows side has the same shape inside `WM_RENDERFORMAT`.
+- **The GUI on a client shows only that client.** A client's status report
+  carries no desk -- `monitor = []` even for its own screens -- so the desk
+  view is complete only on the server. Either the server sends the desk to
+  its clients or the GUI reads the server's report over the link.
+- **`files` in the default formats carries paths, not files.** A list of
+  files copied on one machine is offered on the others as `CF_HDROP` or
+  `text/uri-list` naming paths that exist only where they were copied. It
+  should stay off until transfer exists to back it.
+- **Log lines print `DeviceId` as thirty-two decimal bytes.** Hex, or the
+  machine's name, would make the clipboard lines readable.
 
 **File transfer** is not started.
 
