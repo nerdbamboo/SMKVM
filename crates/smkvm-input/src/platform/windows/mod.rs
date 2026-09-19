@@ -14,6 +14,8 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR,
     MONITORINFO, MONITORINFOEXW,
 };
+use windows::Win32::UI::Accessibility::MOUSEKEYS;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_NUMLOCK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
@@ -23,8 +25,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, EDD_GET_DEVICE_INTERFACE_NAME, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, XBUTTON1, XBUTTON2,
+    GetSystemMetrics, SystemParametersInfoW, EDD_GET_DEVICE_INTERFACE_NAME, MKF_AVAILABLE,
+    MKF_MOUSEKEYSON, MKF_REPLACENUMBERS, MONITORINFOF_PRIMARY, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_MOUSEPRESENT, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPIF_SENDCHANGE,
+    SPI_GETMOUSEKEYS, SPI_SETMOUSEKEYS, XBUTTON1, XBUTTON2,
 };
 
 use crate::keymap::hid_to_scancode;
@@ -63,6 +67,9 @@ pub struct WindowsInput {
     wheel_remainder: (i32, i32),
     /// Where the pointer was before it was moved out of the way.
     parked: Parked,
+    /// The MouseKeys setting as it was before this forced the pointer to be
+    /// drawn, kept so it can be put back. `None` while nothing is forced.
+    mouse_keys_before: Option<MOUSEKEYS>,
 }
 
 impl Default for WindowsInput {
@@ -76,6 +83,53 @@ impl WindowsInput {
         Self {
             wheel_remainder: (0, 0),
             parked: Parked::default(),
+            mouse_keys_before: None,
+        }
+    }
+
+    /// Make Windows draw the pointer on a machine that has no mouse.
+    ///
+    /// Windows hides the pointer altogether when no mouse is attached --
+    /// `GetCursorInfo` reports it hidden with no cursor handle at all, and
+    /// injected motion moves an invisible point. A machine driven only from
+    /// another machine has exactly no mouse. The one thing that persuades
+    /// Windows a mouse is present is the MouseKeys accessibility setting,
+    /// which is what Barrier did too, so it is switched on while the cursor
+    /// is here and put back the moment it leaves.
+    ///
+    /// MouseKeys lets the number pad steer the pointer, which would eat the
+    /// digits typed there. Which state of Num Lock it steers in is a flag,
+    /// so it is set to the state Num Lock is *not* in right now: the digits
+    /// keep typing, and steering needs a Num Lock press nobody makes.
+    fn force_pointer_drawn(&mut self) {
+        if self.mouse_keys_before.is_some() {
+            return;
+        }
+        // SAFETY: a plain query of a system metric.
+        if unsafe { GetSystemMetrics(SM_MOUSEPRESENT) } != 0 {
+            return;
+        }
+        let Some(before) = mouse_keys() else {
+            return;
+        };
+        let mut wanted = before;
+        wanted.dwFlags |= MKF_AVAILABLE | MKF_MOUSEKEYSON;
+        // SAFETY: reading a key's toggle state takes no pointers.
+        let num_lock_on = unsafe { GetKeyState(VK_NUMLOCK.0 as i32) } & 1 != 0;
+        if num_lock_on {
+            wanted.dwFlags &= !MKF_REPLACENUMBERS;
+        } else {
+            wanted.dwFlags |= MKF_REPLACENUMBERS;
+        }
+        if set_mouse_keys(&wanted) {
+            self.mouse_keys_before = Some(before);
+        }
+    }
+
+    /// Put the MouseKeys setting back as it was found.
+    fn release_pointer_forcing(&mut self) {
+        if let Some(before) = self.mouse_keys_before.take() {
+            set_mouse_keys(&before);
         }
     }
 
@@ -239,6 +293,9 @@ impl Inject for WindowsInput {
         // takes the pointer away from the person. It has been moved, not
         // caged, so their own mouse brings it back whatever this program
         // manages to do.
+        // The pointer is about to be on another machine; a number pad here
+        // should type digits again whatever Num Lock does meanwhile.
+        self.release_pointer_forcing();
         let desk = virtual_desktop();
         if desk.is_empty() {
             return Ok(());
@@ -278,11 +335,51 @@ impl Inject for WindowsInput {
         // would exit immediately having achieved nothing, and report success.
         // A pointer hidden by another program is that program's to show, and
         // the answer is to close it.
+        self.force_pointer_drawn();
         let Some((x, y)) = self.parked.restore() else {
             return Ok(());
         };
         self.place(x, y)
     }
+}
+
+impl Drop for WindowsInput {
+    fn drop(&mut self) {
+        self.release_pointer_forcing();
+    }
+}
+
+/// The MouseKeys setting as it stands, or `None` if Windows will not say.
+fn mouse_keys() -> Option<MOUSEKEYS> {
+    let mut keys = MOUSEKEYS {
+        cbSize: std::mem::size_of::<MOUSEKEYS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `keys` is correctly sized and lives for the call.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSEKEYS,
+            keys.cbSize,
+            Some(&mut keys as *mut MOUSEKEYS as *mut _),
+            Default::default(),
+        )
+    };
+    ok.is_ok().then_some(keys)
+}
+
+fn set_mouse_keys(keys: &MOUSEKEYS) -> bool {
+    let mut keys = *keys;
+    keys.cbSize = std::mem::size_of::<MOUSEKEYS>() as u32;
+    // SAFETY: as above; the setting is broadcast so the shell picks it up.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_SETMOUSEKEYS,
+            keys.cbSize,
+            Some(&mut keys as *mut MOUSEKEYS as *mut _),
+            SPIF_SENDCHANGE,
+        )
+    }
+    .is_ok()
 }
 
 /// Collects displays during enumeration.
