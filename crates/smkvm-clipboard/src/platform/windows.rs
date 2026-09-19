@@ -38,10 +38,10 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    PostThreadMessageW, RegisterClassW, TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
+    PostThreadMessageW, RegisterClassW, SetTimer, TranslateMessage, HWND_MESSAGE, MSG,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WM_RENDERALLFORMATS,
+    WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
 
 use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
@@ -57,6 +57,12 @@ const OPEN_PATIENCE: Duration = Duration::from_millis(500);
 const WM_OFFER: u32 = WM_APP + 1;
 /// Asks it to give the clipboard back.
 const WM_RELEASE: u32 = WM_APP + 2;
+
+/// The timer that lets a burst of change notices settle into one report.
+const SETTLE_TIMER: usize = 1;
+/// How long to wait for the burst to end. The steps of one copy are a few
+/// milliseconds apart; two copies by a person are never this close.
+const SETTLE_MS: u32 = 60;
 
 fn last_error(what: &str) -> ClipboardError {
     ClipboardError::Display(format!(
@@ -332,13 +338,35 @@ unsafe extern "system" fn window_proc(
                 }
                 state.offer = None;
                 state.cache.clear();
-                let formats = state.formats;
-                let sender = state.changes.clone();
-                drop(slot);
+            });
+            // One copy arrives as several of these: an application that sets
+            // the clipboard through OLE empties it and fills it in more than
+            // one step, and each step is a notice, a few milliseconds apart.
+            // Reporting each made every copy two offers, and a paste that had
+            // asked for the first was refused as stale when the second
+            // replaced it. So the report waits a moment, and a burst becomes
+            // one report of how the clipboard was finally left.
+            // SAFETY: a timer on this thread's own window; re-setting an
+            // existing timer restarts it.
+            unsafe {
+                SetTimer(window, SETTLE_TIMER, SETTLE_MS, None);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == SETTLE_TIMER => {
+            // SAFETY: balanced against the SetTimer above.
+            unsafe {
+                let _ = KillTimer(window, SETTLE_TIMER);
+            }
+            let report = STATE.with(|cell| {
+                let slot = cell.borrow();
+                slot.as_ref().map(|s| (s.formats, s.changes.clone()))
+            });
+            if let Some((formats, sender)) = report {
                 if Opened::take(HWND::default()).is_ok() {
                     let _ = sender.send(available_now(formats));
                 }
-            });
+            }
             LRESULT(0)
         }
         WM_RENDERFORMAT => {
