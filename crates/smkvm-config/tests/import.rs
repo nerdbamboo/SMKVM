@@ -1,16 +1,20 @@
 //! Migrating a real Barrier installation.
 //!
-//! The fixtures are a genuine `Barrier.conf` (addresses replaced) and a
-//! server-side text config of the kind a multi-monitor user ends up
-//! hand-writing. What matters is that the settings worth keeping come across,
-//! that trust does not, and that the user is told what was left behind.
+//! The fixtures are a genuine `Barrier.conf` from the GUI (names and addresses
+//! replaced), kept here as `qt-settings.conf`, and a server-side `barrier.conf`
+//! of the kind a multi-monitor user ends up hand-writing, kept as
+//! `server-config.conf`. Barrier's own names for the two differ only in case,
+//! which a Windows checkout cannot tell apart -- it wrote one file under both
+//! names, and every test here read the wrong one. What matters is that the
+//! settings worth keeping come across, that trust does not, and that the user
+//! is told what was left behind.
 
 use smkvm_config::barrier::{Edge, Import, ServerConfig};
 use smkvm_config::{Config, DEFAULT_PORT};
 use smkvm_proto::Role;
 
-const QT_SETTINGS: &str = include_str!("fixtures/Barrier.conf");
-const SERVER_CONFIG: &str = include_str!("fixtures/barrier.conf");
+const QT_SETTINGS: &str = include_str!("fixtures/qt-settings.conf");
+const SERVER_CONFIG: &str = include_str!("fixtures/server-config.conf");
 
 fn import() -> Import {
     Import::from_qt_settings(QT_SETTINGS)
