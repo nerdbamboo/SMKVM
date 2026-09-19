@@ -21,7 +21,8 @@ use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
-    PropertyNotifyEvent, SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass,
+    PropertyNotifyEvent, SelectionNotifyEvent, SelectionRequestEvent, Timestamp, Window,
+    WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -226,10 +227,18 @@ impl X11Clipboard {
                 Some(event) => match want(&event) {
                     Some(value) => return Ok(value),
                     // A change of owner seen mid-conversion is news the watcher
-                    // still has to hear. Everything else on this connection
-                    // is the trail of our own asking -- properties written
-                    // and deleted on our window -- and matters to nobody.
-                    None if matches!(event, Event::XfixesSelectionNotify(_)) => {
+                    // still has to hear, and a request or a clearing is the
+                    // owner's to deal with once it is done asking. Property
+                    // notices are the trail of our own asking -- written and
+                    // deleted on our window -- and matter to nobody; kept,
+                    // they were once fed back into the watcher's loop for ever.
+                    None if matches!(
+                        event,
+                        Event::XfixesSelectionNotify(_)
+                            | Event::SelectionRequest(_)
+                            | Event::SelectionClear(_)
+                    ) =>
+                    {
                         self.deferred.push(event)
                     }
                     None => {}
@@ -332,6 +341,24 @@ impl X11Clipboard {
         }
     }
 
+    /// The server's idea of now.
+    ///
+    /// X11 has no request for the time; the way to learn it is to change a
+    /// property on a window of one's own and read the time off the notice.
+    fn server_time(&mut self) -> Result<Timestamp> {
+        let window = self.window;
+        let atom = self.atoms.transfer;
+        self.conn
+            .change_property8(PropMode::APPEND, window, atom, AtomEnum::STRING, &[])
+            .map_err(display_err)?;
+        self.conn.flush().map_err(display_err)?;
+        let deadline = Instant::now() + ANSWER_TIMEOUT;
+        self.wait_for(deadline, |event| match event {
+            Event::PropertyNotify(e) if e.window == window && e.atom == atom => Some(e.time),
+            _ => None,
+        })
+    }
+
     /// What the current owner says it can provide.
     pub fn available(&mut self) -> Result<Available> {
         let targets = match self.convert(self.atoms.targets) {
@@ -416,6 +443,11 @@ pub struct X11Owner {
     /// Largest property this server will accept in one go.
     chunk: usize,
     owns: bool,
+    /// The server's time when the selection was taken. Giving a selection up
+    /// sends its owner a SelectionClear -- including when the owner is this
+    /// very window letting go before taking it again -- and one from before
+    /// this moment is about an ownership that is already over.
+    since: Timestamp,
 }
 
 impl X11Owner {
@@ -429,9 +461,11 @@ impl X11Owner {
         // its header; going over is a protocol error rather than a short read.
         let chunk = (clipboard.conn.maximum_request_bytes() / 2).max(4096);
 
+        let mut clipboard = clipboard;
+        let since = clipboard.server_time()?;
         clipboard
             .conn
-            .set_selection_owner(clipboard.window, clipboard.atoms.clipboard, CURRENT_TIME)
+            .set_selection_owner(clipboard.window, clipboard.atoms.clipboard, since)
             .map_err(display_err)?;
         clipboard.conn.flush().map_err(display_err)?;
 
@@ -453,11 +487,36 @@ impl X11Owner {
             in_flight: Vec::new(),
             chunk,
             owns: true,
+            since,
         })
+    }
+
+    /// Offer something else through the selection this already holds.
+    ///
+    /// Letting go and taking again would work, but the letting go sends
+    /// this window a SelectionClear that arrives after the taking, and
+    /// looks exactly like somebody else copying. Ownership simply continues,
+    /// and requests from here on are answered from the new source.
+    pub fn reoffer(&mut self, formats: &[ClipFormat], source: Box<dyn crate::Fetch>) {
+        self.offered = formats.to_vec();
+        self.source = source;
+        self.cached.clear();
     }
 
     pub fn owns_clipboard(&self) -> bool {
         self.owns
+    }
+
+    /// Whether the server still has this window down as the owner.
+    fn still_owner(&self) -> Result<bool> {
+        let held = self
+            .clipboard
+            .conn
+            .get_selection_owner(self.clipboard.atoms.clipboard)
+            .map_err(display_err)?
+            .reply()
+            .map_err(display_err)?;
+        Ok(held.owner == self.clipboard.window)
     }
 
     /// The window the clipboard is held through.
@@ -494,8 +553,14 @@ impl X11Owner {
                 self.answer(request)?;
                 Ok(true)
             }
-            Event::SelectionClear(_) => {
-                // Something else copied; it is theirs now.
+            Event::SelectionClear(cleared) => {
+                // Either something else copied, or this is the echo of this
+                // window's own earlier letting-go arriving after it took the
+                // selection again. The two can carry the same timestamp, so
+                // the server is asked who owns it now rather than guessing.
+                if cleared.time < self.since || self.still_owner()? {
+                    return Ok(true);
+                }
                 self.owns = false;
                 Ok(false)
             }
@@ -539,6 +604,12 @@ impl X11Owner {
             Ok(())
         };
 
+        tracing::debug!(
+            target = request.target,
+            format = ?self.clipboard.atoms.format_of(request.target),
+            requestor = request.requestor,
+            "something here is asking the clipboard"
+        );
         if request.target == self.clipboard.atoms.targets {
             let atoms = self.atoms_for_offer();
             let bytes: Vec<u8> = atoms.iter().flat_map(|a| a.to_ne_bytes()).collect();
@@ -804,6 +875,10 @@ fn owner_thread(
 
         match command {
             Some(Command::Offer(formats, source)) => {
+                if let Some(held) = owner.as_mut().filter(|h| h.owns_clipboard()) {
+                    held.reoffer(&formats, source);
+                    continue;
+                }
                 take_back(&mut owner, &mut idle);
                 let Some(conn) = idle.take().or_else(reconnect) else {
                     tracing::warn!("cannot reach the display to offer the clipboard");
