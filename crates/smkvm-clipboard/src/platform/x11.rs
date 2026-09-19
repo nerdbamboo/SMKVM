@@ -225,9 +225,14 @@ impl X11Clipboard {
             match self.conn.poll_for_event().map_err(display_err)? {
                 Some(event) => match want(&event) {
                     Some(value) => return Ok(value),
-                    // Not what was being waited for, but somebody else's to
-                    // handle later.
-                    None => self.deferred.push(event),
+                    // A change of owner seen mid-conversion is news the watcher
+                    // still has to hear. Everything else on this connection
+                    // is the trail of our own asking -- properties written
+                    // and deleted on our window -- and matters to nobody.
+                    None if matches!(event, Event::XfixesSelectionNotify(_)) => {
+                        self.deferred.push(event)
+                    }
+                    None => {}
                 },
                 None => {
                     if Instant::now() >= deadline {
@@ -378,14 +383,11 @@ impl Watch for X11Clipboard {
                 }
                 return self.available().ok();
             }
-            // Requests aimed at us are somebody else's concern here; hold them
-            // so whoever is serving the selection still sees them.
-            if matches!(
-                event,
-                Event::SelectionRequest(_) | Event::SelectionClear(_) | Event::PropertyNotify(_)
-            ) {
-                self.deferred.push(event);
-            }
+            // Anything else here is left over from looking at the last owner,
+            // and is dropped. It must never go back into `deferred`: this
+            // loop takes from there first, and would spin on it for ever,
+            // never reaching the display again -- which is how the watcher
+            // once went deaf after its first look.
         }
     }
 }
