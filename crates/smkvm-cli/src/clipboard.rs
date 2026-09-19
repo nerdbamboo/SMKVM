@@ -202,8 +202,12 @@ impl Sharing {
     /// Act on it. Returns what has to go over the link, and to whom.
     pub fn on(&mut self, happened: Happened, now: Instant) -> Vec<(DeviceId, Bulk)> {
         let input = match happened {
-            Happened::Changed(available) => Input::LocalChanged(available.formats),
+            Happened::Changed(available) => {
+                debug!(formats = ?available.formats, "the clipboard here changed");
+                Input::LocalChanged(available.formats)
+            }
             Happened::Wanted(wanted) => {
+                debug!(seq = ?wanted.seq, format = ?wanted.format, "something here is pasting");
                 let ticket = self.next_ticket;
                 self.next_ticket += 1;
                 self.tickets.insert(ticket, wanted.reply);
@@ -234,6 +238,31 @@ impl Sharing {
     }
 
     pub fn peer_said(&mut self, from: DeviceId, msg: Bulk, now: Instant) -> Vec<(DeviceId, Bulk)> {
+        match &msg {
+            Bulk::ClipOffer(offer) => {
+                debug!(seq = ?offer.seq, entries = offer.entries.len(), "another machine copied")
+            }
+            Bulk::ClipRequest {
+                seq,
+                format,
+                offset,
+            } => {
+                debug!(?seq, ?format, offset, "another machine is pasting")
+            }
+            Bulk::ClipUnavailable {
+                seq,
+                format,
+                reason,
+            } => {
+                debug!(
+                    ?seq,
+                    ?format,
+                    ?reason,
+                    "another machine would not hand the clipboard over"
+                )
+            }
+            _ => {}
+        }
         let outputs = self.exchange.handle(Input::FromPeer { from, msg }, now);
         self.apply(outputs)
     }
@@ -265,6 +294,15 @@ impl Sharing {
                 }
                 Output::ReadLocal { seq, format } => self.read_local(seq, format),
                 Output::Deliver { ticket, result } => {
+                    if let Err(why) = &result {
+                        debug!(
+                            ticket,
+                            ?why,
+                            local = ?self.exchange.local_offer(),
+                            held = ?self.exchange.held_offer(),
+                            "a paste here could not be served"
+                        );
+                    }
                     if let Some(reply) = self.tickets.remove(&ticket) {
                         let _ = reply.send(result);
                     }
