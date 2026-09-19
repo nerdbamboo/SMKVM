@@ -579,3 +579,26 @@ fn the_configuration_names_formats_in_plain_words() {
     assert_eq!(formats_from_names(&names), ALL.to_vec());
     assert!(formats_from_names(&[]).is_empty());
 }
+
+#[test]
+fn a_change_notice_with_nothing_usable_in_it_leaves_what_is_held_alone() {
+    // What the watcher reports when the clipboard's owner did not answer in
+    // time, or when something was copied in a form this cannot carry. Seen on
+    // the real machines: our own owner was busy fetching, the watcher gave up
+    // asking it, and the empty report made the machine forget the offer it
+    // was holding -- so the paste that had been waiting was refused as stale.
+    let mut desk = Desk::new();
+    desk.copy(A, vec![(ClipFormat::Text, b"hello".to_vec())]);
+    let seq = desk.held(B);
+
+    desk.now += Duration::from_secs(5);
+    desk.feed(B, Input::LocalChanged(vec![]));
+    assert_eq!(desk.held(B), seq, "B still holds A's offer");
+    assert_eq!(desk.paste(B, ClipFormat::Text), Ok(b"hello".to_vec()));
+
+    // The same on the machine that copied: its own offer stands.
+    desk.now += Duration::from_secs(5);
+    desk.feed(A, Input::LocalChanged(vec![]));
+    assert_eq!(desk.exchange(A).local_offer(), Some(seq));
+    assert_eq!(desk.paste(SERVER, ClipFormat::Text), Ok(b"hello".to_vec()));
+}

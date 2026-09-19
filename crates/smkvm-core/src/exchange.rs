@@ -284,6 +284,15 @@ impl Exchange {
             .into_iter()
             .filter(|f| self.allowed.contains(f))
             .collect();
+        // A notice with nothing usable in it says nothing about what is
+        // held. It is what a watcher reports when the owner did not answer in
+        // time -- our own owner, busy fetching, included -- and what a copy
+        // of some form this cannot carry looks like. Taking `local` or
+        // `remote` away on its strength left peers offering a sequence this
+        // machine had forgotten, and their next paste refused as stale.
+        if formats.is_empty() {
+            return;
+        }
 
         // Our own offer coming back round as a change. The backends catch this
         // where they can; where they cannot, it arrives moments after the
@@ -303,9 +312,6 @@ impl Exchange {
         // by the copy that just happened.
         if let Some(held) = self.remote.take() {
             self.forget(held.seq, out);
-        }
-        if formats.is_empty() {
-            return;
         }
 
         self.counter += 1;
