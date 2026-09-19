@@ -1,5 +1,7 @@
 # SMKVM
 
+**English** · [한국어](README.ko.md) · [日本語](README.ja.md)
+
 One keyboard and mouse across several computers. Move the pointer off the edge
 of one screen and it appears on the next, whichever machine that screen belongs
 to; what you copy on one machine pastes on another.
