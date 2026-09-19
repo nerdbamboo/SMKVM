@@ -77,3 +77,55 @@ pub fn default_name() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "smkvm".into())
 }
+
+/// Resolve a path from the configuration, where a leading `~` stands for
+/// the home directory.
+///
+/// Only the bare `~` and `~/` forms are recognised: `~user` is another
+/// person's home, which this has no business writing into.
+pub fn expand_home(path: &str) -> PathBuf {
+    let home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    };
+    if path == "~" {
+        return home().unwrap_or_else(|| PathBuf::from("."));
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::expand_home;
+
+    #[test]
+    fn a_tilde_becomes_the_home_directory() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("a home to test against");
+        assert_eq!(expand_home("~"), std::path::PathBuf::from(&home));
+        assert_eq!(
+            expand_home("~/Downloads/SMKVM"),
+            std::path::PathBuf::from(&home).join("Downloads/SMKVM")
+        );
+    }
+
+    #[test]
+    fn anything_else_is_left_alone() {
+        assert_eq!(expand_home("/srv/in"), std::path::PathBuf::from("/srv/in"));
+        assert_eq!(
+            expand_home("~someone/x"),
+            std::path::PathBuf::from("~someone/x")
+        );
+        assert_eq!(
+            expand_home("rel/ative"),
+            std::path::PathBuf::from("rel/ative")
+        );
+    }
+}

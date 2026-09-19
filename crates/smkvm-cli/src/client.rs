@@ -33,7 +33,9 @@ pub async fn run(identity: Identity, peer: Peer, address: String, config: Config
     // worth offering once the link is back.
     let mut sharing = Sharing::start(
         identity.id(),
+        Role::Client,
         &config.clipboard,
+        &config.transfer,
         match platform::clipboard() {
             Ok(backends) => Some(backends),
             Err(e) => {

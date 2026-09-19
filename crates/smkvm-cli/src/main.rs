@@ -5,6 +5,7 @@ mod clipboard;
 mod hello;
 mod platform;
 mod server;
+mod transfer;
 
 // Where things live is the daemon's agreement with anything else that reads
 // the same files, so it belongs with the configuration rather than in here.

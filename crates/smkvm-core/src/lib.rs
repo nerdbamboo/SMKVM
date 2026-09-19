@@ -16,9 +16,11 @@
 mod client;
 pub mod exchange;
 mod server;
+pub mod transfer;
 
 pub use client::{Client, ClientAction};
 pub use exchange::Exchange;
 pub use server::{
     Action, ClientHealth, Event, LocalAction, Placement, PointerMode, Server, Settings,
 };
+pub use transfer::Transfer;

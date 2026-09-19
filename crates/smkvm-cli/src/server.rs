@@ -242,7 +242,9 @@ pub async fn run(
 
     let sharing = Sharing::start(
         identity.id(),
+        Role::Server,
         &config.clipboard,
+        &config.transfer,
         match platform::clipboard() {
             Ok(backends) => Some(backends),
             Err(e) => {
@@ -606,7 +608,7 @@ impl Daemon {
         for event in queue {
             self.handle(event);
         }
-        self.sharing.reconfigure(&fresh.clipboard);
+        self.sharing.reconfigure(&fresh.clipboard, &fresh.transfer);
         self.config = fresh;
         self.status_dirty = true;
         info!("configuration reloaded");

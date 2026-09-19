@@ -121,12 +121,16 @@ pub struct Clipboard {
 pub struct Transfer {
     #[serde(default = "yes")]
     pub enabled: bool,
-    /// Where received files land.
+    /// Where received files land. A leading `~` means the home directory.
     #[serde(default = "default_quarantine")]
     pub directory: String,
-    /// Ask before accepting a transfer larger than this.
-    #[serde(default = "default_prompt_over")]
-    pub prompt_over_bytes: u64,
+    /// Refuse a transfer larger than this, all files together.
+    ///
+    /// A paste blocks the application pasting until the files have arrived,
+    /// so this is the most anyone is made to wait for. Exceeding it is
+    /// reported in the log, never a silent drop.
+    #[serde(default = "default_transfer_max", alias = "prompt_over_bytes")]
+    pub max_bytes: u64,
 }
 
 /// Where one monitor sits on the global desktop.
@@ -205,8 +209,8 @@ fn default_formats() -> Vec<String> {
 fn default_clipboard_max() -> u64 {
     128 * 1024 * 1024
 }
-fn default_prompt_over() -> u64 {
-    256 * 1024 * 1024
+fn default_transfer_max() -> u64 {
+    1024 * 1024 * 1024
 }
 fn default_quarantine() -> String {
     "~/Downloads/SMKVM".into()
@@ -238,7 +242,7 @@ impl Default for Transfer {
         Self {
             enabled: true,
             directory: default_quarantine(),
-            prompt_over_bytes: default_prompt_over(),
+            max_bytes: default_transfer_max(),
         }
     }
 }

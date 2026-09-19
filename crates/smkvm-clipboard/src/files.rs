@@ -137,3 +137,104 @@ fn from_uri(line: &str) -> Option<String> {
     let path = String::from_utf8_lossy(&decoded).replace('/', "\\");
     (!path.is_empty()).then_some(path)
 }
+
+/// The local paths named by a `text/uri-list`, on this platform.
+///
+/// Only `file:` URIs for this machine are paths here: one naming another host
+/// is dropped, as is anything that is not a URI. On Windows the leading slash
+/// before a drive letter goes and the separators turn round; elsewhere the
+/// path is taken as it decodes.
+pub fn local_paths(uri_list: &[u8]) -> Vec<std::path::PathBuf> {
+    String::from_utf8_lossy(uri_list)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(local_path)
+        .collect()
+}
+
+fn local_path(line: &str) -> Option<std::path::PathBuf> {
+    let rest = line.strip_prefix("file://")?;
+    // `file://host/path` belongs to `host`; only an empty host, or
+    // `localhost`, is this machine.
+    let rest = match rest.strip_prefix("localhost/") {
+        Some(after) => after,
+        None => rest.strip_prefix('/')?,
+    };
+    let decoded = percent_decode(rest);
+    let text = String::from_utf8_lossy(&decoded);
+    if text.is_empty() {
+        return None;
+    }
+    if cfg!(windows) {
+        Some(std::path::PathBuf::from(text.replace('/', "\\")))
+    } else {
+        Some(std::path::PathBuf::from(format!("/{text}")))
+    }
+}
+
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// A `text/uri-list` naming these local paths, one `file:` URI a line.
+pub fn uri_list(paths: &[std::path::PathBuf]) -> Vec<u8> {
+    let mut out = String::new();
+    for path in paths {
+        out.push_str(&to_uri(&path.to_string_lossy()));
+        out.push_str("\r\n");
+    }
+    out.into_bytes()
+}
+
+#[cfg(test)]
+mod local_path_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_uri_for_this_machine_becomes_a_path_and_back() {
+        let list = b"file:///tmp/some%20dir/a%23b.txt\r\n# a comment\r\nfile://elsewhere/x\r\n";
+        let paths = local_paths(list);
+        if cfg!(windows) {
+            assert_eq!(paths, vec![PathBuf::from("tmp\\some dir\\a#b.txt")]);
+        } else {
+            assert_eq!(paths, vec![PathBuf::from("/tmp/some dir/a#b.txt")]);
+            let back = uri_list(&paths);
+            assert_eq!(back, b"file:///tmp/some%20dir/a%23b.txt\r\n");
+        }
+    }
+
+    #[test]
+    fn localhost_counts_as_here_and_nonsense_does_not() {
+        let paths = local_paths(b"file://localhost/var/y\nnot a uri\nhttp://x/y\n");
+        if cfg!(windows) {
+            assert_eq!(paths, vec![PathBuf::from("var\\y")]);
+        } else {
+            assert_eq!(paths, vec![PathBuf::from("/var/y")]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_survives_the_round_trip() {
+        let paths = vec![PathBuf::from("C:\\Users\\me\\a b.txt")];
+        let list = uri_list(&paths);
+        assert_eq!(list, b"file:///C:/Users/me/a%20b.txt\r\n");
+        assert_eq!(local_paths(&list), paths);
+    }
+}

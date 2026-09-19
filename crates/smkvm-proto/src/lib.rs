@@ -30,8 +30,8 @@ pub mod keys;
 pub mod msg;
 
 pub use codec::{
-    decode, encode, encode_with_limit, FrameDecoder, ProtoError, HEADER_LEN, MAX_CHUNK_DATA,
-    MAX_FRAME_LEN,
+    decode, encode, encode_bare, encode_with_limit, FrameDecoder, ProtoError, HEADER_LEN,
+    MAX_CHUNK_DATA, MAX_FRAME_LEN,
 };
 pub use keys::{Key, MouseButton, Scroll};
 pub use msg::{

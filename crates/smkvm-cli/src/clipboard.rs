@@ -6,24 +6,46 @@
 //! backends block -- on the display, on another application, on the person
 //! -- so each lives on a thread of its own and talks to the daemon's loop
 //! through channels.
+//!
+//! Files ride along. Where the clipboard would carry a list of paths -- which
+//! mean nothing on another machine -- it carries a manifest of names and
+//! sizes instead, and a paste pulls the files themselves, piece by piece,
+//! into the transfer directory before the pasting application is handed
+//! paths that exist.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use smkvm_clipboard::files::{local_paths, uri_list};
 use smkvm_clipboard::{Available, ClipboardError, Fetch, Read, Watch, Write};
 use smkvm_core::exchange::{formats_from_names, Input, Output};
-use smkvm_core::Exchange;
+use smkvm_core::transfer::{Input as TransferInput, Output as TransferOutput};
+use smkvm_core::{Exchange, Transfer};
 use smkvm_layout::DeviceId;
-use smkvm_proto::{Bulk, ClipError, ClipFormat, ClipSeq};
+use smkvm_proto::{Bulk, ClipError, ClipFormat, ClipSeq, FileOffer, Role, TransferId};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use crate::transfer::{self as disk, Arriving, Landing, Offered};
 
 /// How long a paste waits for the far machine before giving up.
 ///
 /// Long enough for a large image over a slow link; short enough that a paste
 /// into an application that is waiting on it does not look hung for ever.
 const FETCH_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How long a paste of files waits for all of them to arrive.
+///
+/// The pasting application is blocked for the duration, so this is bounded
+/// by patience rather than by bandwidth; `transfer.max_bytes` is what keeps
+/// the wait reasonable.
+const FILES_PATIENCE: Duration = Duration::from_secs(10 * 60);
+
+/// How many manifests this machine keeps serving after copying something
+/// else. A paste that began just before the next copy still completes.
+const OFFERED_KEPT: usize = 4;
 
 /// The three things a platform provides.
 pub struct Backends {
@@ -39,6 +61,13 @@ pub struct Wanted {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, ClipError>>,
 }
 
+/// Something on this machine is pasting files, and needs them on disk.
+pub struct PullFiles {
+    offer: FileOffer,
+    /// Answered with a `text/uri-list` of where they landed.
+    reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+}
+
 /// The local clipboard has been read.
 pub struct ReadDone {
     seq: ClipSeq,
@@ -51,6 +80,7 @@ pub enum Happened {
     Changed(Available),
     Wanted(Wanted),
     Read(ReadDone),
+    PullFiles(PullFiles),
 }
 
 /// Fetches an offer's contents from the machine that holds them.
@@ -60,6 +90,7 @@ pub enum Happened {
 struct RemoteFetch {
     seq: ClipSeq,
     ask: mpsc::Sender<Wanted>,
+    files: mpsc::Sender<PullFiles>,
 }
 
 impl Fetch for RemoteFetch {
@@ -72,11 +103,33 @@ impl Fetch for RemoteFetch {
                 reply,
             })
             .map_err(|_| ClipboardError::Display("the daemon has stopped".into()))?;
-        match answer.recv_timeout(FETCH_PATIENCE) {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(why)) => Err(ClipboardError::Display(describe(&why))),
+        let bytes = match answer.recv_timeout(FETCH_PATIENCE) {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(why)) => return Err(ClipboardError::Display(describe(&why))),
+            Err(_) => {
+                return Err(ClipboardError::Display(
+                    "the other machine did not hand the clipboard over in time".into(),
+                ))
+            }
+        };
+        if *format != ClipFormat::Uris {
+            return Ok(bytes);
+        }
+
+        // What arrived is a manifest. The files are still on the other
+        // machine, and the application pasting wants paths that exist here.
+        let offer: FileOffer = smkvm_proto::decode(&bytes).map_err(|_| {
+            ClipboardError::Display("the file list from the other machine is unreadable".into())
+        })?;
+        let (reply, landed) = std::sync::mpsc::channel();
+        self.files
+            .blocking_send(PullFiles { offer, reply })
+            .map_err(|_| ClipboardError::Display("the daemon has stopped".into()))?;
+        match landed.recv_timeout(FILES_PATIENCE) {
+            Ok(Ok(uris)) => Ok(uris),
+            Ok(Err(why)) => Err(ClipboardError::Display(why)),
             Err(_) => Err(ClipboardError::Display(
-                "the other machine did not hand the clipboard over in time".into(),
+                "the files did not all arrive in time".into(),
             )),
         }
     }
@@ -108,19 +161,59 @@ struct Live {
     read: Arc<Mutex<Box<dyn Read + Send>>>,
 }
 
+/// What the configuration says about files.
+#[derive(Debug, Clone)]
+struct FileSettings {
+    enabled: bool,
+    directory: PathBuf,
+    max_bytes: u64,
+}
+
+impl FileSettings {
+    fn from(cfg: &smkvm_config::Transfer) -> FileSettings {
+        FileSettings {
+            enabled: cfg.enabled,
+            directory: smkvm_config::paths::expand_home(&cfg.directory),
+            max_bytes: cfg.max_bytes,
+        }
+    }
+}
+
+/// Files being pulled for a paste on this machine.
+struct Incoming {
+    id: TransferId,
+    offer: FileOffer,
+    landing: Landing,
+    /// The entry being written, or the next to start.
+    index: usize,
+    current: Option<Arriving>,
+    reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    started: Instant,
+}
+
 /// The clipboard side of a daemon, whichever role it plays.
 pub struct Sharing {
+    me: DeviceId,
+    role: Role,
     exchange: Exchange,
+    transfer: Transfer,
+    files: FileSettings,
     live: Option<Live>,
     changes: mpsc::Receiver<Available>,
     /// Whether the watcher is still there to report changes.
     watching: bool,
     wanted_tx: mpsc::Sender<Wanted>,
     wanted: mpsc::Receiver<Wanted>,
+    pulls_tx: mpsc::Sender<PullFiles>,
+    pulls: mpsc::Receiver<PullFiles>,
     reads_tx: mpsc::Sender<ReadDone>,
     reads: mpsc::Receiver<ReadDone>,
     tickets: HashMap<u64, std::sync::mpsc::Sender<Result<Vec<u8>, ClipError>>>,
     next_ticket: u64,
+    /// Manifests this machine has offered, newest last, and where the files are.
+    offered: VecDeque<Offered>,
+    next_transfer: u64,
+    incoming: Option<Incoming>,
 }
 
 impl Sharing {
@@ -130,11 +223,14 @@ impl Sharing {
     /// its own still carries offers between its clients.
     pub fn start(
         me: DeviceId,
+        role: Role,
         cfg: &smkvm_config::Clipboard,
+        files: &smkvm_config::Transfer,
         backends: Option<Backends>,
     ) -> Sharing {
         let (changes_tx, changes) = mpsc::channel(16);
         let (wanted_tx, wanted) = mpsc::channel(16);
+        let (pulls_tx, pulls) = mpsc::channel(4);
         let (reads_tx, reads) = mpsc::channel(16);
 
         let mut exchange = Exchange::new(me, formats_from_names(&cfg.formats), cfg.max_bytes);
@@ -165,24 +261,34 @@ impl Sharing {
         }
 
         Sharing {
+            me,
+            role,
             exchange,
+            transfer: Transfer::new(me, None),
+            files: FileSettings::from(files),
             watching: live.is_some(),
             live,
             changes,
             wanted_tx,
             wanted,
+            pulls_tx,
+            pulls,
             reads_tx,
             reads,
             tickets: HashMap::new(),
             next_ticket: 1,
+            offered: VecDeque::new(),
+            next_transfer: 1,
+            incoming: None,
         }
     }
 
     /// Take a changed configuration into use.
-    pub fn reconfigure(&mut self, cfg: &smkvm_config::Clipboard) {
+    pub fn reconfigure(&mut self, cfg: &smkvm_config::Clipboard, files: &smkvm_config::Transfer) {
         self.exchange.set_enabled(cfg.enabled);
         self.exchange.set_allowed(formats_from_names(&cfg.formats));
         self.exchange.set_max_bytes(cfg.max_bytes);
+        self.files = FileSettings::from(files);
     }
 
     /// Wait for the clipboard side to have something to say.
@@ -195,6 +301,7 @@ impl Sharing {
                 },
                 Some(wanted) = self.wanted.recv() => return Happened::Wanted(wanted),
                 Some(read) = self.reads.recv() => return Happened::Read(read),
+                Some(pull) = self.pulls.recv() => return Happened::PullFiles(pull),
             }
         }
     }
@@ -204,7 +311,11 @@ impl Sharing {
         let input = match happened {
             Happened::Changed(available) => {
                 debug!(formats = ?available.formats, "the clipboard here changed");
-                Input::LocalChanged(available.formats)
+                let mut formats = available.formats;
+                if !self.files.enabled {
+                    formats.retain(|f| *f != ClipFormat::Uris);
+                }
+                Input::LocalChanged(formats)
             }
             Happened::Wanted(wanted) => {
                 debug!(seq = ?wanted.seq, format = ?wanted.format, "something here is pasting");
@@ -217,24 +328,43 @@ impl Sharing {
                     format: wanted.format,
                 }
             }
-            Happened::Read(read) => Input::ReadDone {
-                seq: read.seq,
-                format: read.format,
-                result: read.result,
-            },
+            Happened::Read(read) => {
+                let result = if read.format == ClipFormat::Uris {
+                    read.result.and_then(|bytes| self.manifest_for(&bytes))
+                } else {
+                    read.result
+                };
+                Input::ReadDone {
+                    seq: read.seq,
+                    format: read.format,
+                    result,
+                }
+            }
+            Happened::PullFiles(pull) => return self.start_pull(pull),
         };
         let outputs = self.exchange.handle(input, now);
         self.apply(outputs)
     }
 
     pub fn peer_up(&mut self, peer: DeviceId, now: Instant) -> Vec<(DeviceId, Bulk)> {
+        if self.role == Role::Client {
+            // A client's one peer is the server, through which every file
+            // is fetched.
+            self.transfer.set_hub(Some(peer));
+        }
+        let outputs = self.transfer.handle(TransferInput::PeerUp(peer));
+        let mut sends = self.apply_transfer(outputs);
         let outputs = self.exchange.handle(Input::PeerUp(peer), now);
-        self.apply(outputs)
+        sends.extend(self.apply(outputs));
+        sends
     }
 
     pub fn peer_gone(&mut self, peer: DeviceId, now: Instant) -> Vec<(DeviceId, Bulk)> {
+        let outputs = self.transfer.handle(TransferInput::PeerGone(peer));
+        let mut sends = self.apply_transfer(outputs);
         let outputs = self.exchange.handle(Input::PeerGone(peer), now);
-        self.apply(outputs)
+        sends.extend(self.apply(outputs));
+        sends
     }
 
     pub fn peer_said(&mut self, from: DeviceId, msg: Bulk, now: Instant) -> Vec<(DeviceId, Bulk)> {
@@ -261,7 +391,25 @@ impl Sharing {
                     "another machine would not hand the clipboard over"
                 )
             }
+            Bulk::FileRequest { id, index, offset } => {
+                debug!(
+                    ?id,
+                    index, offset, "another machine wants a piece of a file"
+                )
+            }
+            Bulk::FileAbort { id, reason } => debug!(?id, reason, "a transfer was called off"),
             _ => {}
+        }
+        if matches!(
+            msg,
+            Bulk::FileOffer(_)
+                | Bulk::FileRequest { .. }
+                | Bulk::FileChunk { .. }
+                | Bulk::FileDone { .. }
+                | Bulk::FileAbort { .. }
+        ) {
+            let outputs = self.transfer.handle(TransferInput::FromPeer { from, msg });
+            return self.apply_transfer(outputs);
         }
         let outputs = self.exchange.handle(Input::FromPeer { from, msg }, now);
         self.apply(outputs)
@@ -272,13 +420,20 @@ impl Sharing {
         for output in outputs {
             match output {
                 Output::Send { to, msg } => sends.push((to, msg)),
-                Output::OfferLocally { seq, formats } => {
+                Output::OfferLocally { seq, mut formats } => {
                     let Some(live) = self.live.as_mut() else {
                         continue;
                     };
+                    if !self.files.enabled {
+                        formats.retain(|f| *f != ClipFormat::Uris);
+                        if formats.is_empty() {
+                            continue;
+                        }
+                    }
                     let source = Box::new(RemoteFetch {
                         seq,
                         ask: self.wanted_tx.clone(),
+                        files: self.pulls_tx.clone(),
                     });
                     match live.write.offer(&formats, source) {
                         Ok(()) => debug!(?formats, "offering another machine's clipboard here"),
@@ -340,5 +495,266 @@ impl Sharing {
                 result,
             });
         });
+    }
+
+    /// Turn the list of paths an application copied here into the manifest
+    /// the other machines are given, and remember where the files are.
+    fn manifest_for(&mut self, uri_list: &[u8]) -> Result<Vec<u8>, ClipError> {
+        let paths = local_paths(uri_list);
+        if paths.is_empty() {
+            warn!("the copied file list names nothing on this machine");
+            return Err(ClipError::OwnerRefused);
+        }
+        let id = TransferId {
+            device: self.me,
+            counter: self.next_transfer,
+        };
+        self.next_transfer += 1;
+        let offered = match disk::describe(id, &paths) {
+            Ok(offered) => offered,
+            Err(e) => {
+                warn!("could not describe the copied files: {e}");
+                return Err(ClipError::OwnerRefused);
+            }
+        };
+        info!(
+            files = offered.offer.files.len(),
+            bytes = offered.offer.total_bytes,
+            "offering copied files to the other machines"
+        );
+        // Bare, because this travels as the contents of a clipboard format,
+        // not as a frame of its own; `decode` on the other side expects that.
+        let bytes =
+            smkvm_proto::encode_bare(&offered.offer).map_err(|_| ClipError::OwnerRefused)?;
+        self.offered.push_back(offered);
+        while self.offered.len() > OFFERED_KEPT {
+            self.offered.pop_front();
+        }
+        Ok(bytes)
+    }
+
+    fn apply_transfer(&mut self, outputs: Vec<TransferOutput>) -> Vec<(DeviceId, Bulk)> {
+        let mut sends = Vec::new();
+        for output in outputs {
+            match output {
+                TransferOutput::Send { to, msg } => sends.push((to, msg)),
+                TransferOutput::ReadFile {
+                    to,
+                    id,
+                    index,
+                    offset,
+                } => sends.push((to, self.piece_of(id, index, offset))),
+                TransferOutput::Chunk {
+                    id,
+                    index,
+                    offset,
+                    data,
+                    last,
+                } => sends.extend(self.piece_arrived(id, index, offset, data, last)),
+                TransferOutput::Failed(id) => {
+                    self.finish_pull(id, Err("the machine holding the files went away".into()))
+                }
+            }
+        }
+        sends
+    }
+
+    /// Read a piece of a file this machine offered, for another machine.
+    fn piece_of(&self, id: TransferId, index: u32, offset: u64) -> Bulk {
+        let refuse = |reason: &str| Bulk::FileAbort {
+            id,
+            reason: reason.to_owned(),
+        };
+        let Some(offered) = self.offered.iter().find(|o| o.offer.id == id) else {
+            return refuse("those files are no longer on offer");
+        };
+        let Some((entry, path)) = offered
+            .offer
+            .files
+            .get(index as usize)
+            .zip(offered.paths.get(index as usize))
+        else {
+            return refuse("no such file in that copy");
+        };
+        if entry.is_dir {
+            return refuse("that entry is a folder");
+        }
+        match disk::read_piece(path, offset) {
+            Ok((data, last)) => Bulk::FileChunk {
+                id,
+                index,
+                offset,
+                data,
+                last,
+            },
+            Err(e) => {
+                warn!(path = %path.display(), "could not read a copied file: {e}");
+                refuse("the file could not be read")
+            }
+        }
+    }
+
+    /// Something here pasted files from elsewhere: decide where they go and
+    /// ask for the first piece.
+    fn start_pull(&mut self, pull: PullFiles) -> Vec<(DeviceId, Bulk)> {
+        if !self.files.enabled {
+            let _ = pull
+                .reply
+                .send(Err("file transfer is turned off here".into()));
+            return Vec::new();
+        }
+        if self.incoming.is_some() {
+            let _ = pull
+                .reply
+                .send(Err("another paste of files is still arriving".into()));
+            return Vec::new();
+        }
+        let landing =
+            match disk::plan_landing(&pull.offer, &self.files.directory, self.files.max_bytes) {
+                Ok(landing) => landing,
+                Err(why) => {
+                    warn!("refusing the pasted files: {why}");
+                    let _ = pull
+                        .reply
+                        .send(Err(format!("refusing the pasted files: {why}")));
+                    return Vec::new();
+                }
+            };
+        info!(
+            files = pull.offer.files.len(),
+            bytes = pull.offer.total_bytes,
+            into = %self.files.directory.display(),
+            "files are being pasted here; fetching them"
+        );
+        self.incoming = Some(Incoming {
+            id: pull.offer.id,
+            offer: pull.offer,
+            landing,
+            index: 0,
+            current: None,
+            reply: pull.reply,
+            started: Instant::now(),
+        });
+        self.advance_pull()
+    }
+
+    /// Create whatever comes next -- folders and empty files need no bytes --
+    /// and ask for the first piece of the next file that does.
+    fn advance_pull(&mut self) -> Vec<(DeviceId, Bulk)> {
+        let Some(incoming) = self.incoming.as_mut() else {
+            return Vec::new();
+        };
+        while incoming.index < incoming.offer.files.len() {
+            let entry = &incoming.offer.files[incoming.index];
+            let path = &incoming.landing.paths[incoming.index];
+            if entry.is_dir {
+                if let Err(e) = std::fs::create_dir_all(path) {
+                    let why = format!("could not create {}: {e}", path.display());
+                    let id = incoming.id;
+                    return self.fail_pull(id, why);
+                }
+                incoming.index += 1;
+                continue;
+            }
+            match Arriving::create(path) {
+                Ok(arriving) if entry.bytes == 0 => {
+                    if let Err(e) = arriving.finish() {
+                        let why = format!("could not write {}: {e}", path.display());
+                        let id = incoming.id;
+                        return self.fail_pull(id, why);
+                    }
+                    incoming.index += 1;
+                }
+                Ok(arriving) => {
+                    incoming.current = Some(arriving);
+                    let id = incoming.id;
+                    let index = incoming.index as u32;
+                    let outputs = self.transfer.handle(TransferInput::Pull {
+                        id,
+                        index,
+                        offset: 0,
+                    });
+                    return self.apply_transfer(outputs);
+                }
+                Err(e) => {
+                    let why = format!("could not create {}: {e}", path.display());
+                    let id = incoming.id;
+                    return self.fail_pull(id, why);
+                }
+            }
+        }
+        // Everything has landed.
+        let incoming = self.incoming.take().expect("checked above");
+        info!(
+            files = incoming.offer.files.len(),
+            bytes = incoming.offer.total_bytes,
+            took_ms = incoming.started.elapsed().as_millis() as u64,
+            "the pasted files have all arrived"
+        );
+        let _ = incoming
+            .reply
+            .send(Ok(uri_list(&incoming.landing.top_level)));
+        Vec::new()
+    }
+
+    fn piece_arrived(
+        &mut self,
+        id: TransferId,
+        index: u32,
+        offset: u64,
+        data: Vec<u8>,
+        last: bool,
+    ) -> Vec<(DeviceId, Bulk)> {
+        let Some(incoming) = self.incoming.as_mut() else {
+            return Vec::new();
+        };
+        if incoming.id != id || incoming.index as u32 != index {
+            return Vec::new();
+        }
+        let Some(current) = incoming.current.as_mut() else {
+            return Vec::new();
+        };
+        if let Err(e) = current.append(offset, &data) {
+            return self.fail_pull(id, format!("could not write the arriving file: {e}"));
+        }
+        let expected = incoming.offer.files[incoming.index].bytes;
+        if current.written() > expected {
+            return self.fail_pull(id, "a file arrived larger than it was said to be".into());
+        }
+        if !last {
+            let offset = current.written();
+            let outputs = self
+                .transfer
+                .handle(TransferInput::Pull { id, index, offset });
+            return self.apply_transfer(outputs);
+        }
+        if current.written() != expected {
+            return self.fail_pull(id, "a file arrived shorter than it was said to be".into());
+        }
+        if let Some(done) = incoming.current.take() {
+            if let Err(e) = done.finish() {
+                return self.fail_pull(id, format!("could not finish writing a file: {e}"));
+            }
+        }
+        incoming.index += 1;
+        self.advance_pull()
+    }
+
+    fn fail_pull(&mut self, id: TransferId, why: String) -> Vec<(DeviceId, Bulk)> {
+        warn!("{why}");
+        self.finish_pull(id, Err(why));
+        let outputs = self.transfer.handle(TransferInput::Drop(id));
+        self.apply_transfer(outputs)
+    }
+
+    fn finish_pull(&mut self, id: TransferId, result: Result<Vec<u8>, String>) {
+        if self.incoming.as_ref().is_some_and(|i| i.id == id) {
+            let incoming = self.incoming.take().expect("checked");
+            // Whatever was half written is not left looking like a file.
+            if incoming.current.is_some() {
+                let _ = std::fs::remove_file(&incoming.landing.paths[incoming.index]);
+            }
+            let _ = incoming.reply.send(result);
+        }
     }
 }

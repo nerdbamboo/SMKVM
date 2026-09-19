@@ -55,6 +55,13 @@ pub fn encode_with_limit<T: Serialize>(msg: &T, max: usize) -> Result<Vec<u8>, P
     Ok(out)
 }
 
+/// Encode a message on its own, with no frame header -- the form [`decode`]
+/// takes, for something carried inside another message rather than sent as
+/// one.
+pub fn encode_bare<T: Serialize>(msg: &T) -> Result<Vec<u8>, ProtoError> {
+    postcard::to_stdvec(msg).map_err(ProtoError::Encode)
+}
+
 /// Decode one frame body.
 pub fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, ProtoError> {
     postcard::from_bytes(frame).map_err(ProtoError::Decode)
@@ -138,5 +145,34 @@ impl FrameDecoder {
 impl Default for FrameDecoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod bare_tests {
+    use super::*;
+    use crate::msg::{FileEntry, FileOffer, TransferId};
+    use smkvm_layout::DeviceId;
+
+    #[test]
+    fn what_is_encoded_bare_is_what_decode_reads() {
+        let offer = FileOffer {
+            id: TransferId {
+                device: DeviceId::from_bytes([3; 32]),
+                counter: 9,
+            },
+            files: vec![FileEntry {
+                path: "a/b.txt".into(),
+                bytes: 12,
+                is_dir: false,
+            }],
+            total_bytes: 12,
+        };
+        let bare = encode_bare(&offer).unwrap();
+        assert_eq!(decode::<FileOffer>(&bare).unwrap(), offer);
+        // The framed form is not the same thing, and would not read back.
+        let framed = encode(&offer).unwrap();
+        assert_eq!(&framed[HEADER_LEN..], &bare[..]);
+        assert!(decode::<FileOffer>(&framed).is_err());
     }
 }
