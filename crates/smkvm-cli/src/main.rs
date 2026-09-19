@@ -469,10 +469,22 @@ fn load_config(path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
 /// Two copies on one machine fight over the link, and the one that loses is
 /// left holding whatever it did last -- a pointer out of the way, keys down.
 /// The daemon's own status report is the evidence: a report younger than its
-/// refresh interval was written by something that is still there.
+/// refresh interval was written by something that is still there -- unless
+/// the process it names has gone, in which case it was left behind by a
+/// daemon that was stopped moments ago, and waiting out the interval would
+/// only make every restart take a quarter of a minute.
 fn ensure_not_running() -> Result<()> {
     let path = paths::status_file();
     if let Some(report) = Status::current(&path) {
+        if let Some(pid) = report.pid {
+            if process_alive(pid) == Some(false) {
+                tracing::info!(
+                    pid,
+                    "the last report was left behind by a daemon that has gone"
+                );
+                return Ok(());
+            }
+        }
         bail!(
             "smkvm already seems to be running here{} -- its report at {} was written {} s ago. \
              Stop it first. If it is not running, wait {} s or delete that file.",
@@ -486,6 +498,48 @@ fn ensure_not_running() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether a process with this id exists, or `None` where that cannot be asked.
+///
+/// A process id is reused eventually, so "alive" may name some other program
+/// -- which then costs one refusal until the report ages out, exactly as
+/// before. "Gone" is the answer that matters, and is not mistaken.
+fn process_alive(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: asking for a handle by id; the handle is closed below.
+        match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(handle) => {
+                let mut code = 0u32;
+                // SAFETY: a valid handle and a place to put the code.
+                let alive = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok()
+                    && code == STILL_ACTIVE.0 as u32;
+                // SAFETY: balanced against the open above.
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                Some(alive)
+            }
+            // No such process. Anything else -- most often access denied, for
+            // a process belonging to somebody else -- means it exists.
+            Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => Some(false),
+            Err(_) => Some(true),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 async fn pair(host: Option<String>, yes: bool) -> Result<()> {
@@ -599,4 +653,29 @@ async fn connect(config_path: Option<PathBuf>, host: Option<String>) -> Result<(
     let peer = client::choose_server(&trust, &config)?;
     info!(server = %peer.name, %address, "connecting");
     client::run(identity, peer, address, config).await
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::process_alive;
+
+    #[test]
+    fn this_process_is_alive() {
+        assert_eq!(process_alive(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn a_process_that_has_exited_is_gone() {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/c", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .expect("a short-lived child");
+        let pid = child.id();
+        child.wait().expect("it finishes");
+        assert_eq!(process_alive(pid), Some(false));
+    }
 }
