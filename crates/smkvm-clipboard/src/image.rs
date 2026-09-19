@@ -153,12 +153,46 @@ pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Convert a PNG to a device-independent bitmap.
+/// Which bitmap header to write.
+#[derive(Clone, Copy)]
+enum Header {
+    /// The 40-byte `BITMAPINFOHEADER`, `BI_RGB`, 32 bits a pixel. This is
+    /// what `CF_DIB` is defined to hold, and the only form Windows will turn
+    /// into a `CF_BITMAP` for the many applications that ask for one. It has
+    /// nowhere to declare the fourth byte as alpha; applications treat it as
+    /// padding, and an image with transparency comes out opaque.
+    V3,
+    /// The 124-byte `BITMAPV5HEADER`, `BI_BITFIELDS`, with masks that say
+    /// where the alpha lives. This is what `CF_DIBV5` holds, and carries
+    /// transparency across intact for the applications that read it.
+    V5,
+}
+
+impl Header {
+    fn len(self) -> usize {
+        match self {
+            Header::V3 => HEADER_V3,
+            Header::V5 => 124,
+        }
+    }
+}
+
+/// Convert a PNG to the bitmap `CF_DIB` holds: a plain 40-byte header.
 ///
-/// Produces the 32-bit form with an alpha mask, which is what carries
-/// transparency across intact. Rows are written bottom first, the arrangement
-/// every application understands.
+/// Rows are written bottom first, the arrangement every application
+/// understands. Transparency is carried in the fourth byte, where our own
+/// reading finds it again, but Windows does not know it is there; use
+/// [`png_to_dibv5`] for the form that declares it.
 pub fn png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>> {
+    png_to_bitmap(png_bytes, Header::V3)
+}
+
+/// Convert a PNG to the bitmap `CF_DIBV5` holds, with its alpha declared.
+pub fn png_to_dibv5(png_bytes: &[u8]) -> Result<Vec<u8>> {
+    png_to_bitmap(png_bytes, Header::V5)
+}
+
+fn png_to_bitmap(png_bytes: &[u8], header: Header) -> Result<Vec<u8>> {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
     let mut reader = decoder
         .read_info()
@@ -185,35 +219,37 @@ pub fn png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>> {
         ));
     }
 
-    // A v5 header, whose masks say where the alpha lives. A plain v3 header
-    // has nowhere to declare it, and applications then treat the fourth byte
-    // as padding.
-    const HEADER_V5: usize = 124;
+    let header_len = header.len();
     let stride = width as usize * 4;
     let pixels_len = stride * height as usize;
-    let mut dib = vec![0u8; HEADER_V5 + pixels_len];
+    let mut dib = vec![0u8; header_len + pixels_len];
 
     let put32 = |dib: &mut [u8], at: usize, value: u32| {
         dib[at..at + 4].copy_from_slice(&value.to_le_bytes());
     };
-    put32(&mut dib, 0, HEADER_V5 as u32);
+    put32(&mut dib, 0, header_len as u32);
     put32(&mut dib, 4, width);
     put32(&mut dib, 8, height); // positive: rows run bottom to top
     dib[12..14].copy_from_slice(&1u16.to_le_bytes()); // one plane
     dib[14..16].copy_from_slice(&32u16.to_le_bytes());
-    put32(&mut dib, 16, BI_BITFIELDS);
     put32(&mut dib, 20, pixels_len as u32);
-    put32(&mut dib, 40, 0x00FF_0000); // red
-    put32(&mut dib, 44, 0x0000_FF00); // green
-    put32(&mut dib, 48, 0x0000_00FF); // blue
-    put32(&mut dib, 52, 0xFF00_0000); // alpha
-    put32(&mut dib, 56, 0x7352_4742); // 'BGRs': sRGB
+    match header {
+        Header::V3 => put32(&mut dib, 16, BI_RGB),
+        Header::V5 => {
+            put32(&mut dib, 16, BI_BITFIELDS);
+            put32(&mut dib, 40, 0x00FF_0000); // red
+            put32(&mut dib, 44, 0x0000_FF00); // green
+            put32(&mut dib, 48, 0x0000_00FF); // blue
+            put32(&mut dib, 52, 0xFF00_0000); // alpha
+            put32(&mut dib, 56, 0x7352_4742); // 'BGRs': sRGB
+        }
+    }
 
     for row in 0..height as usize {
         // Bottom first.
         let source_row = height as usize - 1 - row;
         let from = source_row * width as usize * channels;
-        let to = HEADER_V5 + row * stride;
+        let to = header_len + row * stride;
         for x in 0..width as usize {
             let px = &source[from + x * channels..];
             let (r, g, b) = (px[0], px[1], px[2]);

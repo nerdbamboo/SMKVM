@@ -5,7 +5,7 @@
 //! row first, rows are padded, and the fourth byte of a 32-bit pixel may or
 //! may not mean anything.
 
-use smkvm_clipboard::image::{dib_to_png, png_to_dib};
+use smkvm_clipboard::image::{dib_to_png, png_to_dib, png_to_dibv5};
 
 const HEADER_V3: usize = 40;
 
@@ -185,4 +185,89 @@ fn nonsense_never_panics() {
             let _ = png_to_dib(&vec![fill; len]);
         }
     }
+}
+
+/// Encode plain RGB pixels the way GTK does when an image is copied on Linux:
+/// eight bits a channel, no alpha at all.
+fn rgb_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("a header");
+        writer.write_image_data(rgb).expect("the pixels");
+    }
+    out
+}
+
+#[test]
+fn a_png_with_no_alpha_channel_becomes_an_opaque_bitmap() {
+    // A 40 by 30 block of pure blue, as GTK copies it.
+    let (w, h) = (40u32, 30u32);
+    let rgb: Vec<u8> = std::iter::repeat_n([0u8, 0, 255], (w * h) as usize)
+        .flatten()
+        .collect();
+    let dib = png_to_dib(&rgb_png(w, h, &rgb)).expect("an RGB PNG is a form this can take");
+
+    let width = i32::from_le_bytes(dib[4..8].try_into().unwrap());
+    let height = i32::from_le_bytes(dib[8..12].try_into().unwrap());
+    assert_eq!((width, height.abs()), (40, 30));
+
+    // And back again, so the colour and the opacity can be checked.
+    let (pw, ph, pixels) = png_pixels(&dib_to_png(&dib).expect("it reads back"));
+    assert_eq!((pw, ph), (40, 30));
+    assert_eq!(&pixels[..4], &[0, 0, 255, 255], "blue, and fully opaque");
+    assert!(pixels.chunks(4).all(|p| p == [0, 0, 255, 255]));
+}
+
+/// A two-pixel PNG: one opaque red, one half-transparent green.
+fn two_pixel_png() -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, 2, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("a header");
+        writer
+            .write_image_data(&[255, 0, 0, 255, 0, 255, 0, 128])
+            .expect("the pixels");
+    }
+    out
+}
+
+#[test]
+fn the_plain_bitmap_has_the_forty_byte_header_windows_can_turn_into_a_bitmap() {
+    // `CF_DIB` is defined as a BITMAPINFOHEADER followed by pixels. Windows
+    // synthesises `CF_BITMAP` from it for every application that asks for
+    // one -- and refuses when the header is a later, longer form. Found the
+    // hard way: a paste on Windows came up empty while the log said the
+    // bitmap had been handed over.
+    let dib = png_to_dib(&two_pixel_png()).expect("converts");
+    let header_len = u32::from_le_bytes(dib[0..4].try_into().unwrap());
+    let compression = u32::from_le_bytes(dib[16..20].try_into().unwrap());
+    let bits = u16::from_le_bytes(dib[14..16].try_into().unwrap());
+    assert_eq!(header_len, 40, "BITMAPINFOHEADER, nothing later");
+    assert_eq!(compression, 0, "BI_RGB");
+    assert_eq!(bits, 32);
+    assert_eq!(dib.len(), 40 + 2 * 4);
+
+    // Our own reading still finds the alpha in the fourth byte.
+    let (_, _, pixels) = png_pixels(&dib_to_png(&dib).expect("reads back"));
+    assert_eq!(pixels, vec![255, 0, 0, 255, 0, 255, 0, 128]);
+}
+
+#[test]
+fn the_v5_bitmap_declares_where_its_alpha_is() {
+    let dib = png_to_dibv5(&two_pixel_png()).expect("converts");
+    let header_len = u32::from_le_bytes(dib[0..4].try_into().unwrap());
+    let compression = u32::from_le_bytes(dib[16..20].try_into().unwrap());
+    let alpha_mask = u32::from_le_bytes(dib[52..56].try_into().unwrap());
+    assert_eq!(header_len, 124, "BITMAPV5HEADER");
+    assert_eq!(compression, 3, "BI_BITFIELDS");
+    assert_eq!(alpha_mask, 0xFF00_0000);
+    assert_eq!(dib.len(), 124 + 2 * 4);
+
+    let (_, _, pixels) = png_pixels(&dib_to_png(&dib).expect("reads back"));
+    assert_eq!(pixels, vec![255, 0, 0, 255, 0, 255, 0, 128]);
 }

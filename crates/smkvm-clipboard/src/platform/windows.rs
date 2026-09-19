@@ -35,7 +35,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -241,14 +241,21 @@ fn render(format_id: u32) {
         };
         let formats = state.formats;
         let Some((offered, source)) = state.offer.as_ref() else {
+            tracing::debug!(format_id, "asked to render, but nothing is on offer");
             return;
         };
         let wanted = offered
             .iter()
             .find(|f| native_ids(formats, f).contains(&format_id));
         let Some(wanted) = wanted.cloned() else {
+            tracing::debug!(
+                format_id,
+                ?offered,
+                "asked to render a form that was not offered"
+            );
             return;
         };
+        tracing::debug!(format_id, ?wanted, "something here is pasting");
 
         let bytes = match state.cache.get(&wanted) {
             Some(cached) => cached.clone(),
@@ -264,8 +271,9 @@ fn render(format_id: u32) {
             },
         };
 
-        if let Err(e) = write_native(formats, &wanted, format_id, &bytes) {
-            tracing::warn!(?wanted, "could not put the data on the clipboard: {e}");
+        match write_native(formats, &wanted, format_id, &bytes) {
+            Ok(()) => tracing::debug!(format_id, ?wanted, bytes = bytes.len(), "handed over"),
+            Err(e) => tracing::warn!(?wanted, "could not put the data on the clipboard: {e}"),
         }
     });
 }
@@ -275,8 +283,10 @@ fn native_ids(formats: Formats, format: &ClipFormat) -> Vec<u32> {
     match format {
         ClipFormat::Text => vec![CF_UNICODETEXT.0 as u32],
         ClipFormat::Html => vec![formats.html],
-        // Offered both ways: applications differ on which they ask for.
-        ClipFormat::Png => vec![formats.png, CF_DIB.0 as u32],
+        // Offered every way applications ask: the plain bitmap is the one
+        // Windows will turn into a `CF_BITMAP`, the v5 one carries alpha for
+        // those that read it, and PNG spares the conversion for the rest.
+        ClipFormat::Png => vec![formats.png, CF_DIB.0 as u32, CF_DIBV5.0 as u32],
         ClipFormat::Uris => vec![CF_HDROP.0 as u32],
         ClipFormat::Other(_) => Vec::new(),
     }
@@ -292,6 +302,9 @@ fn write_native(formats: Formats, format: &ClipFormat, as_id: u32, bytes: &[u8])
         }
         ClipFormat::Html => write_raw(formats.html, &html::wrap(bytes)),
         ClipFormat::Png if as_id == formats.png => write_raw(formats.png, bytes),
+        ClipFormat::Png if as_id == CF_DIBV5.0 as u32 => {
+            write_raw(CF_DIBV5.0 as u32, &image::png_to_dibv5(bytes)?)
+        }
         ClipFormat::Png => write_raw(CF_DIB.0 as u32, &image::png_to_dib(bytes)?),
         ClipFormat::Uris => write_raw(CF_HDROP.0 as u32, &files::uri_list_to_hdrop(bytes)?),
         ClipFormat::Other(_) => Err(ClipboardError::Refused(format.clone())),
