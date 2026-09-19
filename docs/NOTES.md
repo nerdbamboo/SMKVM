@@ -80,42 +80,39 @@ invisible, look for other KVM software first.
 
 ## What is still wrong
 
-Everything on `main` has now run on the real machines, with the clipboard
-exercised in both directions and the log read on both ends. Found and fixed
-so far, each with a test that failed first: the X11 watcher going deaf after
-its first look (an event it held back was fed straight back to itself, for
-ever, at full CPU), and the bitmap handed to Windows under `CF_DIB` having a
-v5 header Windows will not turn into a `CF_BITMAP` (the paste came up empty
-while the log said it had been handed over). What remains:
+Everything on `main` has run on the real machines: input, the clipboard in
+both directions including images, and files pasted both ways. Each fault
+found there was pinned with a test that failed first; the commit messages
+say what each one was. What remains:
 
-- **One copy on Windows arrives as two offers.** `WM_CLIPBOARDUPDATE` fires
-  twice for a single `SetText`, about 8 ms apart, and each becomes a new
-  sequence number and a new offer to every machine. Harmless so far -- the
-  second supersedes the first -- but it doubles the X11 ownership dance on
-  every client and is the first thing to suspect in any "stale" report.
-- **A change notice with nothing usable in it erases what is held.**
-  `Exchange::local_changed` takes `local` and `remote` away before noticing
-  the formats are empty, and announces nothing. A peer then keeps offering a
-  sequence the holder has forgotten, and the next paste there is refused as
-  stale. Either ignore such notices or announce a release; the wire has no
-  release message yet.
+- **Files move by copy and paste only.** Dragging a file to another screen
+  does nothing yet. The pull-on-paste machinery is what a drop would use
+  too; what is missing is the OLE drop target and the XDND side, which is
+  the riskiest piece in the plan and was left for last on purpose.
+- **A paste of files blocks the pasting application until they arrive.**
+  Explorer or Nautilus asks for the list and gets it only once every file
+  is on disk, so a large paste looks hung for the duration. `transfer.max_bytes`
+  bounds the wait; the fix is Windows' virtual-file form
+  (`CFSTR_FILEDESCRIPTOR`), which lets Explorer show its own progress.
+- **The pointer on a machine with no mouse relies on MouseKeys.** Windows
+  hides the pointer outright when no mouse is attached; the client switches
+  the MouseKeys accessibility setting on while the cursor is there, which is
+  the only thing that makes Windows draw it (Barrier did the same). It is put
+  back when the cursor leaves. While on, the number pad steers the pointer
+  in whichever Num Lock state it was *not* in when the cursor arrived, so
+  toggling Num Lock while there makes the digits move the pointer.
 - **The X11 owner thread blocks on the network.** Serving a paste calls
-  `Fetch::fetch`, which waits up to 30 s for the far machine, and no new offer
-  is taken up until it returns -- so a slow or failed fetch leaves the owner
-  answering with the sequence number of an offer the exchange has already
-  replaced. The Windows side has the same shape inside `WM_RENDERFORMAT`.
+  `Fetch::fetch`, which waits on the far machine, and a replacement offer is
+  taken up only once it returns. Ownership now continues across the
+  replacement and stale clears are recognised, so nothing is lost -- but a
+  slow fetch still delays the next offer. The Windows side has the same shape
+  inside `WM_RENDERFORMAT`.
 - **The GUI on a client shows only that client.** A client's status report
   carries no desk -- `monitor = []` even for its own screens -- so the desk
   view is complete only on the server. Either the server sends the desk to
   its clients or the GUI reads the server's report over the link.
-- **`files` in the default formats carries paths, not files.** A list of
-  files copied on one machine is offered on the others as `CF_HDROP` or
-  `text/uri-list` naming paths that exist only where they were copied. It
-  should stay off until transfer exists to back it.
 - **Log lines print `DeviceId` as thirty-two decimal bytes.** Hex, or the
   machine's name, would make the clipboard lines readable.
-
-**File transfer** is not started.
 
 ## Traps that have already cost time
 
