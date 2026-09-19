@@ -100,10 +100,7 @@ fn merging_a_text_config_adds_its_screens_and_explains_the_workaround() {
     i.merge_server_config(&ServerConfig::parse(SERVER_CONFIG));
 
     let names: Vec<_> = i.grid.iter().map(|g| g.name.as_str()).collect();
-    assert!(
-        names.contains(&"WIN-LAPTOP"),
-        "third machine picked up"
-    );
+    assert!(names.contains(&"WIN-LAPTOP"), "third machine picked up");
 
     let notes = i.notes.join("\n");
     assert!(

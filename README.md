@@ -111,7 +111,7 @@ Both targets, always: most of the platform code exists only on one of them.
 The X11 tests start a private `Xvfb` when one is installed and skip otherwise.
 
 The design reasoning is in the commit messages; `git log` reads as the record
-of why things are the way they are. `docs/HANDOFF.md` holds what is not in the
+of why things are the way they are. `docs/NOTES.md` holds what is not in the
 code.
 
 GPL-2.0-or-later.

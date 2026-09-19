@@ -2,3 +2,5 @@
 **/*.rs.bk
 *.pdb
 .omc/
+# Notes about one particular installation: machine names, accounts, addresses.
+docs/local/
