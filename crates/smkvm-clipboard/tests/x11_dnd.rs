@@ -57,7 +57,11 @@ fn display_taken(n: u32) -> bool {
 
 fn start_server() -> Option<Server> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let base = 300 + (std::process::id() % 40) * 4;
+    // A hundred display numbers of its own, so two test binaries running
+    // at once cannot land on the same one: twenty buckets four apart,
+    // and the search below walks up to twenty-four from wherever it
+    // starts.
+    let base = 300 + (std::process::id() % 20) * 4;
     for _ in 0..24 {
         let n = base + NEXT.fetch_add(1, Ordering::SeqCst);
         if display_taken(n) {
@@ -311,9 +315,13 @@ fn a_drag_in_progress_is_caught_with_its_files_and_ended_on_the_catcher() {
         }
     }
     let (paths, driven) = catching.join().expect("the catcher thread finishes");
-    // Anything the application was told after the catcher returned.
-    let settle = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < settle {
+    // Anything the application was told after the catcher returned. The
+    // message was flushed before the catcher gave up its files, so this waits
+    // for it to arrive rather than for a fixed stretch of clock: a machine
+    // running the whole suite at once can leave this thread unscheduled for
+    // longer than any stretch worth writing down, and did.
+    let settle = Instant::now() + Duration::from_secs(5);
+    while !seen.finished && Instant::now() < settle {
         match dragger.conn.poll_for_event().unwrap() {
             Some(Event::ClientMessage(m)) if m.type_ == finished => seen.finished = true,
             Some(_) => {}
@@ -332,17 +340,21 @@ fn a_drag_in_progress_is_caught_with_its_files_and_ended_on_the_catcher() {
     assert_eq!(
         driven.iter().filter(|d| **d == Drive::ReleaseLeft).count(),
         1,
-        "the button is let go exactly once, once the drag is confirmed"
+        "the button is let go exactly once, once the drag is confirmed: {driven:?}"
     );
     assert!(
         driven.iter().any(|d| matches!(d, Drive::MoveTo(..))),
-        "the pointer was nudged so the application would look"
+        "the pointer was nudged so the application would look: {driven:?}"
     );
-    assert_eq!(seen.status & 1, 1, "the catcher accepted the drag");
-    assert!(seen.served, "the file list was asked for");
+    assert_eq!(
+        seen.status & 1,
+        1,
+        "the catcher accepted the drag: {seen:?}"
+    );
+    assert!(seen.served, "the file list was asked for: {seen:?}");
     assert!(
         seen.finished,
-        "the application was told the drop is finished"
+        "the application was told the drop is finished: {seen:?}"
     );
     drop(server);
 }

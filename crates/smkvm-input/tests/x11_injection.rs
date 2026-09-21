@@ -81,7 +81,11 @@ fn start_server() -> Option<Server> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     // Spread across a range so concurrent test binaries do not collide, and
     // step past any number that turns out to be taken.
-    let base = 90 + (std::process::id() % 30) * 4;
+    // A hundred display numbers of its own, so two test binaries running
+    // at once cannot land on the same one: twenty buckets four apart,
+    // and the search below walks up to twenty-four from wherever it
+    // starts.
+    let base = 100 + (std::process::id() % 20) * 4;
 
     for _ in 0..24 {
         let n = base + NEXT.fetch_add(1, Ordering::SeqCst);

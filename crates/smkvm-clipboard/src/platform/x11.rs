@@ -1241,6 +1241,16 @@ impl CatchDrag for DndCatcher {
             [self.window, 1, self.atoms.action_copy, 0, 0],
         );
         self.unmap();
+        // A round trip, so the server has certainly acted on that message
+        // before this connection can go away. Flushing only puts the bytes on
+        // the socket; a server that reads them together with the end of the
+        // connection is within its rights to drop them, and then the
+        // application is left holding a drag that never ended -- no files
+        // moved, no cursor restored, nothing said. It was lost that way about
+        // a third of the time on a loaded machine.
+        if let Ok(cookie) = self.conn.get_input_focus() {
+            let _ = cookie.reply();
+        }
         let paths = files::local_paths(&list?);
         (!paths.is_empty()).then_some(paths)
     }

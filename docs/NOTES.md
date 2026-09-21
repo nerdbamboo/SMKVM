@@ -222,6 +222,15 @@ an administrator window in front looked identical to every other stopped
 pointer. Every refusal is now noticed and explained in the log. If a pointer
 stops on a Windows client and the log says nothing, look there first.
 
+**Flushing an X message is not the same as the server having acted on it.**
+The catcher sent `XdndFinished` and let its connection go; a server that
+reads those bytes together with the end of the connection may drop them, and
+about a third of the time on a loaded machine it did. The application is then
+left holding a drag that never ended. A round trip after the last thing said
+on a connection is what makes it stick -- `get_input_focus().reply()` is the
+cheap one. The same applies anywhere a connection is closed right after a
+send.
+
 **A scheduled task's process has a console even when nothing is on screen.**
 The daemon decided where to log by asking whether stderr was a terminal, and
 from inside a task it looked like one, so two deployments logged into a

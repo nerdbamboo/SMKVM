@@ -46,7 +46,11 @@ fn display_taken(n: u32) -> bool {
 
 fn start_server() -> Option<Server> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let base = 150 + (std::process::id() % 40) * 4;
+    // A hundred display numbers of its own, so two test binaries running
+    // at once cannot land on the same one: twenty buckets four apart,
+    // and the search below walks up to twenty-four from wherever it
+    // starts.
+    let base = 200 + (std::process::id() % 20) * 4;
     for _ in 0..24 {
         let n = base + NEXT.fetch_add(1, Ordering::SeqCst);
         if display_taken(n) {
