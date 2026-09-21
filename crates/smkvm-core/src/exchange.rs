@@ -276,6 +276,25 @@ impl Exchange {
         }
     }
 
+    /// Offer something this machine has that is not on its clipboard -- files
+    /// picked up from a drag as the cursor left. Announced to every peer like
+    /// a copy; the caller answers [`Output::ReadLocal`] for it itself. Returns
+    /// the sequence the offer travels under, or `None` if nothing was offered.
+    pub fn announce(
+        &mut self,
+        formats: Vec<ClipFormat>,
+        now: Instant,
+    ) -> (Option<ClipSeq>, Vec<Output>) {
+        let mut out = Vec::new();
+        let before = self.counter;
+        self.local_changed(formats, now, &mut out);
+        let seq = (self.counter != before).then_some(ClipSeq {
+            device: self.me,
+            counter: self.counter,
+        });
+        (seq, out)
+    }
+
     fn local_changed(&mut self, formats: Vec<ClipFormat>, now: Instant, out: &mut Vec<Output>) {
         if !self.enabled {
             return;
@@ -359,13 +378,14 @@ impl Exchange {
                 }
             }
             Bulk::ClipCancel { .. } => {}
-            // File transfer is not carried yet; a machine that sends it is
-            // ahead of this build and nothing here can act on it.
+            // Files travel through `Transfer`, and which machine a drag lands
+            // on is the daemon's to know; neither is decided here.
             Bulk::FileOffer(_)
             | Bulk::FileRequest { .. }
             | Bulk::FileChunk { .. }
             | Bulk::FileDone { .. }
-            | Bulk::FileAbort { .. } => {}
+            | Bulk::FileAbort { .. }
+            | Bulk::Dragging { .. } => {}
         }
     }
 

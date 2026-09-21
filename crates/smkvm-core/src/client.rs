@@ -5,7 +5,7 @@
 //! stops being in charge. A key still held on a machine the user has walked
 //! away from is the failure this is built around.
 
-use smkvm_input::{Inject, Tracked};
+use smkvm_input::{Inject, InputError, Tracked};
 use smkvm_layout::Monitor;
 use smkvm_proto::{ClientControl, ServerControl, SuspendReason};
 
@@ -20,6 +20,11 @@ pub struct Client<I: Inject> {
     /// Whether this machine currently has the cursor.
     active: bool,
     suspended: Option<SuspendReason>,
+    /// The last injection that the platform refused while the cursor was
+    /// here, kept until somebody asks. A refusal means nothing sent is
+    /// landing, which from the person's side is a pointer that has stopped;
+    /// throwing the error away is how that went unexplained.
+    refused: Option<InputError>,
 }
 
 impl<I: Inject> Client<I> {
@@ -28,6 +33,20 @@ impl<I: Inject> Client<I> {
             input: Tracked::new(input),
             active: false,
             suspended: None,
+            refused: None,
+        }
+    }
+
+    /// The most recent injection the platform refused, if any since the last
+    /// time this was asked. The caller decides what that means here -- on
+    /// Windows, most often a window of higher privilege in front.
+    pub fn take_refusal(&mut self) -> Option<InputError> {
+        self.refused.take()
+    }
+
+    fn note(&mut self, result: smkvm_input::Result<()>) {
+        if let Err(e) = result {
+            self.refused = Some(e);
         }
     }
 
@@ -107,6 +126,7 @@ impl<I: Inject> Client<I> {
                     // Worth saying: this is the person watching a machine they
                     // have just been given not show them a pointer.
                     tracing::warn!("the pointer could not be put where it arrived: {e}");
+                    self.refused = Some(e);
                 }
                 // After the placement, not before. Anything owed from being
                 // parked is settled by having been put somewhere on purpose --
@@ -131,21 +151,24 @@ impl<I: Inject> Client<I> {
             }
             ServerControl::MoveTo { x, y } => {
                 if self.deliverable() {
-                    let _ = self.input.move_to(x, y);
+                    let moved = self.input.move_to(x, y);
+                    self.note(moved);
                     let _ = self.input.flush();
                 }
                 Vec::new()
             }
             ServerControl::Button { button, down } => {
                 if self.deliverable() {
-                    let _ = self.input.button(button, down);
+                    let pressed = self.input.button(button, down);
+                    self.note(pressed);
                     let _ = self.input.flush();
                 }
                 Vec::new()
             }
             ServerControl::Wheel(scroll) => {
                 if self.deliverable() {
-                    let _ = self.input.wheel(scroll);
+                    let scrolled = self.input.wheel(scroll);
+                    self.note(scrolled);
                     let _ = self.input.flush();
                 }
                 Vec::new()
@@ -154,11 +177,16 @@ impl<I: Inject> Client<I> {
                 if self.deliverable() {
                     // A repeat is the same physical key going down again; the
                     // held set does not change.
-                    let _ = if repeat && down {
+                    let typed = if repeat && down {
                         self.input.inner_mut().key(key, true)
                     } else {
                         self.input.key(key, down)
                     };
+                    // A key this platform has no way to send is not a refusal;
+                    // it is reported once by the capture side already.
+                    if !matches!(typed, Err(InputError::UnmappedKey(_))) {
+                        self.note(typed);
+                    }
                     let _ = self.input.flush();
                 }
                 Vec::new()

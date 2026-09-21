@@ -10,6 +10,10 @@ use smkvm_core::Event;
 use smkvm_input::{Inject, Monitors};
 use tokio::sync::mpsc::Sender;
 
+use std::path::PathBuf;
+
+use smkvm_clipboard::CatchDrag;
+
 use crate::clipboard::Backends;
 
 /// Open the backend that puts input on this machine's screen.
@@ -33,6 +37,80 @@ pub fn injector() -> Result<Box<dyn InjectAndReport>> {
 /// An injector that can also say what displays it has.
 pub trait InjectAndReport: Inject + Monitors + Send {}
 impl<T: Inject + Monitors + Send> InjectAndReport for T {}
+
+/// Why input injected here is not landing, if it is not.
+///
+/// Asked when an injection was refused, and every so often while the cursor
+/// is here, since the secure desktop refuses nothing -- input to it simply
+/// goes nowhere. The second string is for the log: what is in the way and
+/// what to do about it.
+pub fn injection_blocked() -> Option<(smkvm_proto::SuspendReason, String)> {
+    #[cfg(windows)]
+    {
+        use smkvm_input::platform::windows::{can_inject, desktop, privilege};
+        use smkvm_proto::SuspendReason;
+
+        match desktop::current() {
+            desktop::InputDesktop::Ours => {}
+            desktop::InputDesktop::Elsewhere(name) => {
+                return Some((
+                    SuspendReason::SecureDesktop,
+                    format!(
+                        "input is going to the {name} desktop -- a UAC prompt, the lock screen \
+                         or Ctrl+Alt+Del -- which a program in the user's session cannot reach"
+                    ),
+                ))
+            }
+            desktop::InputDesktop::OutOfReach => {
+                return Some((
+                    SuspendReason::SecureDesktop,
+                    "input is going to a desktop this program is not allowed on, which is what \
+                     a UAC prompt or the lock screen does"
+                        .into(),
+                ))
+            }
+        }
+        if let Some(front) = privilege::foreground_outranks_us() {
+            return Some((
+                SuspendReason::Elevated,
+                format!(
+                    "{} is in front and runs at a {} integrity level while smkvm runs at a {} \
+                     one, so Windows refuses input from smkvm. Click a different window, or run \
+                     smkvm as administrator (a scheduled task with 'run with highest privileges') \
+                     so it outranks everything it has to type into",
+                    front.program,
+                    privilege::describe_level(front.theirs),
+                    privilege::describe_level(front.ours)
+                ),
+            ));
+        }
+        if !can_inject() {
+            return Some((
+                SuspendReason::Other,
+                "the system refuses injected input right now and does not say why".into(),
+            ));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Would injected input land now? The other half of [`injection_blocked`],
+/// asked while suspended to know when to take the cursor again.
+pub fn injection_possible() -> bool {
+    #[cfg(windows)]
+    {
+        use smkvm_input::platform::windows::{can_inject, desktop};
+        desktop::current().is_reachable() && can_inject()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 /// Open this machine's clipboard for watching, reading and offering.
 pub fn clipboard() -> Result<Backends> {
@@ -70,6 +148,48 @@ pub fn clipboard() -> Result<Backends> {
     #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
     {
         bail!("this platform has no clipboard backend yet")
+    }
+}
+
+/// Something that can pick up the files of a drag as the cursor leaves.
+pub fn drop_catcher() -> Result<Box<dyn CatchDrag>> {
+    #[cfg(windows)]
+    {
+        let catcher = smkvm_clipboard::platform::windows_drag::DropCatcher::start()
+            .context("making the window that catches drags")?;
+        Ok(Box::new(catcher))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let catcher = smkvm_clipboard::platform::x11::DndCatcher::open()
+            .context("opening the display to catch drags")?;
+        Ok(Box::new(catcher))
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        bail!("this platform has no way to catch a drag yet")
+    }
+}
+
+/// Drop files that have landed here wherever the pointer is when the button
+/// comes up, the way the platform's own drag would. Returns whether the
+/// platform can do that at all; where it cannot, the files stay where they
+/// landed and are on the clipboard.
+pub fn native_drop(paths: Vec<PathBuf>) -> bool {
+    #[cfg(windows)]
+    {
+        match smkvm_clipboard::platform::windows_drag::drop_files(paths) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("could not start the drop: {e}");
+                false
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = paths;
+        false
     }
 }
 

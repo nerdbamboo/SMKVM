@@ -29,7 +29,9 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
 
-use crate::{Available, ClipboardError, Fetch, Read, Result, Watch, Write};
+use crate::{
+    files, Available, CatchDrag, ClipboardError, Drive, Fetch, Read, Result, Watch, Write,
+};
 
 /// How long to wait for the application holding the selection to answer.
 ///
@@ -915,4 +917,331 @@ fn owner_thread(
         }
     }
     take_back(&mut owner, &mut idle);
+}
+
+// ---------------------------------------------------------------------------
+// Drag and drop: picking up what is being dragged as the cursor leaves.
+// ---------------------------------------------------------------------------
+
+/// The atoms the XDND protocol is spoken in.
+struct DndAtoms {
+    aware: Atom,
+    enter: Atom,
+    position: Atom,
+    status: Atom,
+    drop: Atom,
+    finished: Atom,
+    selection: Atom,
+    type_list: Atom,
+    action_copy: Atom,
+    uri_list: Atom,
+    /// Where the file list is asked to be written on our window.
+    transfer: Atom,
+}
+
+impl DndAtoms {
+    fn intern(conn: &RustConnection) -> Result<DndAtoms> {
+        let get = |name: &str| -> Result<Atom> {
+            Ok(conn
+                .intern_atom(false, name.as_bytes())
+                .map_err(display_err)?
+                .reply()
+                .map_err(display_err)?
+                .atom)
+        };
+        Ok(DndAtoms {
+            aware: get("XdndAware")?,
+            enter: get("XdndEnter")?,
+            position: get("XdndPosition")?,
+            status: get("XdndStatus")?,
+            drop: get("XdndDrop")?,
+            finished: get("XdndFinished")?,
+            selection: get("XdndSelection")?,
+            type_list: get("XdndTypeList")?,
+            action_copy: get("XdndActionCopy")?,
+            uri_list: get("text/uri-list")?,
+            transfer: get("SMKVM_DND_TRANSFER")?,
+        })
+    }
+}
+
+/// The XDND protocol version this speaks. Five is what every toolkit has
+/// spoken for twenty years.
+const XDND_VERSION: u32 = 5;
+
+/// How long the dragging application gets to notice the window.
+const ENTER_PATIENCE: Duration = Duration::from_millis(250);
+/// How long the drop gets to arrive once the button has been released, and
+/// then the file list once the drop has.
+const DROP_PATIENCE: Duration = Duration::from_millis(500);
+/// Half the side of the catching window. Big enough that a pointer nudged
+/// by one pixel is still inside it.
+const REACH: i16 = 32;
+
+/// Picks up what is being dragged as the cursor leaves this machine.
+///
+/// XDND tells only the window under the pointer what a drag carries, so this
+/// keeps a small override-redirect window of its own unmapped, and when asked
+/// maps it under the pointer for a moment. The dragging application notices
+/// it on the next pointer movement and sends `XdndEnter`; the drag is then
+/// accepted, the button released on the application's behalf so it drops
+/// here, the file list read out of the drag's selection, and the application
+/// told the drop is finished -- with nothing moved or copied on this machine,
+/// since a copy is what was declared.
+pub struct DndCatcher {
+    conn: RustConnection,
+    root: Window,
+    window: Window,
+    atoms: DndAtoms,
+}
+
+impl DndCatcher {
+    pub fn open() -> Result<DndCatcher> {
+        Self::open_display(None)
+    }
+
+    pub fn open_display(display: Option<&str>) -> Result<DndCatcher> {
+        let (conn, screen_num) = x11rb::connect(display).map_err(display_err)?;
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let window = conn.generate_id().map_err(display_err)?;
+        conn.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            (2 * REACH) as u16,
+            (2 * REACH) as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .event_mask(EventMask::PROPERTY_CHANGE)
+                .background_pixel(screen.black_pixel),
+        )
+        .map_err(display_err)?;
+        let atoms = DndAtoms::intern(&conn)?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms.aware,
+            AtomEnum::ATOM,
+            &[XDND_VERSION],
+        )
+        .map_err(display_err)?;
+        conn.flush().map_err(display_err)?;
+        Ok(DndCatcher {
+            conn,
+            root,
+            window,
+            atoms,
+        })
+    }
+
+    /// Wait for an event matching `want`, dropping everything else.
+    fn wait_for<T>(
+        &self,
+        deadline: Instant,
+        mut want: impl FnMut(&Event) -> Option<T>,
+    ) -> Option<T> {
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(event)) => {
+                    if let Some(value) = want(&event) {
+                        return Some(value);
+                    }
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn tell(&self, to: Window, type_: Atom, data: [u32; 5]) -> Result<()> {
+        let event = x11rb::protocol::xproto::ClientMessageEvent {
+            response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: to,
+            type_,
+            data: x11rb::protocol::xproto::ClientMessageData::from(data),
+        };
+        self.conn
+            .send_event(false, to, EventMask::NO_EVENT, event)
+            .map_err(display_err)?;
+        self.conn.flush().map_err(display_err)?;
+        Ok(())
+    }
+
+    fn unmap(&self) {
+        let _ = self.conn.unmap_window(self.window);
+        let _ = self.conn.flush();
+    }
+
+    /// The types a drag offers: three in the message, or a list on the
+    /// source's window when there are more.
+    fn types_of(&self, source: Window, data: &[u32; 5]) -> Vec<Atom> {
+        if data[1] & 1 == 0 {
+            return data[2..5].iter().copied().filter(|a| *a != 0).collect();
+        }
+        self.conn
+            .get_property(false, source, self.atoms.type_list, AtomEnum::ATOM, 0, 1024)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|reply| reply.value32().map(|v| v.collect()))
+            .unwrap_or_default()
+    }
+
+    /// Read the drag's file list out of its selection, as of `time`.
+    fn file_list(&self, time: Timestamp) -> Option<Vec<u8>> {
+        self.conn
+            .delete_property(self.window, self.atoms.transfer)
+            .ok()?;
+        self.conn
+            .convert_selection(
+                self.window,
+                self.atoms.selection,
+                self.atoms.uri_list,
+                self.atoms.transfer,
+                time,
+            )
+            .ok()?;
+        self.conn.flush().ok()?;
+        let window = self.window;
+        let deadline = Instant::now() + DROP_PATIENCE;
+        let notify: SelectionNotifyEvent = self.wait_for(deadline, |event| match event {
+            Event::SelectionNotify(e) if e.requestor == window => Some(*e),
+            _ => None,
+        })?;
+        if notify.property == NONE {
+            return None;
+        }
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.transfer,
+                AtomEnum::ANY,
+                0,
+                u32::MAX / 4,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        let _ = self.conn.delete_property(window, self.atoms.transfer);
+        let _ = self.conn.flush();
+        // A file list is a few hundred bytes; one that arrives in pieces is
+        // not one this expects, and is not worth the machinery.
+        (reply.format == 8 && !reply.value.is_empty()).then_some(reply.value)
+    }
+}
+
+impl CatchDrag for DndCatcher {
+    fn catch(&mut self, drive: &mut dyn FnMut(Drive)) -> Option<Vec<std::path::PathBuf>> {
+        // Anything left over from an earlier attempt is about that attempt.
+        while let Ok(Some(_)) = self.conn.poll_for_event() {}
+
+        let pointer = self.conn.query_pointer(self.root).ok()?.reply().ok()?;
+        let (x, y) = (pointer.root_x, pointer.root_y);
+        self.conn
+            .configure_window(
+                self.window,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .x(i32::from(x - REACH))
+                    .y(i32::from(y - REACH))
+                    .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+            )
+            .ok()?;
+        self.conn.map_window(self.window).ok()?;
+        self.conn.flush().ok()?;
+        // The application looks at what is under the pointer when the pointer
+        // moves. Once away and back leaves it exactly where it was.
+        drive(Drive::MoveTo(i32::from(x) + 1, i32::from(y)));
+        drive(Drive::MoveTo(i32::from(x), i32::from(y)));
+
+        let (enter, position) = (self.atoms.enter, self.atoms.position);
+        let window = self.window;
+        let deadline = Instant::now() + ENTER_PATIENCE;
+        let Some((source, data)) = self.wait_for(deadline, |event| match event {
+            Event::ClientMessage(m) if m.window == window && m.type_ == enter => {
+                let data = m.data.as_data32();
+                Some((data[0], data))
+            }
+            _ => None,
+        }) else {
+            // Nothing was being dragged, or not by anything that speaks XDND.
+            // The button is left exactly as it was.
+            self.unmap();
+            return None;
+        };
+        let types = self.types_of(source, &data);
+        if !types.contains(&self.atoms.uri_list) {
+            tracing::debug!("a drag was caught, but it carries no files");
+            self.unmap();
+            return None;
+        }
+
+        // The application sends where the pointer is once we have said we
+        // are interested; we are, so accept whatever it asks about.
+        let accept = |me: &DndCatcher| {
+            me.tell(
+                source,
+                me.atoms.status,
+                [me.window, 1, 0, 0, me.atoms.action_copy],
+            )
+        };
+        let deadline = Instant::now() + ENTER_PATIENCE;
+        let _ = self.wait_for(deadline, |event| match event {
+            Event::ClientMessage(m) if m.window == window && m.type_ == position => Some(()),
+            _ => None,
+        });
+        if accept(self).is_err() {
+            self.unmap();
+            return None;
+        }
+
+        // Let go of the button on the application's behalf, so its drag ends
+        // on this window.
+        drive(Drive::ReleaseLeft);
+        let (drop, position) = (self.atoms.drop, self.atoms.position);
+        let deadline = Instant::now() + DROP_PATIENCE;
+        let mut pending_position = false;
+        let dropped_at = self.wait_for(deadline, |event| match event {
+            Event::ClientMessage(m) if m.window == window && m.type_ == drop => {
+                Some(m.data.as_data32()[2])
+            }
+            Event::ClientMessage(m) if m.window == window && m.type_ == position => {
+                pending_position = true;
+                None
+            }
+            _ => None,
+        });
+        if pending_position {
+            let _ = accept(self);
+        }
+        let Some(time) = dropped_at else {
+            tracing::debug!("the drag was accepted but the drop never came");
+            self.unmap();
+            return None;
+        };
+        let list = self.file_list(if time == 0 { CURRENT_TIME } else { time });
+        // Finished, and nothing was taken: the files are still where they
+        // were, whatever the application thought it was doing.
+        let _ = self.tell(
+            source,
+            self.atoms.finished,
+            [self.window, 1, self.atoms.action_copy, 0, 0],
+        );
+        self.unmap();
+        let paths = files::local_paths(&list?);
+        (!paths.is_empty()).then_some(paths)
+    }
 }

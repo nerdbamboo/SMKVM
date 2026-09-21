@@ -12,8 +12,14 @@
 //! sizes instead, and a paste pulls the files themselves, piece by piece,
 //! into the transfer directory before the pasting application is handed
 //! paths that exist.
+//!
+//! A drag is a copy that never touched the clipboard. Files picked up as the
+//! cursor left one machine are announced exactly as a copy would be, with
+//! their manifest kept here rather than read from the clipboard; the machine
+//! the cursor arrived on is told that this offer is what the cursor carries,
+//! pulls the files without waiting for a paste, and drops them.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -179,7 +185,14 @@ impl FileSettings {
     }
 }
 
-/// Files being pulled for a paste on this machine.
+/// Who is waiting for files being pulled: an application pasting, or a drag
+/// that will drop them once they are here.
+enum Delivery {
+    Paste(std::sync::mpsc::Sender<Result<Vec<u8>, String>>),
+    Drop,
+}
+
+/// Files being pulled for a paste or a drop on this machine.
 struct Incoming {
     id: TransferId,
     offer: FileOffer,
@@ -187,8 +200,21 @@ struct Incoming {
     /// The entry being written, or the next to start.
     index: usize,
     current: Option<Arriving>,
-    reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    delivery: Delivery,
     started: Instant,
+}
+
+/// Hands over exactly what it was made with. For files that have landed from
+/// a drop: their list goes on the clipboard so a paste places them too.
+struct Fixed(Vec<u8>);
+
+impl Fetch for Fixed {
+    fn fetch(&self, format: &ClipFormat) -> smkvm_clipboard::Result<Vec<u8>> {
+        match format {
+            ClipFormat::Uris => Ok(self.0.clone()),
+            other => Err(ClipboardError::Refused(other.clone())),
+        }
+    }
 }
 
 /// The clipboard side of a daemon, whichever role it plays.
@@ -214,6 +240,15 @@ pub struct Sharing {
     offered: VecDeque<Offered>,
     next_transfer: u64,
     incoming: Option<Incoming>,
+    /// Manifests offered for a drag. Nothing put them on the clipboard, so a
+    /// request for them is answered from here.
+    synthetic: HashMap<ClipSeq, Vec<u8>>,
+    /// Requests whose answer is a manifest to drop here, not to paste.
+    drop_tickets: HashSet<u64>,
+    /// A drag the cursor arrived with, whose offer has not arrived yet.
+    pending_drop: Option<ClipSeq>,
+    /// Files that have just landed from a drop, for the daemon to take.
+    landed: Option<Vec<PathBuf>>,
 }
 
 impl Sharing {
@@ -280,7 +315,103 @@ impl Sharing {
             offered: VecDeque::new(),
             next_transfer: 1,
             incoming: None,
+            synthetic: HashMap::new(),
+            drop_tickets: HashSet::new(),
+            pending_drop: None,
+            landed: None,
         }
+    }
+
+    pub fn files_enabled(&self) -> bool {
+        self.files.enabled
+    }
+
+    /// Files were picked up from a drag as the cursor left this machine.
+    ///
+    /// Offered to every other machine exactly as a copy would be; the
+    /// manifest is kept here since nothing put it on the clipboard. Returns
+    /// the sequence the offer travels under, for telling the machine the
+    /// cursor arrived on that this is what it is carrying.
+    pub fn drag_started(
+        &mut self,
+        paths: Vec<PathBuf>,
+        now: Instant,
+    ) -> (Option<ClipSeq>, Vec<(DeviceId, Bulk)>) {
+        if !self.files.enabled {
+            return (None, Vec::new());
+        }
+        let id = TransferId {
+            device: self.me,
+            counter: self.next_transfer,
+        };
+        self.next_transfer += 1;
+        let offered = match disk::describe(id, &paths) {
+            Ok(offered) => offered,
+            Err(e) => {
+                warn!("could not describe the dragged files: {e}");
+                return (None, Vec::new());
+            }
+        };
+        let Ok(bytes) = smkvm_proto::encode_bare(&offered.offer) else {
+            return (None, Vec::new());
+        };
+        info!(
+            files = offered.offer.files.len(),
+            bytes = offered.offer.total_bytes,
+            "files picked up from a drag; offering them to the other machines"
+        );
+        self.offered.push_back(offered);
+        while self.offered.len() > OFFERED_KEPT {
+            self.offered.pop_front();
+        }
+        let (seq, outputs) = self.exchange.announce(vec![ClipFormat::Uris], now);
+        if let Some(seq) = seq {
+            self.synthetic.insert(seq, bytes);
+            let oldest = seq.counter.saturating_sub(OFFERED_KEPT as u64);
+            self.synthetic.retain(|s, _| s.counter > oldest);
+        }
+        let sends = self.apply(outputs);
+        (seq, sends)
+    }
+
+    /// The cursor arrived here carrying the offer `seq`: pull its files now,
+    /// without waiting for a paste, and drop them.
+    pub fn drop_here(&mut self, seq: ClipSeq, now: Instant) -> Vec<(DeviceId, Bulk)> {
+        if !self.files.enabled {
+            debug!(
+                ?seq,
+                "the cursor arrived carrying files, but transfer is off here"
+            );
+            return Vec::new();
+        }
+        if self.exchange.held_offer() != Some(seq) {
+            // The notice can only follow the offer on the link, but the
+            // server passes each on separately; the offer is moments away.
+            self.pending_drop = Some(seq);
+            return Vec::new();
+        }
+        self.pending_drop = None;
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.drop_tickets.insert(ticket);
+        info!(
+            ?seq,
+            "the cursor arrived carrying files; fetching them to drop here"
+        );
+        let outputs = self.exchange.handle(
+            Input::Wanted {
+                ticket,
+                seq,
+                format: ClipFormat::Uris,
+            },
+            now,
+        );
+        self.apply(outputs)
+    }
+
+    /// Files that have just landed from a drop, once.
+    pub fn take_landed(&mut self) -> Option<Vec<PathBuf>> {
+        self.landed.take()
     }
 
     /// Take a changed configuration into use.
@@ -329,18 +460,23 @@ impl Sharing {
                 }
             }
             Happened::Read(read) => {
-                let result = if read.format == ClipFormat::Uris {
-                    read.result.and_then(|bytes| self.manifest_for(&bytes))
-                } else {
-                    read.result
-                };
+                // A drag's manifest was made here and is already one; only a
+                // list read off the clipboard has to be turned into one.
+                let result =
+                    if read.format == ClipFormat::Uris && !self.synthetic.contains_key(&read.seq) {
+                        read.result.and_then(|bytes| self.manifest_for(&bytes))
+                    } else {
+                        read.result
+                    };
                 Input::ReadDone {
                     seq: read.seq,
                     format: read.format,
                     result,
                 }
             }
-            Happened::PullFiles(pull) => return self.start_pull(pull),
+            Happened::PullFiles(pull) => {
+                return self.begin_pull(pull.offer, Delivery::Paste(pull.reply))
+            }
         };
         let outputs = self.exchange.handle(input, now);
         self.apply(outputs)
@@ -412,7 +548,14 @@ impl Sharing {
             return self.apply_transfer(outputs);
         }
         let outputs = self.exchange.handle(Input::FromPeer { from, msg }, now);
-        self.apply(outputs)
+        let mut sends = self.apply(outputs);
+        // A drag notice that got here before its offer waits for exactly this.
+        if let Some(seq) = self.pending_drop {
+            if self.exchange.held_offer() == Some(seq) {
+                sends.extend(self.drop_here(seq, now));
+            }
+        }
+        sends
     }
 
     fn apply(&mut self, outputs: Vec<Output>) -> Vec<(DeviceId, Bulk)> {
@@ -448,6 +591,17 @@ impl Sharing {
                     }
                 }
                 Output::ReadLocal { seq, format } => self.read_local(seq, format),
+                Output::Deliver { ticket, result } if self.drop_tickets.remove(&ticket) => {
+                    match result {
+                        Ok(bytes) => match smkvm_proto::decode::<FileOffer>(&bytes) {
+                            Ok(offer) => sends.extend(self.begin_pull(offer, Delivery::Drop)),
+                            Err(_) => warn!("the dragged files' list is unreadable"),
+                        },
+                        Err(why) => {
+                            warn!("the dragged files could not be fetched: {}", describe(&why))
+                        }
+                    }
+                }
                 Output::Deliver { ticket, result } => {
                     if let Err(why) = &result {
                         debug!(
@@ -469,6 +623,17 @@ impl Sharing {
 
     /// Read the local clipboard off the loop, and report back when done.
     fn read_local(&mut self, seq: ClipSeq, format: ClipFormat) {
+        if format == ClipFormat::Uris {
+            if let Some(bytes) = self.synthetic.get(&seq) {
+                // A drag's manifest: made here, never on the clipboard.
+                let _ = self.reads_tx.try_send(ReadDone {
+                    seq,
+                    format,
+                    result: Ok(bytes.clone()),
+                });
+                return;
+            }
+        }
         let Some(live) = self.live.as_ref() else {
             // Nothing to read from. Said straight away rather than left to
             // time out on the other machine.
@@ -594,45 +759,51 @@ impl Sharing {
         }
     }
 
-    /// Something here pasted files from elsewhere: decide where they go and
-    /// ask for the first piece.
-    fn start_pull(&mut self, pull: PullFiles) -> Vec<(DeviceId, Bulk)> {
+    /// Files from elsewhere are wanted here -- pasted, or dropped: decide
+    /// where they go and ask for the first piece.
+    fn begin_pull(&mut self, offer: FileOffer, delivery: Delivery) -> Vec<(DeviceId, Bulk)> {
+        let refuse = |delivery: Delivery, why: String| {
+            warn!("{why}");
+            if let Delivery::Paste(reply) = delivery {
+                let _ = reply.send(Err(why));
+            }
+        };
         if !self.files.enabled {
-            let _ = pull
-                .reply
-                .send(Err("file transfer is turned off here".into()));
+            refuse(delivery, "file transfer is turned off here".into());
             return Vec::new();
         }
         if self.incoming.is_some() {
-            let _ = pull
-                .reply
-                .send(Err("another paste of files is still arriving".into()));
+            refuse(
+                delivery,
+                "another set of files is still arriving; try again when it has".into(),
+            );
             return Vec::new();
         }
-        let landing =
-            match disk::plan_landing(&pull.offer, &self.files.directory, self.files.max_bytes) {
-                Ok(landing) => landing,
-                Err(why) => {
-                    warn!("refusing the pasted files: {why}");
-                    let _ = pull
-                        .reply
-                        .send(Err(format!("refusing the pasted files: {why}")));
-                    return Vec::new();
-                }
-            };
+        let landing = match disk::plan_landing(&offer, &self.files.directory, self.files.max_bytes)
+        {
+            Ok(landing) => landing,
+            Err(why) => {
+                refuse(delivery, format!("refusing the files: {why}"));
+                return Vec::new();
+            }
+        };
         info!(
-            files = pull.offer.files.len(),
-            bytes = pull.offer.total_bytes,
+            files = offer.files.len(),
+            bytes = offer.total_bytes,
             into = %self.files.directory.display(),
-            "files are being pasted here; fetching them"
+            how = match delivery {
+                Delivery::Paste(_) => "pasted",
+                Delivery::Drop => "dropped",
+            },
+            "files are wanted here; fetching them"
         );
         self.incoming = Some(Incoming {
-            id: pull.offer.id,
-            offer: pull.offer,
+            id: offer.id,
+            offer,
             landing,
             index: 0,
             current: None,
-            reply: pull.reply,
+            delivery,
             started: Instant::now(),
         });
         self.advance_pull()
@@ -689,11 +860,26 @@ impl Sharing {
             files = incoming.offer.files.len(),
             bytes = incoming.offer.total_bytes,
             took_ms = incoming.started.elapsed().as_millis() as u64,
-            "the pasted files have all arrived"
+            into = %self.files.directory.display(),
+            "the files have all arrived"
         );
-        let _ = incoming
-            .reply
-            .send(Ok(uri_list(&incoming.landing.top_level)));
+        let list = uri_list(&incoming.landing.top_level);
+        match incoming.delivery {
+            Delivery::Paste(reply) => {
+                let _ = reply.send(Ok(list));
+            }
+            Delivery::Drop => {
+                // Whether or not the drop itself can be made where the
+                // pointer is, the files are here now, and a paste places
+                // them: so their list goes on the clipboard too.
+                if let Some(live) = self.live.as_mut() {
+                    if let Err(e) = live.write.offer(&[ClipFormat::Uris], Box::new(Fixed(list))) {
+                        warn!("could not put the landed files on the clipboard: {e}");
+                    }
+                }
+                self.landed = Some(incoming.landing.top_level);
+            }
+        }
         Vec::new()
     }
 
@@ -754,7 +940,9 @@ impl Sharing {
             if incoming.current.is_some() {
                 let _ = std::fs::remove_file(&incoming.landing.paths[incoming.index]);
             }
-            let _ = incoming.reply.send(result);
+            if let Delivery::Paste(reply) = incoming.delivery {
+                let _ = reply.send(result);
+            }
         }
     }
 }

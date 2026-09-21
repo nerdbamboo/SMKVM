@@ -602,3 +602,44 @@ fn a_change_notice_with_nothing_usable_in_it_leaves_what_is_held_alone() {
     assert_eq!(desk.exchange(A).local_offer(), Some(seq));
     assert_eq!(desk.paste(SERVER, ClipFormat::Text), Ok(b"hello".to_vec()));
 }
+
+#[test]
+fn files_picked_up_from_a_drag_are_offered_like_a_copy_and_read_from_the_offerer() {
+    // A drag never touched the clipboard, so the offerer answers the read
+    // itself; to every other machine it is a copy of files like any other.
+    let mut desk = Desk::new();
+    desk.now += Duration::from_secs(2);
+    let (seq, outputs) = desk
+        .machines
+        .iter_mut()
+        .find(|(d, _, _)| *d == dev(A))
+        .map(|(_, exchange, _)| exchange.announce(vec![ClipFormat::Uris], desk.now))
+        .expect("A is a machine");
+    let seq = seq.expect("something was offered");
+    assert_eq!(seq.device, dev(A));
+    assert_eq!(outputs.len(), 1, "one peer, one announcement: {outputs:?}");
+    for output in outputs {
+        match output {
+            Output::Send { to, msg } => desk.wire.push_back((dev(A), to, msg)),
+            other => panic!("a drag offer only announces: {other:?}"),
+        }
+    }
+    desk.settle();
+    assert_eq!(desk.held(SERVER), seq);
+    assert_eq!(desk.held(B), seq, "the hub passed it on");
+
+    // A paste on B asks A to read the offer, exactly as for a copy.
+    desk.contents
+        .push((dev(A), ClipFormat::Uris, b"manifest".to_vec()));
+    assert_eq!(desk.paste(B, ClipFormat::Uris), Ok(b"manifest".to_vec()));
+}
+
+#[test]
+fn announcing_nothing_shareable_offers_nothing() {
+    let mut exchange = Exchange::new(dev(A), vec![ClipFormat::Text], LIMIT);
+    exchange.handle(Input::PeerUp(dev(SERVER)), Instant::now());
+    let (seq, outputs) = exchange.announce(vec![ClipFormat::Uris], Instant::now());
+    assert_eq!(seq, None);
+    assert!(outputs.is_empty());
+    assert_eq!(exchange.local_offer(), None);
+}

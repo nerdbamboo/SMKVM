@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use smkvm_clipboard::{CatchDrag, Drive};
 use smkvm_config::status::{Machine, MachineState, PlacedMonitor, Status};
 use smkvm_config::{paths, Config};
 use smkvm_core::{
@@ -25,7 +26,7 @@ use smkvm_net::identity::Identity;
 use smkvm_net::link::{Link, LinkReader, LinkWriter};
 use smkvm_net::session::Session;
 use smkvm_net::trust::Trust;
-use smkvm_proto::{Bulk, ClientControl, Role, ServerControl};
+use smkvm_proto::{Bulk, ClientControl, ClipSeq, MouseButton, Role, ServerControl};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, error::TrySendError, Sender};
 use tokio::task::JoinHandle;
@@ -191,6 +192,8 @@ struct Daemon {
     injector: Box<dyn platform::InjectAndReport>,
     capture: platform::CaptureHandle,
     sharing: Sharing,
+    /// Picks up what is being dragged as the cursor leaves this machine.
+    catcher: Option<Box<dyn CatchDrag>>,
     from_clients: Sender<FromClient>,
     heartbeat: Duration,
     status_path: PathBuf,
@@ -254,6 +257,14 @@ pub async fn run(
         },
     );
 
+    let catcher = match platform::drop_catcher() {
+        Ok(catcher) => Some(catcher),
+        Err(e) => {
+            warn!("files cannot be dragged off this machine: {e:#}");
+            None
+        }
+    };
+
     let heartbeat = Duration::from_millis(u64::from(config.network.heartbeat_ms.max(500)));
     let mut daemon = Daemon {
         me: identity.id(),
@@ -267,6 +278,7 @@ pub async fn run(
         injector,
         capture,
         sharing,
+        catcher,
         from_clients: from_clients_tx,
         heartbeat,
         status_path: paths::status_file(),
@@ -374,6 +386,11 @@ impl Daemon {
             Action::Local(LocalAction::SetPointerMode(mode)) => {
                 let captured = mode == PointerMode::Captured;
                 self.capture.set_swallow(captured);
+                // Before the pointer is parked: the drag, if there is one, is
+                // still under it.
+                if captured {
+                    self.pick_up_drag();
+                }
                 let result = if captured {
                     self.injector.hide_cursor()
                 } else {
@@ -422,6 +439,74 @@ impl Daemon {
         }
         for event in queue {
             self.handle(event);
+        }
+        self.settle_drops();
+    }
+
+    /// The cursor is leaving this machine. If the button is held, something
+    /// may be being dragged; find out, and if so offer it and tell the
+    /// machine the cursor is going to.
+    fn pick_up_drag(&mut self) {
+        if !self.sharing.files_enabled() || !self.server.held_buttons().contains(&MouseButton::Left)
+        {
+            return;
+        }
+        let Some(catcher) = self.catcher.as_mut() else {
+            return;
+        };
+        let injector = &mut self.injector;
+        let paths = catcher.catch(&mut |drive| match drive {
+            Drive::MoveTo(x, y) => {
+                let _ = injector.move_to(x, y);
+                let _ = injector.flush();
+            }
+            Drive::ReleaseLeft => {
+                let _ = injector.button(MouseButton::Left, false);
+                let _ = injector.flush();
+            }
+        });
+        let Some(paths) = paths else {
+            return;
+        };
+        let (seq, sends) = self.sharing.drag_started(paths, Instant::now());
+        self.send_bulk(sends);
+        if let Some(seq) = seq {
+            self.dragging(seq);
+        }
+    }
+
+    /// The offer `seq` is what the cursor is carrying. It goes to whichever
+    /// machine has the cursor -- which may be this one.
+    fn dragging(&mut self, seq: ClipSeq) {
+        let active = self.server.active();
+        if active == self.me {
+            let sends = self.sharing.drop_here(seq, Instant::now());
+            self.send_bulk(sends);
+        } else {
+            self.send_bulk(vec![(active, Bulk::Dragging { seq })]);
+        }
+    }
+
+    /// Files that have just landed from a drop: drop them where the pointer
+    /// is if the button is still held and the platform can, and say where
+    /// they are either way.
+    fn settle_drops(&mut self) {
+        let Some(paths) = self.sharing.take_landed() else {
+            return;
+        };
+        let still_dragging = self.server.active() == self.me
+            && self.server.held_buttons().contains(&MouseButton::Left);
+        if still_dragging && platform::native_drop(paths.clone()) {
+            info!(
+                files = paths.len(),
+                "dropping the files where the pointer is"
+            );
+        } else {
+            info!(
+                files = paths.len(),
+                first = %paths.first().map(|p| p.display().to_string()).unwrap_or_default(),
+                "the dragged files have landed and are on the clipboard; paste to place them"
+            );
         }
     }
 
@@ -519,9 +604,22 @@ impl Daemon {
                 self.handle(Event::ClientMonitors { device, monitors })
             }
             ClientControl::Suspended { reason } => {
+                let name = self.attached.get(&device).map(|c| c.name.clone());
+                warn!(
+                    machine = %name.unwrap_or_default(),
+                    ?reason,
+                    "machine cannot take input for the moment; the cursor comes home"
+                );
                 self.handle(Event::ClientSuspended { device, reason })
             }
-            ClientControl::Resumed => self.handle(Event::ClientResumed { device }),
+            ClientControl::Resumed => {
+                let name = self.attached.get(&device).map(|c| c.name.clone());
+                info!(machine = %name.unwrap_or_default(), "machine can take input again");
+                self.handle(Event::ClientResumed { device })
+            }
+            // A drag notice names no machine; the one with the cursor is the
+            // one it is for, and only the server knows which that is.
+            ClientControl::Bulk(Bulk::Dragging { seq }) => self.dragging(seq),
             ClientControl::Bulk(bulk) => {
                 let sends = self.sharing.peer_said(device, bulk, Instant::now());
                 self.send_bulk(sends);

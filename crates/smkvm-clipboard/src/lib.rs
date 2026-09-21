@@ -95,3 +95,32 @@ pub trait Write {
 pub trait Fetch: Send {
     fn fetch(&self, format: &ClipFormat) -> Result<Vec<u8>>;
 }
+
+/// Something a drag catcher needs done to the pointer while it works.
+///
+/// Catching a drag means standing a window under the pointer and letting the
+/// application doing the dragging notice it, which takes a movement, and then
+/// letting go of the button on that application's behalf. The catcher owns no
+/// way to move a pointer; the caller does, and drives it through this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drive {
+    /// Put the pointer here, in this machine's own coordinates.
+    MoveTo(i32, i32),
+    /// Let go of the left button.
+    ReleaseLeft,
+}
+
+/// Picks up the files of a drag in progress, as the cursor leaves.
+///
+/// An application dragging files tells only the window under the pointer
+/// what it carries. So the moment the cursor leaves this screen with the
+/// button held, a window of this program's is put under the pointer, the
+/// pointer nudged so the application notices it, and the button released so
+/// the drag ends there -- with the file list in hand and nothing moved or
+/// copied on this machine. If nothing was being dragged, no window is told
+/// anything and the button is left alone.
+pub trait CatchDrag: Send {
+    /// Returns the files being dragged, or `None` if no drag was in progress
+    /// or it could not be read in time. Blocks for a fraction of a second.
+    fn catch(&mut self, drive: &mut dyn FnMut(Drive)) -> Option<Vec<std::path::PathBuf>>;
+}

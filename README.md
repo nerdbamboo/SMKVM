@@ -28,10 +28,12 @@ past which sharing silently stopped.
   available; contents are fetched only when something pastes, one chunk at a
   time, so a screenshot that is never pasted costs one small message and
   there is no size at which sharing quietly fails.
-- **Files go the same way.** Copy files in Explorer or Nautilus, paste them
-  on another machine, and they land in `~/Downloads/SMKVM` there -- fetched
-  only when pasted, through the same link, with a limit on how much one paste
-  may pull. Dragging between screens is not there yet.
+- **Files go the same way, and by dragging.** Copy files in Explorer or
+  Nautilus and paste them on another machine, or drag them off the edge of one
+  screen and let go on another: either way they land in `~/Downloads/SMKVM`
+  there, fetched through the same link, with a limit on how much one transfer
+  may pull. On Windows a drop also lands where the pointer is; everywhere, the
+  landed files are on the clipboard, so a paste places them.
 - **It says what it is doing.** A status file, a `smkvm status` command and
   the window all show which machines are connected, where their screens are,
   and which one has the cursor. The configuration is picked up when it changes,

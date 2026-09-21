@@ -36,6 +36,7 @@ use crate::{Inject, InputError, Monitors, Parked, Result};
 
 pub mod capture;
 pub mod desktop;
+pub mod privilege;
 
 /// Stamped on every event this process injects.
 ///
@@ -485,6 +486,32 @@ fn stable_id(adapter: &[u16; 32]) -> Option<String> {
         return None;
     }
     Some(id.to_string())
+}
+
+/// Would an injection land right now?
+///
+/// Asked by sending a mouse movement of nothing at all -- carrying this
+/// program's marker, so the capture hook lets it through -- and seeing whether
+/// the system takes it. It is refused in exactly the situations that refuse
+/// everything else: a window of higher privilege in front, or the input
+/// desktop being one this process is not on. Nothing moves either way.
+pub fn can_inject() -> bool {
+    let probe = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dwExtraInfo: INJECTED_MARKER,
+            },
+        },
+    };
+    // SAFETY: the slice is valid for the call and the size matches the
+    // struct the API expects.
+    unsafe { SendInput(&[probe], std::mem::size_of::<INPUT>() as i32) == 1 }
 }
 
 /// Where the pointer is now, in desktop coordinates.

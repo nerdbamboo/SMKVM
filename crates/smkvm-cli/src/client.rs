@@ -4,15 +4,16 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use smkvm_clipboard::{CatchDrag, Drive};
 use smkvm_config::status::{Machine, MachineState, Status};
 use smkvm_config::{paths, Config};
 use smkvm_core::{Client, ClientAction};
-use smkvm_input::Monitors;
+use smkvm_input::{Inject, Monitors};
 use smkvm_net::identity::Identity;
 use smkvm_net::link::{Link, LinkReader};
 use smkvm_net::session::Session;
 use smkvm_net::trust::Peer;
-use smkvm_proto::{ClientControl, Role, ServerControl};
+use smkvm_proto::{Bulk, ClientControl, MouseButton, Role, ServerControl};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -21,6 +22,15 @@ use crate::{hello, platform};
 
 /// How many heartbeats the server may miss before the link is given up on.
 const MISSED_HEARTBEATS: u32 = 3;
+
+/// How often to look, while the cursor is here, at whether input can still
+/// reach the screen; and, while it cannot, at whether it can again.
+///
+/// The secure desktop refuses nothing -- input to it goes nowhere -- so the
+/// only way to know is to look. Twice a second is quick enough that a UAC
+/// prompt hands the cursor back before the person has reached for the mouse
+/// on the other machine, and cheap enough not to matter.
+const LOOK_FOR_BLOCKAGE: Duration = Duration::from_millis(500);
 
 /// Connect, stay connected, and reconnect when the link goes.
 pub async fn run(identity: Identity, peer: Peer, address: String, config: Config) -> Result<()> {
@@ -104,6 +114,13 @@ async fn session(
         .send(&ClientControl::Monitors { monitors })
         .await
         .context("reporting displays")?;
+    let mut catcher = match platform::drop_catcher() {
+        Ok(catcher) => Some(catcher),
+        Err(e) => {
+            warn!("files cannot be dragged off this machine: {e:#}");
+            None
+        }
+    };
 
     let (incoming_tx, mut incoming) = mpsc::channel::<ServerControl>(256);
     let reading = tokio::spawn(read_loop(reader, incoming_tx));
@@ -114,6 +131,8 @@ async fn session(
 
     let mut refresh = tokio::time::interval(Status::REFRESH_EVERY);
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut look = tokio::time::interval(LOOK_FOR_BLOCKAGE);
+    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let silence = heartbeat * MISSED_HEARTBEATS;
     let mut had_cursor = client.is_active();
     write_status(
@@ -136,8 +155,21 @@ async fn session(
             },
             happened = sharing.next() => Step::Clipboard(happened),
             _ = refresh.tick() => Step::Refresh,
+            _ = look.tick() => Step::Look,
         };
+        // The cursor leaving with the button held may be a drag. Looked into
+        // before the leave is acted on, since acting on it lets go of the
+        // button and parks the pointer, and the drag is under the pointer.
+        if matches!(step, Step::Message(ServerControl::Leave)) {
+            if let Err(e) = pick_up_drag(&mut client, catcher.as_mut(), sharing, &mut writer).await
+            {
+                break Err(e);
+            }
+        }
         let outcome: Result<()> = match step {
+            Step::Message(ServerControl::Bulk(Bulk::Dragging { seq })) => {
+                send_all(&mut writer, sharing.drop_here(seq, Instant::now())).await
+            }
             Step::Message(ServerControl::Bulk(bulk)) => {
                 send_all(
                     &mut writer,
@@ -173,9 +205,30 @@ async fn session(
                 );
                 Ok(())
             }
+            Step::Look => {
+                let mut outcome = Ok(());
+                for reply in look_at_blockage(&mut client, None) {
+                    if let Err(e) = writer.send(&reply).await {
+                        outcome = Err(e.into());
+                        break;
+                    }
+                }
+                outcome
+            }
         };
         if let Err(e) = outcome {
             break Err(e);
+        }
+        settle_drops(&client, sharing);
+        // An injection the platform refused is the one fault that is invisible
+        // from every other angle: the pointer just stops. It is looked into at
+        // once rather than waiting for the next look.
+        if let Some(refusal) = client.take_refusal() {
+            for reply in look_at_blockage(&mut client, Some(refusal)) {
+                if writer.send(&reply).await.is_err() {
+                    break;
+                }
+            }
         }
         if client.is_active() != had_cursor {
             had_cursor = client.is_active();
@@ -206,6 +259,114 @@ enum Step {
     Message(ServerControl),
     Clipboard(crate::clipboard::Happened),
     Refresh,
+    Look,
+}
+
+/// The cursor is leaving. If the button is held, find out whether something
+/// is being dragged, and if so offer it and say so.
+async fn pick_up_drag<I: Inject>(
+    client: &mut Client<I>,
+    catcher: Option<&mut Box<dyn CatchDrag>>,
+    sharing: &mut Sharing,
+    writer: &mut smkvm_net::link::LinkWriter,
+) -> Result<()> {
+    if !sharing.files_enabled() || !client.input().held_buttons().contains(&MouseButton::Left) {
+        return Ok(());
+    }
+    let Some(catcher) = catcher else {
+        return Ok(());
+    };
+    let input = client.input_mut();
+    let paths = catcher.catch(&mut |drive| match drive {
+        Drive::MoveTo(x, y) => {
+            let _ = input.move_to(x, y);
+            let _ = input.flush();
+        }
+        Drive::ReleaseLeft => {
+            let _ = input.button(MouseButton::Left, false);
+            let _ = input.flush();
+        }
+    });
+    let Some(paths) = paths else {
+        return Ok(());
+    };
+    let (seq, sends) = sharing.drag_started(paths, Instant::now());
+    send_all(writer, sends).await?;
+    if let Some(seq) = seq {
+        writer
+            .send(&ClientControl::Bulk(Bulk::Dragging { seq }))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Files that have just landed from a drop: drop them where the pointer is
+/// if the button is still held and the platform can, and say where they are
+/// either way.
+fn settle_drops<I: Inject>(client: &Client<I>, sharing: &mut Sharing) {
+    let Some(paths) = sharing.take_landed() else {
+        return;
+    };
+    let still_dragging =
+        client.is_active() && client.input().held_buttons().contains(&MouseButton::Left);
+    if still_dragging && platform::native_drop(paths.clone()) {
+        info!(
+            files = paths.len(),
+            "dropping the files where the pointer is"
+        );
+    } else {
+        info!(
+            files = paths.len(),
+            first = %paths.first().map(|p| p.display().to_string()).unwrap_or_default(),
+            "the dragged files have landed and are on the clipboard; paste to place them"
+        );
+    }
+}
+
+/// Is input reaching the screen? Suspend when it is not, and say what is in
+/// the way; resume once it is again.
+///
+/// `refusal` is an injection the platform just turned down, which is looked
+/// into whether or not the cursor is here. Without one, only a machine that
+/// has the cursor is worth checking -- and only a suspended one worth
+/// probing, since the probe is itself an injection.
+fn look_at_blockage<I: smkvm_input::Inject>(
+    client: &mut smkvm_core::Client<I>,
+    refusal: Option<smkvm_input::InputError>,
+) -> Vec<ClientControl> {
+    if client.is_suspended() {
+        if platform::injection_possible() {
+            info!("input reaches the screen again; taking the cursor back");
+            return client
+                .resume()
+                .into_iter()
+                .map(|ClientAction::Send(msg)| msg)
+                .collect();
+        }
+        return Vec::new();
+    }
+    if refusal.is_none() && !client.is_active() {
+        return Vec::new();
+    }
+    match platform::injection_blocked() {
+        Some((reason, why)) => {
+            warn!(
+                ?reason,
+                "input is not reaching the screen, so the cursor is handed back to the server: {why}"
+            );
+            client
+                .suspend(reason)
+                .into_iter()
+                .map(|ClientAction::Send(msg)| msg)
+                .collect()
+        }
+        None => {
+            if let Some(e) = refusal {
+                warn!("an injection was refused, and nothing in front explains it: {e}");
+            }
+            Vec::new()
+        }
+    }
 }
 
 async fn send_all(

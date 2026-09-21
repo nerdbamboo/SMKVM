@@ -19,7 +19,7 @@ use smkvm_layout::{DeviceId, Monitor, Point};
 use crate::keys::{Key, MouseButton, Scroll};
 
 /// Wire format version. Bumped whenever a change would confuse an older peer.
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
 
 /// Which side of the session a peer is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +75,10 @@ pub enum SuspendReason {
     /// The display went to sleep.
     DisplayAsleep,
     Other,
+    /// The window in front runs with higher privileges than the client, and
+    /// Windows refuses input injected from below. Nothing sent lands until
+    /// the foreground changes, or the client is run elevated.
+    Elevated,
 }
 
 /// Messages a client sends.
@@ -329,5 +333,13 @@ pub enum Bulk {
     FileAbort {
         id: TransferId,
         reason: String,
+    },
+
+    /// The offer `seq` is what the cursor is carrying: it was picked up from
+    /// a drag in progress on the machine the cursor just left. Sent by that
+    /// machine after the offer itself, and passed by the server to whichever
+    /// machine the cursor arrived on, which pulls the files and drops them.
+    Dragging {
+        seq: ClipSeq,
     },
 }

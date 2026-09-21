@@ -41,9 +41,29 @@ Written and tested without hardware, **not yet run on real machines**
 - `smkvm init`, `smkvm run`, `smkvm status`; a second daemon refuses to start
   beside a live report; the log rolls over at 4 MiB.
 
-Not started: file transfer. It reuses the clipboard's announce-then-fetch
-machinery, which now exists; `Bulk::File*` is defined on the wire and
-ignored on receipt.
+Written and tested without hardware since the last run on the real machines
+(everything from `feat/drag-drop` onwards):
+
+- **Dragging files between screens.** The cursor leaving with the button
+  held is looked into: a window of ours is stood under the pointer, the
+  pointer nudged so the dragging application notices it, the file list read
+  from what it offers, and the button released on its behalf so its drag
+  ends there with nothing moved. On Windows that is an OLE drop target
+  (`smkvm-clipboard::platform::windows_drag`); on X11 an XDND target
+  (`DndCatcher` in `platform/x11.rs`, with an Xvfb test that plays the
+  dragging application). The files are then offered exactly as a copy would
+  be, with the manifest kept by the offerer since nothing put it on a
+  clipboard, and a `Bulk::Dragging` notice goes through the server to the
+  machine the cursor arrived on, which pulls the files at once into
+  `transfer.directory`, puts their list on its clipboard, and on Windows
+  starts a native drag (`DoDragDrop` with a shell data object) so letting
+  go drops them where the pointer is. `PROTO_VERSION` is 3.
+- **A refused injection is reported and acted on.** When Windows will not
+  take injected input -- a window running as administrator in front, or the
+  secure desktop -- the client now notices (every refusal, and a look twice
+  a second), says which program is in the way and what to do, and suspends
+  so the server takes the cursor home; it resumes the moment a probe
+  injection lands again. `SuspendReason::Elevated` names the case.
 
 ## Running on Windows
 
@@ -85,10 +105,26 @@ both directions including images, and files pasted both ways. Each fault
 found there was pinned with a test that failed first; the commit messages
 say what each one was. What remains:
 
-- **Files move by copy and paste only.** Dragging a file to another screen
-  does nothing yet. The pull-on-paste machinery is what a drop would use
-  too; what is missing is the OLE drop target and the XDND side, which is
-  the riskiest piece in the plan and was left for last on purpose.
+- **Dragging has not run on the real machines.** What to watch, in the log
+  on the machine the drag left: `files picked up from a drag` means the
+  catcher worked; nothing at all after `the cursor left` with the button
+  held means the dragging application never noticed our window (on
+  Windows, look at whether `DragEnter` needs the window activated; on X11,
+  whether the toolkit sends `XdndEnter` on an XTEST motion). On the machine
+  it arrived on: `the cursor arrived carrying files; fetching them` then
+  `the files have all arrived`, then either `dropping the files where the
+  pointer is` or `...are on the clipboard; paste to place them`. Two
+  things known to be imperfect: the destination presses the button on
+  arrival before it knows a drag is coming, so the window under the pointer
+  may begin a selection of its own until `DoDragDrop` takes the capture; and
+  an X11 destination makes no native drop -- the files land and are on the
+  clipboard, and that is all.
+- **An elevated window in front stops the client, by design of Windows.**
+  UIPI refuses injected input to a process of higher integrity, so a
+  PowerShell run as administrator on a client freezes the pointer there
+  until the foreground changes. The client now says so and hands the cursor
+  back; the cure is to run the client's scheduled task with "run with
+  highest privileges" so it outranks everything it has to type into.
 - **A paste of files blocks the pasting application until they arrive.**
   Explorer or Nautilus asks for the list and gets it only once every file
   is on disk, so a large paste looks hung for the duration. `transfer.max_bytes`
@@ -151,6 +187,12 @@ decides which queue a message goes to and so what happens when a machine falls
 behind, and `smkvm-proto/tests/dropping.rs` matches every variant exhaustively
 so a new one does not compile until somebody has decided. Only pointer motion
 and wheel notches may be lost.
+
+**A refused injection is silent.** `SendInput` returns zero and Windows says
+nothing more; the client used to discard the error, so a pointer stopped by
+an administrator window in front looked identical to every other stopped
+pointer. Every refusal is now noticed and explained in the log. If a pointer
+stops on a Windows client and the log says nothing, look there first.
 
 **Two daemons on one machine.** Before the guard in `smkvm serve`/`connect`,
 starting a second `smkvm connect` left the first attached and forgotten,
