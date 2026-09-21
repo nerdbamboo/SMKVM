@@ -76,6 +76,16 @@ smkvm run
 `smkvm status` は何がつながっていて何がどこにあるかを教える。
 `smkvm --help` が残りを並べる。
 
+ログインするたびに自動で始まるようにするには、各機械で:
+
+```
+smkvm service install
+```
+
+Windows では管理者プロンプトから実行する。登録されるタスクはデスクトップ
+セッションの中で最高の権限で動き、それによって管理者として動いているウィンドウ
+にも入力できる。`smkvm service start|stop|status` は名前どおりに働く。
+
 ## 置き場所
 
 | | Linux | Windows |

@@ -5,6 +5,7 @@ mod clipboard;
 mod hello;
 mod platform;
 mod server;
+mod service;
 mod transfer;
 
 // Where things live is the daemon's agreement with anything else that reads
@@ -101,6 +102,11 @@ enum Command {
     },
     /// Say what the running daemon is connected to, and where things are.
     Status,
+    /// Start at login, and be started and stopped by hand.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// List the machines this one has been paired with.
     Devices,
     /// Forget a machine.
@@ -121,6 +127,31 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Register `smkvm run` to start when you log in: on Windows a scheduled
+    /// task in the desktop session with highest privileges, on Linux a login
+    /// item. Run from an administrator prompt on Windows.
+    Install {
+        /// Windows: the account whose login starts it, when that is not the
+        /// account registering it (as `DOMAIN\name` or `name`).
+        #[arg(long)]
+        user: Option<String>,
+        /// Windows: register without highest privileges. Windows will then
+        /// refuse input into any window running as administrator.
+        #[arg(long)]
+        limited: bool,
+    },
+    /// Stop starting at login, and stop now.
+    Uninstall,
+    /// Start now, the way a login would.
+    Start,
+    /// Stop now. On a server this gives the keyboard and mouse back.
+    Stop,
+    /// Say whether it is set to start at login, and whether it is running.
+    Status,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     start_logging(cli.verbose, cli.log_file.clone())?;
@@ -135,6 +166,13 @@ fn main() -> Result<()> {
         } => init(cli.config, role, server, listen, name, force),
         Command::Monitors => monitors(),
         Command::Status => status(cli.config),
+        Command::Service { action } => match action {
+            ServiceAction::Install { user, limited } => service::install(user, limited),
+            ServiceAction::Uninstall => service::uninstall(),
+            ServiceAction::Start => service::start(),
+            ServiceAction::Stop => service::stop(),
+            ServiceAction::Status => service::status(),
+        },
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -270,6 +308,7 @@ fn init(
         Role::Client => println!("  2. Run `smkvm run` here once the server is running."),
     }
     println!("  3. Open smkvm-gui to arrange the screens; the daemon picks up the change at once.");
+    println!("  4. `smkvm service install` makes it start at login (from an administrator prompt on Windows).");
     Ok(())
 }
 

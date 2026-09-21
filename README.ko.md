@@ -76,6 +76,16 @@ smkvm run
 `smkvm status`는 무엇이 연결돼 있고 어디에 있는지 알려 준다.
 `smkvm --help`가 나머지를 보여 준다.
 
+로그인할 때마다 자동으로 시작하게 하려면, 각 기계에서:
+
+```
+smkvm service install
+```
+
+Windows에서는 관리자 프롬프트에서 실행한다. 등록되는 예약 작업은 데스크톱
+세션 안에서 최고 권한으로 실행되며, 그래야 관리자 권한으로 실행 중인 창에도
+입력할 수 있다. `smkvm service start|stop|status`는 이름 그대로 동작한다.
+
 ## 어디에 무엇이 있나
 
 | | Linux | Windows |

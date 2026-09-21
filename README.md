@@ -76,6 +76,17 @@ on your desk. The daemon picks the change up within a couple of seconds.
 `smkvm status` says what is connected and where things are. `smkvm --help`
 lists the rest.
 
+To have it start whenever you log in, on each machine:
+
+```
+smkvm service install
+```
+
+On Windows run that from an administrator prompt: the task it registers runs
+in your desktop session with highest privileges, which is what lets it type
+into windows that run as administrator. `smkvm service start|stop|status` do
+what they say.
+
 ## Where things live
 
 | | Linux | Windows |

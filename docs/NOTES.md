@@ -64,6 +64,14 @@ Written and tested without hardware since the last run on the real machines
   a second), says which program is in the way and what to do, and suspends
   so the server takes the cursor home; it resumes the moment a probe
   injection lands again. `SuspendReason::Elevated` names the case.
+- **`smkvm service install|uninstall|start|stop|status`.** Windows: a
+  scheduled task named `SMKVM` in the desktop session, "run with highest
+  privileges", `smkvm run` at logon, restarted on failure; registering it
+  needs an administrator prompt, and `--user` names the account sitting at
+  the desk when it is not the one registering. Linux: a login item in
+  `~/.config/autostart/`, since a systemd user service does not reliably see
+  the display. `stop` on a server ends the hooks and gives the keyboard
+  back, so it is the recovery command too.
 
 ## Running on Windows
 
