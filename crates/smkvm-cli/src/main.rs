@@ -48,6 +48,10 @@ struct Cli {
     /// Write the log here instead of to the terminal.
     #[arg(long, global = true, value_name = "FILE")]
     log_file: Option<PathBuf>,
+    /// Started at login by `smkvm service`, with nobody at a terminal: log
+    /// to the usual file even if there seems to be a console.
+    #[arg(long, global = true, hide = true)]
+    unattended: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -154,7 +158,7 @@ enum ServiceAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    start_logging(cli.verbose, cli.log_file.clone())?;
+    start_logging(cli.verbose, cli.log_file.clone(), cli.unattended)?;
 
     let result = match cli.command {
         Command::Init {
@@ -201,7 +205,12 @@ fn main() -> Result<()> {
 /// by a scheduled task, a service, anything without a console -- there is
 /// nowhere for it to go, so it goes to a file instead. A program that logs
 /// into the void is one that cannot be diagnosed at all.
-fn start_logging(verbose: bool, explicit: Option<PathBuf>) -> Result<()> {
+///
+/// The login task says `--unattended` rather than being left to guess: a
+/// scheduled task on Windows gets a console of its own, headless or not,
+/// and stderr looks like a terminal from inside it. Two deployments went
+/// undiagnosable that way, their logs written to a console nobody could see.
+fn start_logging(verbose: bool, explicit: Option<PathBuf>, unattended: bool) -> Result<()> {
     use std::io::IsTerminal as _;
 
     let filter = tracing_subscriber::EnvFilter::try_from_env("SMKVM_LOG").unwrap_or_else(|_| {
@@ -213,7 +222,7 @@ fn start_logging(verbose: bool, explicit: Option<PathBuf>) -> Result<()> {
 
     let path = match explicit {
         Some(path) => Some(path),
-        None if std::io::stderr().is_terminal() => None,
+        None if !unattended && std::io::stderr().is_terminal() => None,
         None => Some(paths::log_file()),
     };
     match path {
@@ -545,7 +554,7 @@ fn ensure_not_running() -> Result<()> {
 /// A process id is reused eventually, so "alive" may name some other program
 /// -- which then costs one refusal until the report ages out, exactly as
 /// before. "Gone" is the answer that matters, and is not mistaken.
-fn process_alive(pid: u32) -> Option<bool> {
+pub(crate) fn process_alive(pid: u32) -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
         Some(std::path::Path::new(&format!("/proc/{pid}")).exists())
@@ -673,6 +682,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<()> {
         bail!("no machines are paired yet, so none could connect. Run `smkvm pair` first.");
     }
     info!(name = %config.identity.name, id = %identity.id().short(), "starting as the server");
+    platform::report_rank();
     let layout = Layout::new(config.behavior.edge_overflow);
     server::run(identity, trust, config, path, layout).await
 }
@@ -692,6 +702,7 @@ async fn connect(config_path: Option<PathBuf>, host: Option<String>) -> Result<(
     // handshake is encrypted to that machine's key.
     let peer = client::choose_server(&trust, &config)?;
     info!(server = %peer.name, %address, "connecting");
+    platform::report_rank();
     client::run(identity, peer, address, config).await
 }
 

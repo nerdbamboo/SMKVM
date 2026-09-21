@@ -98,6 +98,36 @@ pub fn injection_blocked() -> Option<(smkvm_proto::SuspendReason, String)> {
     }
 }
 
+/// Say, once at startup, how far this machine's input reaches.
+///
+/// The limit it reports is invisible in every other way. A daemon at an
+/// ordinary integrity level works perfectly until an administrator's window
+/// is in front, and then `SendInput` returns zero, the capture hook stops
+/// being called, and Windows says nothing at all -- which is a pointer that
+/// has frozen for no stated reason. Reading it in the log on the day it is
+/// installed beats discovering it the first time a PowerShell is clicked.
+pub fn report_rank() {
+    #[cfg(windows)]
+    {
+        use smkvm_input::platform::windows::privilege;
+        match privilege::our_level() {
+            // High or above: nothing in the session outranks this.
+            Some(rid) if rid >= 0x3000 => tracing::info!(
+                level = privilege::describe_level(rid),
+                "running high enough for every window, including ones run as administrator"
+            ),
+            Some(rid) => tracing::warn!(
+                level = privilege::describe_level(rid),
+                "windows that run as administrator will not take input from here, and what is \
+                 typed into them will not be captured -- Windows refuses both and says nothing. \
+                 `smkvm service install` from an administrator prompt registers a login task \
+                 that outranks them"
+            ),
+            None => {}
+        }
+    }
+}
+
 /// Would injected input land now? The other half of [`injection_blocked`],
 /// asked while suspended to know when to take the cursor again.
 pub fn injection_possible() -> bool {

@@ -84,8 +84,14 @@ smkvm service install
 
 On Windows run that from an administrator prompt: the task it registers runs
 in your desktop session with highest privileges, which is what lets it type
-into windows that run as administrator. `smkvm service start|stop|status` do
-what they say.
+into windows that run as administrator, and it starts without a console
+window. `--user` names the account that sits at the desk when it is not the
+one registering. `smkvm service start|stop|status` do what they say.
+
+The log's first lines say whether input from this machine will reach every
+window. On Windows, one that is not elevated works everywhere except a
+window running as administrator, where the system refuses silently, so it is
+worth reading once after installing.
 
 ## Where things live
 

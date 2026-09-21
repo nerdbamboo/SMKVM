@@ -27,12 +27,29 @@ use smkvm_config::status::Status;
 /// autostart entry is kept in on Linux.
 pub const NAME: &str = "SMKVM";
 
+/// The daemon running on this machine, by its own account -- and only if
+/// that process is still there. A report outlives the daemon that wrote it
+/// by up to its refresh interval, which is exactly the window in which
+/// someone stops a daemon and starts it again; trusting the report alone
+/// there refuses the restart that was asked for.
+fn running_pid() -> Option<u32> {
+    let pid = Status::current(&paths::status_file())?.pid?;
+    (crate::process_alive(pid) != Some(false)).then_some(pid)
+}
+
 /// The binary a registered start should run: this one, by its full path.
 fn this_binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("finding this program's own path")?;
     // Canonical, so a start registered from a relative path or a symlink
     // does not depend on where the shell happened to be.
-    Ok(exe.canonicalize().unwrap_or(exe))
+    let exe = exe.canonicalize().unwrap_or(exe);
+    // Windows canonicalizes to the verbatim form, `\\?\C:\...`, which the
+    // scheduler and the person reading the task both do without.
+    let shown = exe.to_string_lossy();
+    Ok(match shown.strip_prefix(r"\\?\") {
+        Some(plain) if plain.len() > 1 && plain.as_bytes()[1] == b':' => PathBuf::from(plain),
+        _ => exe,
+    })
 }
 
 /// Register a start at login. `user` is the account whose login starts it,
@@ -182,23 +199,118 @@ mod windows {
         format!("'{}'", s.replace('\'', "''"))
     }
 
-    pub fn install(exe: &std::path::Path, user: Option<String>, limited: bool) -> Result<()> {
-        let user = match user {
-            Some(user) => quote(&user),
-            None => "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name".to_string(),
+    /// The task, as the scheduler's own XML, with `$sid` left for PowerShell
+    /// to fill in.
+    ///
+    /// Written out rather than built with the `New-ScheduledTask*` cmdlets
+    /// because those look the principal up by name, and on a machine whose
+    /// account is a cloud or domain one with no line to its directory the
+    /// lookup fails (0x80070534) although the account logs in every day. The
+    /// XML names the principal by SID, and registering it that way is
+    /// accepted with no lookup at all.
+    ///
+    /// The action runs through a headless console host, so no console window
+    /// appears at login. The one that did appear was closed by the person --
+    /// which is the daemon being killed -- because a window with nothing in
+    /// it looks like something to close.
+    pub(super) fn task_xml(exe: &std::path::Path, limited: bool) -> String {
+        let exe = exe
+            .to_string_lossy()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        let run_level = if limited {
+            "LeastPrivilege"
+        } else {
+            "HighestAvailable"
         };
-        let run_level = if limited { "Limited" } else { "Highest" };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Share one keyboard and mouse across several machines</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>$sid</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$sid</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>{run_level}</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>5</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless &quot;{exe}&quot; run --unattended</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+        )
+    }
+
+    pub fn install(exe: &std::path::Path, user: Option<String>, limited: bool) -> Result<()> {
+        let who = match user {
+            Some(user) => quote(&user),
+            None => "$null".to_string(),
+        };
+        // The SID: by lookup when the machine can do one, and from the profile
+        // list otherwise, which remembers every account that has logged in
+        // here whether or not its directory is reachable today.
         let script = format!(
             r#"$ErrorActionPreference = 'Stop'
-$user = {user}
-$action = New-ScheduledTaskAction -Execute {exe} -Argument 'run'
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel {run_level}
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName {name} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-"registered for $user"
+$who = {who}
+if ($who) {{
+  try {{
+    $sid = (New-Object System.Security.Principal.NTAccount($who)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+  }} catch {{
+    $short = ($who -split '\\')[-1]
+    $sid = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' |
+      Where-Object {{ (Split-Path -Leaf ([string]$_.GetValue('ProfileImagePath'))) -ieq $short }} |
+      ForEach-Object {{ $_.PSChildName }} | Select-Object -First 1
+    if (-not $sid) {{ throw "no account called $who has a profile on this machine" }}
+  }}
+}} else {{
+  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $who = $me.Name
+  $sid = $me.User.Value
+}}
+$xml = @"
+{xml}
+"@
+Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
+"registered for $who ($sid)"
 "#,
-            exe = quote(&exe.to_string_lossy()),
+            xml = task_xml(exe, limited),
             name = quote(NAME),
         );
         let said = powershell(&script).with_context(|| {
@@ -212,7 +324,8 @@ Register-ScheduledTask -TaskName {name} -Action $action -Trigger $trigger -Princ
             }
         })?;
         println!(
-            "{said}: {} will start `{} run` at login, in the desktop session{}.",
+            "{said}: {} will start `{} run` at login, in the desktop session and \
+             without a console window{}.",
             NAME,
             exe.display(),
             if limited {
@@ -236,6 +349,10 @@ Register-ScheduledTask -TaskName {name} -Action $action -Trigger $trigger -Princ
     }
 
     pub fn start() -> Result<()> {
+        if let Some(pid) = running_pid() {
+            println!("already running as pid {pid} (started by hand, not by the task).");
+            return Ok(());
+        }
         powershell(&format!("Start-ScheduledTask -TaskName {}", quote(NAME)))
             .context("starting the task; is it installed? `smkvm service install`")?;
         println!("started.");
@@ -245,12 +362,19 @@ Register-ScheduledTask -TaskName {name} -Action $action -Trigger $trigger -Princ
     pub fn stop() -> Result<()> {
         // Stopping the task ends the process, and with it the input hooks,
         // which is what gives the keyboard and mouse back on a server whose
-        // cursor was elsewhere.
+        // cursor was elsewhere. A daemon started by hand is not the task's
+        // to stop, so it is stopped by its pid.
         powershell(&format!(
             "Stop-ScheduledTask -TaskName {} -ErrorAction SilentlyContinue",
             quote(NAME)
         ))?;
-        println!("stopped.");
+        if let Some(pid) = running_pid() {
+            powershell(&format!("Stop-Process -Id {pid} -Force -ErrorAction Stop"))
+                .with_context(|| format!("stopping pid {pid}"))?;
+            println!("stopped pid {pid}.");
+        } else {
+            println!("stopped.");
+        }
         Ok(())
     }
 
@@ -270,10 +394,6 @@ mod linux {
     use super::*;
 
     /// The daemon's process id, from its report, when it is running.
-    fn running_pid() -> Option<u32> {
-        Status::current(&paths::status_file()).and_then(|s| s.pid)
-    }
-
     fn autostart_dir() -> PathBuf {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -293,7 +413,7 @@ mod linux {
              Type=Application\n\
              Name=SMKVM\n\
              Comment=Share one keyboard and mouse across several machines\n\
-             Exec={} run\n\
+             Exec={} run --unattended\n\
              Terminal=false\n\
              NoDisplay=true\n\
              X-GNOME-Autostart-enabled=true\n",
@@ -338,7 +458,7 @@ mod linux {
         // Detached: its own process group, no terminal, so it outlives this
         // shell and logs to the file rather than to a screen nobody watches.
         let child = std::process::Command::new(&exe)
-            .arg("run")
+            .args(["run", "--unattended"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -389,10 +509,33 @@ mod linux {
         fn the_entry_runs_this_binary_without_a_terminal() {
             let text = entry(std::path::Path::new("/opt/smkvm/smkvm"));
             assert!(text.starts_with("[Desktop Entry]\n"));
-            assert!(text.contains("Exec=/opt/smkvm/smkvm run\n"));
+            assert!(text.contains("Exec=/opt/smkvm/smkvm run --unattended\n"));
             assert!(text.contains("Terminal=false\n"));
             assert!(text.contains("NoDisplay=true\n"));
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod task_tests {
+    use super::windows::task_xml;
+
+    #[test]
+    fn the_task_runs_this_binary_headless_as_the_sid() {
+        let xml = task_xml(std::path::Path::new(r"C:\Tools & Co\smkvm.exe"), false);
+        assert!(xml.contains("<UserId>$sid</UserId>"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains(
+            r"<Arguments>--headless &quot;C:\Tools &amp; Co\smkvm.exe&quot; run --unattended</Arguments>"
+        ));
+        assert!(!xml.contains("\"@"));
+    }
+
+    #[test]
+    fn limited_gives_up_the_elevation() {
+        let xml = task_xml(std::path::Path::new(r"C:\smkvm\smkvm.exe"), true);
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
     }
 }
 

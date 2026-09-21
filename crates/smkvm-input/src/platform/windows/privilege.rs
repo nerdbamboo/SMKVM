@@ -99,6 +99,12 @@ fn name_of(process: HANDLE) -> Option<String> {
     Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string())
 }
 
+/// The integrity level this process runs at, as the RID.
+pub fn our_level() -> Option<u32> {
+    // SAFETY: our own process handle needs no closing.
+    integrity_of(unsafe { GetCurrentProcess() })
+}
+
 /// Does the window in front belong to a process that outranks this one?
 ///
 /// `None` when it does not, or when there is no foreground window, or when
@@ -116,8 +122,7 @@ pub fn foreground_outranks_us() -> Option<Outranked> {
     if pid == 0 {
         return None;
     }
-    // SAFETY: our own process handle needs no closing.
-    let ours = integrity_of(unsafe { GetCurrentProcess() })?;
+    let ours = our_level()?;
 
     // SAFETY: asking for a handle by id; closed below on every path.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;

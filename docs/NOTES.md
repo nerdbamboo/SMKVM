@@ -68,10 +68,30 @@ Written and tested without hardware since the last run on the real machines
   scheduled task named `SMKVM` in the desktop session, "run with highest
   privileges", `smkvm run` at logon, restarted on failure; registering it
   needs an administrator prompt, and `--user` names the account sitting at
-  the desk when it is not the one registering. Linux: a login item in
+  the desk when it is not the one registering. The principal is registered
+  by SID, looked up in the profile list when the name cannot be resolved (a
+  cloud or domain account with no line to its directory fails the name
+  lookup with 0x80070534 although it logs in fine). The action runs through
+  `conhost.exe --headless`, so nothing appears at logon: the console window
+  the first version put up got closed by the person, which killed the
+  daemon (the task's last result reads 0xC000013A). The action says `run
+  --unattended`: a task's process has a console, headless or not, and stderr
+  looks like a terminal from inside it, so without the flag the log went to
+  a console nobody could see while the file stopped at the last hand-started
+  run. Linux: a login item in
   `~/.config/autostart/`, since a systemd user service does not reliably see
-  the display. `stop` on a server ends the hooks and gives the keyboard
+  the display. `start` and `stop` go by the status report's pid only when
+  that process is still alive, so stopping and starting again within the
+  report's 15 s does not get refused; `stop` also ends a daemon that was
+  started by hand. `stop` on a server ends the hooks and gives the keyboard
   back, so it is the recovery command too.
+- **The daemon says at startup how far its input reaches.** On Windows a
+  daemon at an ordinary integrity level works everywhere except a window
+  running as administrator, where `SendInput` returns zero and the capture
+  hook stops being called, both without a word from the system. The first
+  lines of the log now say which of the two it is, so the limit is readable
+  on the day of installation rather than the first time a PowerShell is
+  clicked. `platform::report_rank` says it; `privilege::our_level` reads it.
 
 ## Running on Windows
 
@@ -201,6 +221,19 @@ nothing more; the client used to discard the error, so a pointer stopped by
 an administrator window in front looked identical to every other stopped
 pointer. Every refusal is now noticed and explained in the log. If a pointer
 stops on a Windows client and the log says nothing, look there first.
+
+**A scheduled task's process has a console even when nothing is on screen.**
+The daemon decided where to log by asking whether stderr was a terminal, and
+from inside a task it looked like one, so two deployments logged into a
+console nobody could see while their log files stopped at the last
+hand-started run. The task now says `--unattended`, which settles it rather
+than guessing.
+
+**The image of a program stays locked for a moment after it exits.** A deploy
+that stops the daemon and immediately moves the new binary over the old one
+fails, and `Move-Item` says so in a way that scrolls past; the task then
+restarts the *old* binary and everything looks deployed. Wait for the process
+to be gone and retry the move, and check the hash afterwards.
 
 **Two daemons on one machine.** Before the guard in `smkvm serve`/`connect`,
 starting a second `smkvm connect` left the first attached and forgotten,
