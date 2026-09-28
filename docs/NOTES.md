@@ -275,15 +275,19 @@ thing the rest of the program already knows what to do with.
 links it and clippy is clean for both targets; the workspace tests pass
 but they compile **none** of `secure/windows/`, so what they prove is the
 five pure modules (`acl`, `plan`, `reach`, `watch`, `wire`) and nothing
-else. In particular, unverified: whether a worker wearing a
+else. That is worth restating whenever the gate is quoted: a green run
+says the decisions are right and says nothing at all about the calls. In particular, unverified: whether a worker wearing a
 session-shifted SYSTEM token is in fact created on `WinSta0\Winlogon`;
 whether it can set hooks there, or only inject; whether
 `SetTokenInformation(TokenSessionId)` succeeds as written; whether the
 pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by `CreateNamedPipeW`; whether
 the overlapped waits behave as intended; whether the input-desktop poll
 sees the switch promptly enough to be useful; whether the service now
-stops when asked; and what the clipboard and the drag catcher do in a
-process that is not the one with the person's desktop.
+stops when asked; whether a failed start does produce the restart actions;
+whether the quarter-second desktop comparison is in fact quick enough that
+nothing is typed into the wrong desktop, as opposed to merely narrower
+than it was; and what the clipboard and the drag catcher do in a process
+that is not the one with the person's desktop.
 
 **Capture on the Winlogon desktop is the thing to test rather than reason
 about.** `worker.rs` already degrades when `Capture::start()` fails:
@@ -302,6 +306,14 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**What the first session on real hardware should look like.** In order:
+the service starts and logs `running as a service`; if nobody is logged in
+yet it says so once and waits, which is not a failure; a worker appears on
+`Default`; raising a consent prompt produces a second `a worker is on the
+input desktop` saying `Winlogon`, and between the two the client should
+log that it handed the cursor back because the worker had not moved yet.
+Then `smkvm service stop` and confirm it stops rather than timing out.
 
 **Getting out of it.** `smkvm service uninstall` removes whichever of the
 two is registered, and `smkvm service install` with no flag puts the
@@ -341,6 +353,34 @@ makes *Block* ones, which beat any Allow. The port looked open from inside and
 was unreachable from outside. Remove the automatic rules and add an explicit
 allow.
 
+**A service that exits zero was not a service that failed, as far as the
+manager is concerned.** The restart actions registered at install apply
+only to a service that terminates with a code, so a `service_main` that
+reports `NO_ERROR` and calls `exit(0)` whatever happened makes them inert
+-- and the case they exist for, stopped at three in the morning and
+staying stopped, is exactly the case not covered. It also makes `sc start`
+report success while the status says "stopped", with the reason only in
+the log. Failure now reports `ERROR_SERVICE_SPECIFIC_ERROR` and exits
+non-zero.
+
+**"Nobody is logged in yet" is a wait, not a failure of the desktop.** At
+boot the input desktop is `Winlogon` and there may be no console session
+for a moment. Counting that as a failed start exhausted the give-up
+counter within about a second and latched give-up on `Winlogon`, so the
+lock screen was unreachable until somebody had logged in once -- and the
+log said "a worker cannot be started on this desktop", which reads like a
+permission problem. The session is checked before anything else in the
+loop now, and says so once rather than four times a second.
+
+**A refusal believed for a flat interval turns a stuck worker into a
+flapping cursor.** Two seconds, expire, take the cursor back, refused
+again, two seconds: a pointer jumping between machines on a beat, with a
+warning, an informational line and two network messages each turn. The
+interval doubles per consecutive refusal to a ceiling, and resets on an
+injection that goes out after the window closes with nothing coming back
+about it -- which is as close to "an injection that was not refused" as is
+observable, since refusals arrive asynchronously.
+
 **A service that does not answer a stop is killed, and on a server that
 means the keyboard is not given back.** The daemon has always stopped on
 Ctrl+C, which a service never gets: the manager delivers a stop to a
@@ -351,6 +391,15 @@ one `stopping()` that replaced `ctrl_c()` everywhere the daemon waited on
 it. A `STOP_PENDING` report also has to carry `dwWaitHint` and a rising
 `dwCheckPoint`, or the manager has no reason to keep waiting and treats
 the service as hung.
+
+**A structure read back out of a `Vec<u8>` is unaligned, and that is
+undefined whatever the hardware tolerates.** `GetTokenInformation` and
+`QueryServiceConfigW` fill a caller's buffer with a structure full of
+pointers and expect it read back as that structure. A `Vec<u8>` is aligned
+to one byte; taking a reference to the structure inside one is undefined
+behaviour in Rust even where the processor would not care, and it will
+work in testing every time. `secure::windows::Aligned` backs the bytes
+with `u64` instead.
 
 **Keystrokes must never be logged.** Debug logging briefly recorded every key to
 a file on disk, which is how a password would leak. The key identity is not
@@ -382,6 +431,19 @@ left holding a drag that never ended. A round trip after the last thing said
 on a connection is what makes it stick -- `get_input_focus().reply()` is the
 cheap one. The same applies anywhere a connection is closed right after a
 send.
+
+**A worker that is attached is not the same as a worker that is in the
+right place.** The service polls the input desktop four times a second, so
+when a consent prompt appears the worker is still on `Default` for up to a
+quarter of a second after the input has moved to `Winlogon`. A reach that
+knows only "a worker is attached" says input is landing throughout that
+window -- and it is landing, on the wrong desktop. If somebody is typing an
+administrator's password toward the prompt, the opening characters go into
+whatever window is focused behind it. `reach` therefore holds both the
+worker's desktop and the last polled input desktop and reports no reach
+when they differ, and `mind_workers` tells it what it saw on every look
+rather than only when the worker moves. The comparison is free because the
+service is the system account, so its poll already succeeds.
 
 **Asking "can input reach the screen" from a service asks about the wrong
 screen.** `platform::injection_blocked` and `injection_possible` answer by
