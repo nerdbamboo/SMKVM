@@ -11,23 +11,34 @@
 //! service is glue in exactly the sense `client.rs` is: it owns the link
 //! and the state machine and nothing about where the cursor should be.
 //!
-//! What the arm does when there is no worker is the part worth stating. It
-//! reports `Unsupported`, which the client already treats as a refused
-//! injection: it looks at what is in the way, finds the secure desktop or
-//! nothing, and hands the cursor back to the server -- which is precisely
-//! the behaviour of the build before any of this existed. A worker that
-//! cannot be started therefore costs the reach it was going to add and
-//! nothing else.
+//! Two things this has to get right, both of which it got wrong first.
+//!
+//! **What happens when there is no worker.** The arm reports
+//! `Unsupported`, which is a refused injection as far as everything above
+//! is concerned. But a refusal alone does not suspend anything --
+//! `client.rs` suspends only when `platform::injection_blocked` also says
+//! *why* -- so the arm without a worker has to be matched by a probe that
+//! knows the same thing. That is [`Link::reach`], kept as
+//! `secure::reach::Reach` so the accounting is tested on any machine.
+//!
+//! **What happens when the worker stops reading.** A write to a pipe
+//! nobody is reading blocks once the buffer fills, and a write that blocks
+//! while holding the lock every injection needs freezes the daemon
+//! outright -- the exact opposite of handing the cursor back. Every write
+//! from here has a deadline, and a write that misses it means the worker
+//! is dead: the pipe is dropped, the reach says no worker, the cursor goes
+//! home, and `watch` starts another.
 
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smkvm_input::{Inject, InputError, Monitors};
 use smkvm_layout::Monitor;
 use smkvm_proto::{Key, MouseButton, Scroll};
 use tokio::sync::mpsc::Sender;
 
-use crate::secure::windows::pipe::Pipe;
+use crate::secure::reach::{Blocked, Reach};
+use crate::secure::windows::pipe::{Pipe, WRITE_WITHIN};
 use crate::secure::wire::{frame, FromWorker, ToWorker};
 
 /// How long to wait for a worker to say what displays the machine has.
@@ -54,6 +65,8 @@ pub struct Link {
     /// Whether the local keyboard and mouse are being swallowed, so that a
     /// worker starting on a new desktop is told before it hooks anything.
     swallow: Mutex<bool>,
+    /// Whether input is getting to a screen, and why not when it is not.
+    reach: Mutex<Reach>,
 }
 
 impl Link {
@@ -63,9 +76,15 @@ impl Link {
 
     /// A worker has connected. Anything the old one was told that still
     /// holds is told to this one.
+    ///
+    /// Called only after the worker's first frame has been read and
+    /// accepted. Attaching first and checking afterwards -- which is what
+    /// this did -- means an instruction has already been sent to a process
+    /// whose build has not been established.
     pub fn attach(&self, pipe: Pipe) {
         let swallowing = *self.swallow.lock().expect("not poisoned");
         *self.write.lock().expect("not poisoned") = Some(pipe);
+        self.reach.lock().expect("not poisoned").attached(true);
         self.say(&ToWorker::Swallow(swallowing));
     }
 
@@ -73,6 +92,7 @@ impl Link {
     pub fn detach(&self) {
         *self.write.lock().expect("not poisoned") = None;
         self.answers.lock().expect("not poisoned").monitors = None;
+        self.reach.lock().expect("not poisoned").attached(false);
     }
 
     /// Where captured input should go. Set once, by the server glue.
@@ -80,9 +100,25 @@ impl Link {
         *self.capture.lock().expect("not poisoned") = Some(events);
     }
 
+    /// Is input reaching a screen, and if not, why not?
+    pub fn blocked(&self) -> Option<Blocked> {
+        self.reach
+            .lock()
+            .expect("not poisoned")
+            .blocked(Instant::now())
+    }
+
+    /// Would an injection land right now? The other half of [`Link::blocked`],
+    /// asked while suspended to know when to take the cursor back.
+    pub fn possible(&self) -> bool {
+        self.reach
+            .lock()
+            .expect("not poisoned")
+            .possible(Instant::now())
+    }
+
     /// One instruction down the pipe. False when there is nobody to take it.
     pub fn say(&self, message: &ToWorker) -> bool {
-        use std::io::Write as _;
         let mut held = self.write.lock().expect("not poisoned");
         let Some(pipe) = held.as_mut() else {
             return false;
@@ -90,13 +126,41 @@ impl Link {
         let Ok(bytes) = frame(message) else {
             return false;
         };
-        if pipe.write_all(&bytes).is_err() {
-            // A broken pipe is a worker that has gone; forget it here so
-            // the next instruction fails quickly rather than on the write.
+        // `write_all` on a pipe with a deadline stops on the first short
+        // or failed write, so a partial frame cannot be followed later by
+        // the rest of it -- which would be read as a frame of its own.
+        // Either the whole instruction went or the worker is dead.
+        let sent = pipe
+            .write_within(&bytes, WRITE_WITHIN)
+            .and_then(|written| {
+                if written == bytes.len() {
+                    Ok(())
+                } else {
+                    // Kept as a failure rather than looping: a pipe that
+                    // takes part of a frame within the deadline and stops
+                    // is one whose reader has stopped.
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "the worker took only part of the instruction",
+                    ))
+                }
+            })
+            .map_err(|e| {
+                // Written at warn because a worker going away mid-session
+                // is the thing somebody diagnosing a stopped pointer needs
+                // to see, and it is otherwise entirely silent.
+                tracing::warn!("the worker stopped taking instructions: {e}");
+            })
+            .is_ok();
+        if !sent {
+            // Forgotten here rather than left for the minding thread to
+            // notice: the next injection must fail at once and the cursor
+            // must go home now, not in a quarter of a second.
             *held = None;
-            return false;
+            drop(held);
+            self.reach.lock().expect("not poisoned").attached(false);
         }
-        true
+        sent
     }
 
     /// Something the worker said. Called from the thread reading the pipe.
@@ -115,7 +179,13 @@ impl Link {
                 self.answers.lock().expect("not poisoned").monitors = Some(monitors);
                 self.answered.notify_all();
             }
-            FromWorker::Refused(why) => tracing::warn!("the worker's injection was refused: {why}"),
+            FromWorker::Refused(why) => {
+                tracing::warn!("the worker's injection was refused: {why}");
+                self.reach
+                    .lock()
+                    .expect("not poisoned")
+                    .refused(Instant::now());
+            }
             FromWorker::Ready { .. } => {}
         }
     }
@@ -144,8 +214,9 @@ impl Arm {
         } else {
             // The same error a platform with no injector gives, because to
             // everything above this it is the same situation: input is not
-            // reaching the screen. The client suspends and the cursor goes
-            // home, exactly as it did before there was a worker at all.
+            // reaching the screen. `platform::injection_blocked` then says
+            // why, and the client suspends and the cursor goes home --
+            // exactly as it did before there was a worker at all.
             Err(InputError::Unsupported("a worker on the input desktop"))
         }
     }

@@ -290,6 +290,56 @@ fn roll_over(path: &std::path::Path) {
     let _ = std::fs::rename(path, older);
 }
 
+/// Whether something has asked the daemon to stop, and a way to be woken
+/// when it does.
+///
+/// The daemon has always stopped on Ctrl+C, which is the only way to ask
+/// when a person started it. A service has no console and no Ctrl+C: the
+/// manager delivers a stop to a handler on a thread of its own, and
+/// without somewhere for that to land the daemon goes on running until the
+/// manager's patience runs out and the process is killed -- which is a
+/// service that cannot be stopped, and, on a server, a keyboard that is
+/// not given back until the machine is reset.
+///
+/// So there are two ways to ask and one place they arrive. [`stopping`]
+/// replaces `tokio::signal::ctrl_c()` at every point the daemon used to
+/// wait on it, and waits on either.
+static ASKED_TO_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STOP_ASKED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Ask the daemon to stop. Safe to call from any thread, including one
+/// that knows nothing about the runtime -- which the service's control
+/// handler is.
+/// The only caller is the Windows service's control handler, so on a
+/// Linux build this is compiled and never reached. It stays here rather
+/// than behind `cfg(windows)` because the waiting half below is shared,
+/// and splitting the pair would leave the two halves able to drift.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn ask_to_stop() {
+    ASKED_TO_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    STOP_ASKED.notify_waiters();
+}
+
+/// Resolves when the daemon has been asked to stop, by whichever means.
+pub(crate) async fn stopping() {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = asked_to_stop() => {}
+    }
+}
+
+async fn asked_to_stop() {
+    loop {
+        // The waiter is registered before the flag is read, so an ask
+        // that lands between the two wakes this rather than being missed.
+        let waiting = STOP_ASKED.notified();
+        if ASKED_TO_STOP.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        waiting.await;
+    }
+}
+
 fn block_on<F: std::future::Future<Output = Result<()>>>(f: F) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

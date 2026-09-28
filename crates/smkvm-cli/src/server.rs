@@ -330,7 +330,7 @@ pub async fn run(
                 let sends = daemon.sharing.on(happened, Instant::now());
                 daemon.send_bulk(sends);
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = crate::stopping() => {
                 info!("stopping");
                 break;
             }

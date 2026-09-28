@@ -23,12 +23,24 @@ use smkvm_input::platform::windows::capture::{Capture, Captured};
 use smkvm_input::platform::windows::{desktop, WindowsInput};
 use smkvm_input::{Inject, Monitors};
 
+use crate::secure::acl;
+
 use crate::secure::windows::pipe;
 use crate::secure::wire::{frame, read_frame, FromWorker, Saw, ToWorker, WORKER_PROTOCOL};
 
 /// Run as the worker until the pipe closes.
 pub fn run(pipe_name: &str) -> Result<()> {
-    let mut to_service = pipe::connect(pipe_name).context("reaching the service")?;
+    // `connect` applies every one of these before a byte is sent, and
+    // refuses rather than returning if any of them does not hold. Naming
+    // them here rather than in a comment means removing one is a change
+    // somebody has to make to code that is compiled.
+    let mut to_service = pipe::connect(pipe_name).with_context(|| {
+        format!(
+            "reaching the service. The pipe must satisfy all of {:?} before this process, \
+             which runs as the system account and injects keystrokes, says anything to it",
+            acl::Guard::ALL
+        )
+    })?;
     let mut from_service = to_service.share()?;
 
     // Which desktop this actually is, asked rather than assumed. The

@@ -61,7 +61,7 @@ pub async fn run(identity: Identity, peer: Peer, address: String, config: Config
         write_status(&status_path, &config, &peer, MachineState::Away, false);
         let outcome = tokio::select! {
             outcome = session(&identity, &peer, &address, &config, &mut sharing, &status_path, heartbeat) => outcome,
-            _ = tokio::signal::ctrl_c() => {
+            _ = crate::stopping() => {
                 info!("stopping");
                 Status::remove(&status_path);
                 return Ok(());
@@ -76,7 +76,7 @@ pub async fn run(identity: Identity, peer: Peer, address: String, config: Config
         }
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
-            _ = tokio::signal::ctrl_c() => {
+            _ = crate::stopping() => {
                 info!("stopping");
                 Status::remove(&status_path);
                 return Ok(());

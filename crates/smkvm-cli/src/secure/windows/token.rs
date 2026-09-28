@@ -1,21 +1,60 @@
-//! Getting hold of the interactive session, and starting something in it.
+//! Getting a process of our own into the interactive session, on a desktop
+//! we name.
 //!
 //! This is the part a process in the person's own session cannot do, and
-//! the reason the service exists. Three things have to be true at once:
+//! the reason the service exists.
 //!
-//! 1. The caller runs as LocalSystem. Only LocalSystem's token is granted
-//!    `SeTcbPrivilege` by default policy, and `WTSQueryUserToken` requires
-//!    both the account and the privilege.
-//! 2. That privilege is *enabled*, not merely held. Holding a privilege and
-//!    having it switched on are two different states of a token, and a
-//!    privilege that is held but off fails the call with
-//!    `ERROR_PRIVILEGE_NOT_HELD` -- which reads exactly like not having it,
-//!    and is the mistake everyone makes once.
-//! 3. The started process is told a window station and desktop by name. A
-//!    service's own station is `Service-0x0-3e7$` and has no screen, and a
-//!    null `lpDesktop` means "inherit mine". The process would start, see
-//!    nothing, hook nothing and report no error at all -- the shape of
-//!    failure this repository has lost the most time to.
+//! ## Whose token, and why it matters more than anything else here
+//!
+//! The worker has to run as **LocalSystem**, and it gets there by wearing
+//! the service's own token, moved into the console session. It does *not*
+//! wear the logged-in person's token. The distinction decides whether any
+//! of this works:
+//!
+//! * The `Winlogon` desktop's access list grants LocalSystem and nobody
+//!   else. `CreateProcessAsUser` with `lpDesktop = WinSta0\Winlogon` and a
+//!   user's token is refused outright, so the one thing this change exists
+//!   to do could not happen.
+//! * Even on `WinSta0\Default`, a worker wearing the person's token runs at
+//!   medium integrity -- lower than the scheduled task does today. It would
+//!   be refused by every window running as administrator, which is a
+//!   *regression* against what three machines are running, traded for
+//!   nothing.
+//! * And the pipe's access list names LocalSystem alone, so a worker that
+//!   is not LocalSystem cannot even open it.
+//!
+//! The first draft of this called `WTSQueryUserToken`, which hands back the
+//! interactive user's token, while three comments and the notes said the
+//! worker ran as SYSTEM. All three failures above followed from that one
+//! line. What is here instead is: duplicate our own token, move the
+//! duplicate into the console session, start the process with it.
+//!
+//! ## What is deliberately not done
+//!
+//! Nothing here widens the access list on `WinSta0` or on any desktop.
+//! LocalSystem already has full access to both, which is precisely why
+//! this arrangement is the one that reaches the secure desktop. Granting
+//! the interactive user or Administrators access to the `Winlogon` desktop
+//! would take apart the boundary that makes a consent prompt mean
+//! anything, and would be a worse hole than the one being fixed. If
+//! anything in here ever reaches for `SetSecurityInfo` on a window station
+//! or a desktop, something else has gone wrong.
+//!
+//! ## The two traps
+//!
+//! `SetTokenInformation(TokenSessionId)` needs `SeTcbPrivilege`, which
+//! LocalSystem's token *holds* and which is *disabled* until something
+//! switches it on. Holding a privilege and having it on are two states of
+//! a token, and a privilege held but off fails with
+//! `ERROR_PRIVILEGE_NOT_HELD`, which reads exactly like not having it.
+//! Worse, `AdjustTokenPrivileges` reports "you do not have it" by
+//! *succeeding* and setting the last error, so the obvious code says
+//! nothing at all.
+//!
+//! A null `lpDesktop` means "inherit mine", and a service's station is
+//! `Service-0x0-3e7$`, which has no screen. The process would start, see
+//! nothing, hook nothing and report no error -- the shape of failure this
+//! repository has lost the most time to.
 
 #![allow(unsafe_code)]
 
@@ -24,18 +63,16 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
-use windows::Win32::Security::{AdjustTokenPrivileges, LookupPrivilegeValueW, SE_TCB_NAME};
 use windows::Win32::Security::{
-    DuplicateTokenEx, SecurityImpersonation, TokenPrimary, LUID_AND_ATTRIBUTES,
-    SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS,
+    AdjustTokenPrivileges, DuplicateTokenEx, LookupPrivilegeValueW, SecurityImpersonation,
+    SetTokenInformation, TokenPrimary, TokenSessionId, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    SE_TCB_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
     TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
-use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// A handle that is closed when it goes out of scope.
@@ -108,9 +145,9 @@ pub fn enable_tcb_privilege() -> Result<()> {
     // SAFETY: reads this thread's last error and takes no pointers.
     if unsafe { windows::Win32::Foundation::GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
         bail!(
-            "this process does not hold SeTcbPrivilege, so it cannot reach the interactive \
-             session. The service has to run as LocalSystem; check the account under \
-             `sc qc smkvm`"
+            "this process does not hold SeTcbPrivilege, so it cannot put a process in the \
+             interactive session. The service has to run as LocalSystem; check the account \
+             under `sc qc smkvmsystem`"
         );
     }
     Ok(())
@@ -127,37 +164,65 @@ pub fn console_session() -> Option<u32> {
     (session != u32::MAX).then_some(session)
 }
 
-/// A primary token for whoever is logged in at the screen.
+/// A primary token that is this service's own -- LocalSystem -- but
+/// belonging to the session with the screen.
 ///
-/// `WTSQueryUserToken` already hands back a primary token, but it is
-/// duplicated all the same: the duplicate is ours to set access on and to
-/// close on our own schedule, and `CreateProcessAsUser` wants
-/// `TOKEN_ASSIGN_PRIMARY` which the original is not guaranteed to carry.
-pub fn session_token(session: u32) -> Result<Owned> {
-    let mut token = HANDLE::default();
-    // SAFETY: a place for the token; closed by the wrapper below.
-    unsafe { WTSQueryUserToken(session, &mut token) }.with_context(|| {
-        format!(
-            "asking for session {session}'s token. This needs LocalSystem with \
-             SeTcbPrivilege enabled; nobody may be logged in yet"
+/// This is the whole trick, and it is two calls. The duplicate is a
+/// primary token, which is what a process can be started with; an
+/// impersonation token is refused by `CreateProcessAsUser` and is what
+/// plain `DuplicateToken` would give. Moving it into the console session
+/// is what puts the started process where the screens are rather than in
+/// session 0 with the service.
+///
+/// The session is set on the **duplicate**, never on this process's own
+/// token: moving the service itself between sessions would be a different
+/// and much worse thing to do.
+pub fn system_token_in_session(session: u32) -> Result<Owned> {
+    let mut ours = HANDLE::default();
+    // SAFETY: our own process handle needs no closing; the token is wrapped
+    // below before anything can return.
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY,
+            &mut ours,
         )
-    })?;
-    let token = Owned(token);
+    }
+    .context("opening the service's own token")?;
+    let ours = Owned(ours);
 
-    let mut primary = HANDLE::default();
+    let mut worker = HANDLE::default();
     // SAFETY: a valid token in, a place for the duplicate out.
     unsafe {
         DuplicateTokenEx(
-            token.0,
+            ours.0,
             TOKEN_ACCESS_MASK(TOKEN_ALL_ACCESS.0),
             None,
             SecurityImpersonation,
             TokenPrimary,
-            &mut primary,
+            &mut worker,
         )
     }
-    .context("duplicating the session token into one a process can be started with")?;
-    Ok(Owned(primary))
+    .context("duplicating the service's token into one a process can be started with")?;
+    let worker = Owned(worker);
+
+    // SAFETY: the value is a u32 the call is told the size of, and the
+    // token is the duplicate made just above.
+    unsafe {
+        SetTokenInformation(
+            worker.0,
+            TokenSessionId,
+            &session as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .with_context(|| {
+        format!(
+            "moving the worker's token into session {session}. This needs SeTcbPrivilege \
+             enabled, which only the system account holds"
+        )
+    })?;
+    Ok(worker)
 }
 
 /// A process started in the interactive session, on a named desktop.
@@ -202,17 +267,17 @@ pub fn start_on_desktop(
     arguments: &str,
     desktop: &str,
 ) -> Result<Started> {
-    // The person's environment rather than LocalSystem's: `CreateProcessAsUser`
-    // does not build one, and a null block means the child inherits the
-    // service's, where TEMP and APPDATA point into the system profile.
-    let mut environment = std::ptr::null_mut();
-    // SAFETY: a valid token and a place for the block, freed below.
-    let have_environment =
-        unsafe { CreateEnvironmentBlock(&mut environment, token.0, false) }.is_ok();
-
+    // No environment block, and none built. `CreateEnvironmentBlock` from
+    // here would build LocalSystem's environment, so TEMP and APPDATA would
+    // point into the system profile -- which is the hazard worth avoiding
+    // only if the worker read any of it. It does not: it opens one pipe
+    // whose name is on its command line, reads no configuration and touches
+    // no file. A null block means it inherits the service's, which is the
+    // same environment, honestly labelled.
+    //
     // Quoted, always. An unquoted path with a space in it lets anything
     // called `C:\Program.exe` be started instead of what was meant, and this
-    // starts things as SYSTEM.
+    // starts things as the system account.
     let mut command: Vec<u16> = format!("\"{}\" {arguments}", exe.display())
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -226,11 +291,10 @@ pub fn start_on_desktop(
     };
     let mut information = PROCESS_INFORMATION::default();
 
-    // SAFETY: the command line and desktop buffers are null-terminated, live
-    // until after the call, and the command line is writable as the call
-    // requires. The environment block is either a valid Unicode block or
-    // null, and the flag matching it is set only in the first case.
-    let started = unsafe {
+    // SAFETY: the command line and desktop buffers are null-terminated and
+    // live until after the call, and the command line is writable as the
+    // call requires.
+    unsafe {
         CreateProcessAsUserW(
             token.0,
             None,
@@ -238,24 +302,14 @@ pub fn start_on_desktop(
             None,
             None,
             false,
-            if have_environment {
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
-            } else {
-                CREATE_NO_WINDOW
-            },
-            have_environment.then_some(environment),
+            CREATE_NO_WINDOW,
+            None,
             None,
             &startup,
             &mut information,
         )
-    };
-    if have_environment {
-        // SAFETY: the block came from the call above and is not used after.
-        unsafe {
-            let _ = DestroyEnvironmentBlock(environment);
-        }
     }
-    started.with_context(|| format!("starting {} in the interactive session", exe.display()))?;
+    .with_context(|| format!("starting {} in the interactive session", exe.display()))?;
 
     // The thread handle is of no use to anyone here and is a handle leak if
     // it is left; the process handle is kept, to know when it has gone.

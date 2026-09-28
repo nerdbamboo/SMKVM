@@ -435,8 +435,15 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
     }
 
     pub fn start() -> Result<()> {
-        if scm::installed() {
+        // Only when the service is the thing that would start. A service
+        // that is registered but stopped must not shadow a daemon
+        // somebody started by hand.
+        if scm::installed() && !scm::running() {
             return scm::start();
+        }
+        if scm::running() {
+            println!("the service is already running.");
+            return Ok(());
         }
         if let Some(pid) = running_pid() {
             println!("already running as pid {pid} (started by hand, not by the task).");
@@ -449,11 +456,16 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
     }
 
     pub fn stop() -> Result<()> {
-        if scm::installed() {
-            // Stopping the service ends the daemon, and with it the pipe,
-            // and with the pipe the worker: so the hooks on whatever
-            // desktop it was on go too. This is the recovery command on a
-            // server in either arrangement.
+        // Stopping the service ends the daemon, and with it the pipe, and
+        // with the pipe the worker: so the hooks on whatever desktop it
+        // was on go too. This is the recovery command on a server in
+        // either arrangement.
+        //
+        // Only when it is actually running, though. A registered but
+        // stopped service used to short-circuit this, which left a daemon
+        // started by hand with nothing that would stop it -- and on a
+        // server that daemon is holding the keyboard.
+        if scm::running() {
             return scm::stop();
         }
         // Stopping the task ends the process, and with it the input hooks,

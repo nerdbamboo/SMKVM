@@ -9,21 +9,25 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
 use windows::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QueryServiceStatusEx,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
+    QUERY_SERVICE_CONFIGW, SC_HANDLE, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
     SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+    SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+    SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 
 use crate::secure::watch::{self, Seen, Step, Watch};
-use crate::secure::windows::{link, pipe, token};
+use crate::secure::windows::{link, pipe, secret, token};
 use crate::secure::{acl, wire};
 
 /// What the service is registered as. The scheduled task is `SMKVM`; this
@@ -32,13 +36,18 @@ use crate::secure::{acl, wire};
 /// describe rather than one thing shadowing another.
 pub const SERVICE_NAME: &str = "SMKVMSystem";
 
+/// How long the manager is told to keep waiting while the service winds
+/// down, and how often it is told again.
+///
+/// A stop report with no wait hint is a service the manager has no reason
+/// to wait for, so it is treated as hung and killed -- which is what
+/// happened here, and it is why stopping produced a timeout rather than a
+/// stop.
+const WIND_DOWN_HINT_MS: u32 = 8_000;
+
 /// Is the service registered on this machine?
 pub fn installed() -> bool {
-    std::process::Command::new("sc.exe")
-        .args(["query", SERVICE_NAME])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    open_service(SERVICE_QUERY_STATUS).is_ok()
 }
 
 fn sc(arguments: &[&OsStr]) -> Result<String> {
@@ -58,7 +67,8 @@ fn sc(arguments: &[&OsStr]) -> Result<String> {
 /// `sc.exe` rather than `CreateServiceW`, for the same reason the scheduled
 /// task goes through PowerShell: this runs once, by hand, with a person
 /// watching, and what it did is then legible in `sc qc smkvmsystem` --
-/// which is where anyone diagnosing it will look anyway.
+/// which is where anyone diagnosing it will look anyway. Reading the
+/// service back does *not* go through `sc.exe`; see [`describe`].
 pub fn install(exe: &Path) -> Result<()> {
     // Quoted, because a path with a space in it that is not quoted is the
     // unquoted-service-path hole, and this service runs as LocalSystem.
@@ -80,8 +90,10 @@ pub fn install(exe: &Path) -> Result<()> {
         OsStr::new("auto"),
         // LocalSystem, and not for grandeur: it is the one account whose
         // token is granted SeTcbPrivilege by default policy, and without
-        // that privilege `WTSQueryUserToken` refuses, and without that
-        // there is no way to start anything in the person's session.
+        // that privilege the worker's token cannot be moved into the
+        // session with the screen. It is also the account the Winlogon
+        // desktop's own access list admits, which is the whole reason this
+        // arrangement reaches a consent prompt at all.
         OsStr::new("obj="),
         OsStr::new("LocalSystem"),
     ])?;
@@ -132,26 +144,123 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
-pub fn describe() -> Result<String> {
-    if !installed() {
-        return Ok("service: not installed".into());
+// ---------------------------------------------------------------------------
+// Reading the service back
+// ---------------------------------------------------------------------------
+
+/// A service control manager handle that is closed when it goes out of scope.
+struct Service(SC_HANDLE);
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: the handle is this value's own and came from the
+            // manager, which says to close it this way.
+            unsafe {
+                let _ = CloseServiceHandle(self.0);
+            }
+        }
     }
-    let said = sc(&[OsStr::new("qc"), OsStr::new(SERVICE_NAME)])?;
-    let account = said
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("SERVICE_START_NAME"))
-        .and_then(|rest| rest.split(':').nth(1))
-        .unwrap_or(" ?")
-        .trim()
-        .to_string();
-    let state = sc(&[OsStr::new("query"), OsStr::new(SERVICE_NAME)])?;
-    let state = state
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("STATE"))
-        .and_then(|rest| rest.split_whitespace().last())
-        .unwrap_or("?")
-        .to_string();
+}
+
+fn open_service(access: u32) -> Result<(Service, Service)> {
+    // SAFETY: null names mean this machine and the active database.
+    let manager = unsafe { OpenSCManagerW(None, None, SC_MANAGER_CONNECT) }
+        .context("opening the service control manager")?;
+    let manager = Service(manager);
+    // SAFETY: a valid manager handle and a null-terminated name.
+    let service = unsafe { OpenServiceW(manager.0, &HSTRING::from(SERVICE_NAME), access) }
+        .with_context(|| format!("opening the {SERVICE_NAME} service"))?;
+    Ok((manager, Service(service)))
+}
+
+/// Say what is registered and how it is doing.
+///
+/// Asked of the manager rather than scraped out of `sc.exe`'s printing.
+/// `sc.exe` is translated: on a Korean or Japanese Windows the lines do
+/// not begin with `STATE` or `SERVICE_START_NAME`, so the scraping this
+/// replaced fell through to a question mark on exactly the machines this
+/// is deployed on -- in the status line somebody reads when they are
+/// already trying to work out why nothing works.
+pub fn describe() -> Result<String> {
+    let Ok((_manager, service)) = open_service(SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG) else {
+        return Ok("service: not installed".into());
+    };
+
+    let mut needed = 0u32;
+    // SAFETY: asking for the size writes only to `needed`; the call fails
+    // by design, which is how the size is learned.
+    let _ = unsafe { QueryServiceConfigW(service.0, None, 0, &mut needed) };
+    let mut buffer = vec![0u8; needed.max(8) as usize];
+    // SAFETY: the buffer is at least `needed` bytes, and the structure the
+    // call writes points into it.
+    let account = unsafe {
+        QueryServiceConfigW(
+            service.0,
+            Some(buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW),
+            buffer.len() as u32,
+            &mut needed,
+        )
+        .ok()
+        .and_then(|()| {
+            let config = &*(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+            (!config.lpServiceStartName.is_null())
+                .then(|| config.lpServiceStartName.to_string().ok())
+                .flatten()
+        })
+    }
+    .unwrap_or_else(|| "?".into());
+
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0u32;
+    // SAFETY: a buffer of exactly the size the call is told.
+    let state = unsafe {
+        QueryServiceStatusEx(
+            service.0,
+            SC_STATUS_PROCESS_INFO,
+            Some(std::slice::from_raw_parts_mut(
+                &mut status as *mut _ as *mut u8,
+                std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
+            )),
+            &mut needed,
+        )
+    }
+    .map(|()| match status.dwCurrentState {
+        SERVICE_RUNNING => "running",
+        SERVICE_STOPPED => "stopped",
+        SERVICE_STOP_PENDING => "stopping",
+        _ => "changing state",
+    })
+    .unwrap_or("?");
+
     Ok(format!("service: {state}, runs as {account}"))
+}
+
+/// Is the service registered *and* running?
+///
+/// Asked so that `smkvm service stop` does not give up on a daemon
+/// somebody started by hand merely because a stopped service is also
+/// registered.
+pub fn running() -> bool {
+    let Ok((_manager, service)) = open_service(SERVICE_QUERY_STATUS) else {
+        return false;
+    };
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0u32;
+    // SAFETY: a buffer of exactly the size the call is told.
+    unsafe {
+        QueryServiceStatusEx(
+            service.0,
+            SC_STATUS_PROCESS_INFO,
+            Some(std::slice::from_raw_parts_mut(
+                &mut status as *mut _ as *mut u8,
+                std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
+            )),
+            &mut needed,
+        )
+    }
+    .is_ok()
+        && status.dwCurrentState != SERVICE_STOPPED
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +270,20 @@ pub fn describe() -> Result<String> {
 /// Set by the control handler, read by the loop that minds the worker.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
-static mut STATUS: Option<SERVICE_STATUS_HANDLE> = None;
+/// The manager's handle for reporting status.
+///
+/// An atomic rather than a `static mut`: it is written on the thread the
+/// manager calls `service_main` on and read on whichever thread the
+/// manager delivers a control to, which is a different one. The ordering
+/// argument for the old `static mut` was true and is not the point -- two
+/// threads touching a plain static without synchronisation is undefined
+/// whatever the ordering happens to be.
+static STATUS: AtomicIsize = AtomicIsize::new(0);
+
+/// How many times the wind-down has reported progress, which the manager
+/// uses to tell a service that is still going from one that has stopped
+/// answering.
+static CHECKPOINT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Hand this process to the service control manager.
 ///
@@ -190,22 +312,31 @@ pub fn run_as_service() -> Result<()> {
     Ok(())
 }
 
-fn report(state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE, accept: u32) {
-    // SAFETY: written once in service_main before any control can arrive,
-    // and only read afterwards.
-    let Some(handle) = (unsafe { STATUS }) else {
+fn report(state: SERVICE_STATUS_CURRENT_STATE, accept: u32, wait_hint_ms: u32) {
+    let handle = STATUS.load(Ordering::Acquire);
+    if handle == 0 {
         return;
-    };
+    }
     let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
         dwControlsAccepted: accept,
         dwWin32ExitCode: NO_ERROR.0,
+        dwCheckPoint: if wait_hint_ms == 0 {
+            0
+        } else {
+            CHECKPOINT.fetch_add(1, Ordering::Relaxed) + 1
+        },
+        dwWaitHint: wait_hint_ms,
         ..Default::default()
     };
-    // SAFETY: a handle from RegisterServiceCtrlHandlerExW and a status we own.
+    // SAFETY: the handle came from RegisterServiceCtrlHandlerExW on this
+    // process's own service name, and the status is ours.
     unsafe {
-        let _ = SetServiceStatus(handle, &status);
+        let _ = SetServiceStatus(
+            SERVICE_STATUS_HANDLE(handle as *mut core::ffi::c_void),
+            &status,
+        );
     }
 }
 
@@ -218,7 +349,12 @@ unsafe extern "system" fn control(
     match code {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             STOPPING.store(true, Ordering::SeqCst);
-            report(SERVICE_STOP_PENDING, 0);
+            // Told to stop *and* told the daemon to stop. The flag alone
+            // reaches only the thread minding the worker; the daemon is
+            // inside its own loop, and without this the service sat there
+            // until the manager's patience ran out and killed it.
+            crate::ask_to_stop();
+            report(SERVICE_STOP_PENDING, 0, WIND_DOWN_HINT_MS);
             NO_ERROR.0
         }
         _ => ERROR_CALL_NOT_IMPLEMENTED.0,
@@ -234,22 +370,24 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     else {
         return;
     };
-    STATUS = Some(handle);
+    STATUS.store(handle.0 as isize, Ordering::Release);
     report(
         SERVICE_RUNNING,
         SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        0,
     );
 
     if let Err(e) = serve() {
         tracing::error!("{e:#}");
     }
 
-    report(SERVICE_STOPPED, 0);
+    report(SERVICE_STOPPED, 0, 0);
     // Reported stopped exactly once, and then nothing: the first stop
     // report closes the manager's handle and a second can take the process
     // down with it. Exiting here is also what releases the worker -- the
     // pipe closes with the process, and the worker exits when it does, so
-    // no SYSTEM process is left on the logon desktop.
+    // no process running as the system account is left on the logon
+    // desktop.
     std::process::exit(0);
 }
 
@@ -257,8 +395,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 fn serve() -> Result<()> {
     token::enable_tcb_privilege()?;
     tracing::info!(
-        "running as a service; workers will be started on whichever desktop has the input, \
-         so a UAC prompt and the lock screen are reachable"
+        "running as a service; workers will be started as the system account on whichever \
+         desktop has the input, so a UAC prompt and the lock screen are reachable"
     );
 
     let link = link::Link::new();
@@ -274,9 +412,13 @@ fn serve() -> Result<()> {
     };
 
     // From here it is the ordinary daemon, with the arm above standing in
-    // for `SendInput`. Nothing in `run` knows a service is running it.
+    // for `SendInput`. Nothing in `run` knows a service is running it,
+    // except that it now stops when asked as well as on Ctrl+C.
     let outcome = crate::run_daemon_for_service();
     STOPPING.store(true, Ordering::SeqCst);
+    // Every wait inside this thread is bounded, so joining it is bounded
+    // too. That was not true of the first draft, where it could not
+    // return at all and the service could not be stopped.
     let _ = minding.join();
     outcome
 }
@@ -285,7 +427,6 @@ fn serve() -> Result<()> {
 fn mind_workers(exe: &Path, link: Arc<link::Link>) {
     let mut watch = Watch::new();
     let mut running: Option<token::Started> = None;
-    let mut run = 0u64;
 
     while !STOPPING.load(Ordering::SeqCst) {
         std::thread::sleep(watch::LOOK_EVERY);
@@ -294,7 +435,11 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
             if started.gone() {
                 tracing::warn!("the worker exited; another will be started");
                 link.detach();
-                watch.worker_gone();
+                // Timed, because a worker that says hello and dies at once
+                // has to count against the desktop it was on. Without
+                // that this loop starts a process as the system account
+                // four times a second for the rest of the day.
+                watch.worker_gone(Instant::now());
                 running = None;
             }
         }
@@ -325,20 +470,23 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
                 // The one leaving is told to let go before it is replaced,
                 // so nothing is left held down on the desktop it was on.
                 if let Some(old) = running.take() {
+                    tracing::info!(
+                        leaving = watch.worker_on().unwrap_or("?"),
+                        for_ = %desktop,
+                        "the input moved, so the worker is replaced"
+                    );
                     link.say(&wire::ToWorker::Stop);
                     link.detach();
                     old.kill();
                 }
-                run += 1;
-                match start_worker(exe, &on, run, &link) {
+                match start_worker(exe, &on, &link) {
                     Ok((started, landed)) => {
                         tracing::info!(
                             desktop = %landed,
                             pid = started.pid,
-                            was = watch.worker_on().unwrap_or("nothing"),
                             "a worker is on the input desktop"
                         );
-                        watch.worker_started(&landed);
+                        watch.worker_started(&landed, Instant::now());
                         running = Some(started);
                     }
                     Err(e) => {
@@ -350,6 +498,11 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
         }
     }
 
+    // Said again on the way out, so the manager sees progress rather than
+    // a service that reported STOP_PENDING once and went quiet. A rising
+    // check point is the difference between "still winding down" and
+    // "hung", and the manager kills the second.
+    report(SERVICE_STOP_PENDING, 0, WIND_DOWN_HINT_MS);
     if let Some(old) = running {
         link.say(&wire::ToWorker::Stop);
         link.detach();
@@ -358,60 +511,55 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
 }
 
 /// Make the pipe, start the worker on `on`, and wait for it to say hello.
-fn start_worker(
-    exe: &Path,
-    on: &str,
-    run: u64,
-    link: &Arc<link::Link>,
-) -> Result<(token::Started, String)> {
+///
+/// The order is the security of it. The pipe is created and *proved to
+/// exist and be ours* before the worker is started, because any
+/// authenticated user may create a name in the pipe namespace: a worker
+/// started first and then told a name could reach somebody else's pipe of
+/// that name. The first draft spawned the making of the pipe onto a thread
+/// and started the worker without waiting to see whether it had worked,
+/// under a comment claiming exactly the property it did not have.
+fn start_worker(exe: &Path, on: &str, link: &Arc<link::Link>) -> Result<(token::Started, String)> {
     let session = token::console_session().context("nobody is logged in at the screen yet")?;
-    let user = token::session_token(session)?;
-    let name = acl::pipe_name(run);
+    let user = token::system_token_in_session(session)?;
+    // From the system's random number generator. A counter, which this
+    // was, gives a name anything on the machine can create first.
+    let name = acl::pipe_name(&secret::name_bytes()?);
 
-    // The pipe is made before the worker is started, so there is no moment
-    // in which the name exists and this process is not the one holding it.
-    // `FILE_FLAG_FIRST_PIPE_INSTANCE` then makes a name somebody else got
-    // to first a refusal rather than a conversation with them.
-    let listening = std::thread::Builder::new()
-        .name("smkvm-pipe".into())
-        .spawn({
-            let name = name.clone();
-            move || pipe::serve(&name)
-        })
-        .context("starting the thread that waits for the worker")?;
+    let listening = pipe::create(&name)?;
 
     let started =
         token::start_on_desktop(&user, exe, &format!("desktop-worker --pipe {name}"), on)?;
 
-    let served = listening
-        .join()
-        .map_err(|_| anyhow::anyhow!("the thread waiting for the worker died"))??;
-    let mut reading = served.share()?;
-    link.attach(served);
+    // Bounded. A worker that never arrives is a counted failure that
+    // `watch` can give up on, not a thread parked for ever.
+    if let Err(e) = pipe::accept(&listening, pipe::CONNECT_WITHIN) {
+        started.kill();
+        return Err(e);
+    }
 
-    // The first frame says which desktop the worker actually landed on and
-    // that it is the same build. Anything else and it is not talked to.
-    let hello: wire::FromWorker =
-        wire::read_frame(&mut reading).context("the worker said nothing")?;
-    let landed = match hello {
-        wire::FromWorker::Ready { protocol, desktop } if protocol == wire::WORKER_PROTOCOL => {
-            desktop
-        }
-        wire::FromWorker::Ready { protocol, .. } => {
-            link.detach();
+    let mut reading = listening.share()?;
+
+    // The hello is read and judged before the worker is spoken to at all:
+    // `link.attach` sends an instruction, and sending one to a process
+    // whose build has not been established is the thing the comment here
+    // used to claim was not happening.
+    let hello: wire::FromWorker = match wire::read_frame(&mut reading) {
+        Ok(hello) => hello,
+        Err(e) => {
             started.kill();
-            bail!(
-                "the worker speaks protocol {protocol} and this speaks {}: two halves of one \
-                 installation are different builds. Reinstall from one binary",
-                wire::WORKER_PROTOCOL
-            );
-        }
-        other => {
-            link.detach();
-            started.kill();
-            bail!("the worker said {other:?} before saying hello");
+            return Err(anyhow::anyhow!("the worker said nothing: {e}"));
         }
     };
+    let landed = match wire::welcome(hello) {
+        Ok(landed) => landed,
+        Err(e) => {
+            started.kill();
+            return Err(e.into());
+        }
+    };
+
+    link.attach(listening);
 
     let link = link.clone();
     std::thread::Builder::new()

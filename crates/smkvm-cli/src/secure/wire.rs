@@ -105,6 +105,44 @@ impl From<Saw> for smkvm_core::Event {
     }
 }
 
+/// Why a worker's first frame was not acceptable.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotWelcome {
+    #[error(
+        "the worker speaks protocol {theirs} and this speaks {ours}: two halves of one \
+         installation are different builds. Reinstall from one binary"
+    )]
+    WrongProtocol { theirs: u32, ours: u32 },
+    #[error("the worker said something else before saying hello")]
+    SpokeOutOfTurn,
+    #[error("the worker would not say which desktop it is on")]
+    NamelessDesktop,
+}
+
+/// Read the worker's first frame, and say whether it may be spoken to.
+///
+/// Separate from the reading of it, and pure, for two reasons. It is the
+/// decision that keeps a process of a different build from being handed
+/// keystrokes, so it is worth testing on every machine rather than only on
+/// the one that cannot run it. And it is the decision the service got
+/// round the wrong way once: the first draft attached the pipe -- and so
+/// sent the worker an instruction -- before reading this at all.
+pub fn welcome(first: FromWorker) -> Result<String, NotWelcome> {
+    match first {
+        FromWorker::Ready { protocol, .. } if protocol != WORKER_PROTOCOL => {
+            Err(NotWelcome::WrongProtocol {
+                theirs: protocol,
+                ours: WORKER_PROTOCOL,
+            })
+        }
+        FromWorker::Ready { desktop, .. } if desktop.trim().is_empty() => {
+            Err(NotWelcome::NamelessDesktop)
+        }
+        FromWorker::Ready { desktop, .. } => Ok(desktop),
+        _ => Err(NotWelcome::SpokeOutOfTurn),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     #[error("the pipe: {0}")]
@@ -233,6 +271,53 @@ mod tests {
             read_frame::<ToWorker, _>(&mut cursor),
             Err(FrameError::Garbled)
         ));
+    }
+
+    #[test]
+    fn a_worker_of_the_right_build_is_welcome_and_says_where_it_is() {
+        assert_eq!(
+            welcome(FromWorker::Ready {
+                protocol: WORKER_PROTOCOL,
+                desktop: "Winlogon".into()
+            }),
+            Ok("Winlogon".to_string())
+        );
+    }
+
+    #[test]
+    fn a_worker_of_another_build_is_not_spoken_to() {
+        assert_eq!(
+            welcome(FromWorker::Ready {
+                protocol: WORKER_PROTOCOL + 1,
+                desktop: "Winlogon".into()
+            }),
+            Err(NotWelcome::WrongProtocol {
+                theirs: WORKER_PROTOCOL + 1,
+                ours: WORKER_PROTOCOL
+            })
+        );
+    }
+
+    #[test]
+    fn a_worker_that_says_anything_else_first_is_not_spoken_to() {
+        // Including something harmless-looking. The rule is that the
+        // first frame is the hello, not that the first frame is checked
+        // if it happens to be one.
+        assert_eq!(
+            welcome(FromWorker::Monitors(Vec::new())),
+            Err(NotWelcome::SpokeOutOfTurn)
+        );
+        assert_eq!(
+            welcome(FromWorker::Saw(Saw::PointerAt { x: 0, y: 0 })),
+            Err(NotWelcome::SpokeOutOfTurn)
+        );
+        assert_eq!(
+            welcome(FromWorker::Ready {
+                protocol: WORKER_PROTOCOL,
+                desktop: "  ".into()
+            }),
+            Err(NotWelcome::NamelessDesktop)
+        );
     }
 
     #[test]

@@ -57,6 +57,20 @@ pub fn injection_blocked() -> Option<(smkvm_proto::SuspendReason, String)> {
         use smkvm_input::platform::windows::{can_inject, desktop, privilege};
         use smkvm_proto::SuspendReason;
 
+        // As the service, none of the questions below are about the right
+        // machine's screen. They are asked from session 0 on the window
+        // station `Service-0x0-3e7$`, which has no screen and never will:
+        // `desktop::current()` says out of reach, `can_inject()` says no,
+        // and both say so for ever however well the worker is doing. The
+        // client would suspend at the first refusal and never resume,
+        // which is the bug this whole change exists to fix, wearing a
+        // service. The worker is the thing that can see, so it is asked.
+        if let Some(link) = crate::secure::windows::link::worker() {
+            return link
+                .blocked()
+                .map(|why| (SuspendReason::SecureDesktop, why.why().to_string()));
+        }
+
         match desktop::current() {
             desktop::InputDesktop::Ours => {}
             desktop::InputDesktop::Elsewhere(name) => {
@@ -117,6 +131,19 @@ pub fn report_rank() {
     #[cfg(windows)]
     {
         use smkvm_input::platform::windows::privilege;
+        // As the service this process injects nothing itself, so its own
+        // rank says nothing about reach. What matters is the worker's, and
+        // the worker is the system account on whichever desktop has the
+        // input -- which is every window and every desktop, including the
+        // one a consent prompt is on.
+        if crate::secure::windows::link::worker().is_some() {
+            tracing::info!(
+                "running as a service, so input goes through a worker running as the \
+                 system account on whichever desktop has the input -- including the \
+                 desktop a UAC prompt, the lock screen or Ctrl+Alt+Del is on"
+            );
+            return;
+        }
         match privilege::our_level() {
             // High or above: nothing in the session outranks this.
             Some(rid) if rid >= 0x3000 => tracing::info!(
@@ -141,6 +168,11 @@ pub fn injection_possible() -> bool {
     #[cfg(windows)]
     {
         use smkvm_input::platform::windows::{can_inject, desktop};
+        // The same argument as in `injection_blocked`: in service mode the
+        // only process that can see a screen is the worker.
+        if let Some(link) = crate::secure::windows::link::worker() {
+            return link.possible();
+        }
         desktop::current().is_reachable() && can_inject()
     }
     #[cfg(not(windows))]

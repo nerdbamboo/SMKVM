@@ -55,6 +55,17 @@
 //! access control list names LocalSystem and nobody else (see [`acl`]). The
 //! service in turn takes instructions only from where it always has -- the
 //! paired, Noise-authenticated link. No new way in is opened anywhere.
+//!
+//! That list secures one side of the pipe. The other side is the worker
+//! satisfying itself that the pipe it opened is the service's, because any
+//! authenticated user may create a name in the pipe namespace and a name
+//! created first is the one the worker would reach. The three things that
+//! settle it are written down as [`acl::Guard`] and applied in
+//! `windows::pipe` and `windows::worker`: a name from the system's random
+//! number generator rather than a counter, an open that refuses
+//! impersonation, and the worker checking that the process serving the
+//! pipe is the system account. Dropping any one of them hands a SYSTEM
+//! process to whoever got to the name first.
 
 // The Win32 half that acts on all of this is behind `cfg(windows)`, so in a
 // Linux build every decision below is exercised by its tests and called by
@@ -65,6 +76,7 @@
 
 pub mod acl;
 pub mod plan;
+pub mod reach;
 pub mod watch;
 pub mod wire;
 
