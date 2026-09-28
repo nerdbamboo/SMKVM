@@ -62,8 +62,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, LocalFree, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -89,6 +89,7 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use crate::secure::acl;
 use crate::secure::windows::token::Owned;
+use crate::secure::windows::Aligned;
 use crate::secure::wire::LONGEST_FRAME;
 
 /// How long an injection may take to reach the worker before the worker is
@@ -211,6 +212,14 @@ impl Pipe {
         match start(&mut overlapped) {
             Ok(()) => {}
             Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {}
+            // A worker that got to the pipe between it being made and
+            // this call is reported as this, and is a success. It has to
+            // be recognised here, while the error is still a typed
+            // `windows` one: everything below wraps it with
+            // `io::Error::other`, which keeps the message and drops the
+            // code, so a caller downstream cannot tell it apart -- which
+            // is what made the branch that used to try unreachable.
+            Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => return Ok(0),
             Err(e) => return Err(std::io::Error::other(e)),
         }
         let milliseconds = match within {
@@ -269,6 +278,15 @@ impl Pipe {
     /// people out of the right pipe; this is what keeps the worker out of
     /// the wrong pipe, and it is the only one of the three that does not
     /// rely on an attacker having been unlucky.
+    ///
+    /// There is a theoretical race between asking which process serves
+    /// the pipe and opening it: that process could exit and its id be
+    /// reused by one running as the system account. Exploiting it needs
+    /// the attacker's pipe to still be served by a process that has
+    /// exited *and* the id to be reused by the system inside the same
+    /// window. It is written down here so the next reader does not
+    /// rediscover it and wonder whether anybody noticed; it is not worth
+    /// code.
     pub fn server_is_the_system(&self) -> Result<()> {
         let mut pid = 0u32;
         // SAFETY: a valid pipe handle and a place for the id.
@@ -293,7 +311,9 @@ impl Pipe {
         if needed == 0 {
             bail!("the process serving the pipe would not say who it is");
         }
-        let mut buffer = vec![0u8; needed as usize];
+        // Aligned for a structure with a pointer in it, because that is
+        // what is read back out of it below.
+        let mut buffer = Aligned::new(needed as usize);
         // SAFETY: the buffer is at least `needed` bytes, which is what was
         // asked for above.
         unsafe {
@@ -301,7 +321,7 @@ impl Pipe {
                 token.0,
                 TokenUser,
                 Some(buffer.as_mut_ptr() as *mut _),
-                needed,
+                buffer.len() as u32,
                 &mut needed,
             )
         }
@@ -321,7 +341,9 @@ impl Pipe {
         .context("building the system account's identifier to compare against")?;
 
         // SAFETY: the system filled the buffer with a TOKEN_USER whose SID
-        // pointer refers into the same buffer, and `system` holds a SID the
+        // pointer refers into the same buffer; the buffer is `Aligned`, so
+        // a reference to the structure in it is properly aligned, which a
+        // `Vec<u8>` would not have guaranteed. `system` holds a SID the
         // call above wrote.
         let same = unsafe {
             let user = &*(buffer.as_ptr() as *const TOKEN_USER);
@@ -469,14 +491,8 @@ pub fn accept(pipe: &Pipe, within: Duration) -> Result<()> {
             "no worker came to the pipe within {} s",
             within.as_secs_f32()
         ),
-        // The worker can get there between the make and the wait, which is
-        // reported as this and is not a failure.
-        Err(e)
-            if e.raw_os_error()
-                == Some(windows::Win32::Foundation::ERROR_PIPE_CONNECTED.0 as i32) =>
-        {
-            Ok(())
-        }
+        // A worker already connected is a success and is recognised in
+        // `awaited`, where the error still carries its code.
         Err(e) => Err(e).context("waiting for the worker"),
     }
 }

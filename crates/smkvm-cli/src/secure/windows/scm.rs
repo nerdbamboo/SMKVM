@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_CALL_NOT_IMPLEMENTED, NO_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_CALL_NOT_IMPLEMENTED, ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR,
+};
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QueryServiceStatusEx,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -27,7 +29,7 @@ use windows::Win32::System::Services::{
 };
 
 use crate::secure::watch::{self, Seen, Step, Watch};
-use crate::secure::windows::{link, pipe, secret, token};
+use crate::secure::windows::{link, pipe, secret, token, Aligned};
 use crate::secure::{acl, wire};
 
 /// What the service is registered as. The scheduled task is `SMKVM`; this
@@ -44,6 +46,12 @@ pub const SERVICE_NAME: &str = "SMKVMSystem";
 /// happened here, and it is why stopping produced a timeout rather than a
 /// stop.
 const WIND_DOWN_HINT_MS: u32 = 8_000;
+
+/// The service-specific code reported when the service could not do its
+/// job. There is only one, because the distinctions are in the log and
+/// nothing reads this but the manager, which only needs it to be
+/// non-zero.
+const FAILED_TO_SERVE: u32 = 1;
 
 /// Is the service registered on this machine?
 pub fn installed() -> bool {
@@ -191,9 +199,13 @@ pub fn describe() -> Result<String> {
     // SAFETY: asking for the size writes only to `needed`; the call fails
     // by design, which is how the size is learned.
     let _ = unsafe { QueryServiceConfigW(service.0, None, 0, &mut needed) };
-    let mut buffer = vec![0u8; needed.max(8) as usize];
-    // SAFETY: the buffer is at least `needed` bytes, and the structure the
-    // call writes points into it.
+    // Aligned, because a `QUERY_SERVICE_CONFIGW` is read back out of it
+    // and it is full of pointers; a `Vec<u8>` is aligned to one byte, and
+    // taking a reference to a structure inside one is undefined however
+    // well the hardware copes.
+    let mut buffer = Aligned::new(needed.max(8) as usize);
+    // SAFETY: the buffer is at least `needed` bytes and aligned for the
+    // structure the call writes into it, whose fields point into it.
     let account = unsafe {
         QueryServiceConfigW(
             service.0,
@@ -313,6 +325,29 @@ pub fn run_as_service() -> Result<()> {
 }
 
 fn report(state: SERVICE_STATUS_CURRENT_STATE, accept: u32, wait_hint_ms: u32) {
+    report_with(state, accept, wait_hint_ms, NO_ERROR.0, 0);
+}
+
+/// Report, saying how it went.
+///
+/// The exit code is the whole of finding 2. `report` used to hard-code
+/// `NO_ERROR` and `service_main` used to `exit(0)` whatever had happened,
+/// so a service that could not start at all -- registered under the wrong
+/// account, unable to find its own path, a thread that would not spawn --
+/// looked to the manager exactly like one that was asked to stop and did.
+/// `sc start` said success and the status said "stopped", with the reason
+/// only in the log; and the `restart/60000` failure actions registered at
+/// install were inert, because the manager applies those only to a
+/// service that terminates with a code. The case that comment worries
+/// about -- stopped at three in the morning and staying stopped -- was
+/// exactly the case not covered.
+fn report_with(
+    state: SERVICE_STATUS_CURRENT_STATE,
+    accept: u32,
+    wait_hint_ms: u32,
+    win32_code: u32,
+    specific_code: u32,
+) {
     let handle = STATUS.load(Ordering::Acquire);
     if handle == 0 {
         return;
@@ -321,14 +356,14 @@ fn report(state: SERVICE_STATUS_CURRENT_STATE, accept: u32, wait_hint_ms: u32) {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
         dwControlsAccepted: accept,
-        dwWin32ExitCode: NO_ERROR.0,
+        dwWin32ExitCode: win32_code,
+        dwServiceSpecificExitCode: specific_code,
         dwCheckPoint: if wait_hint_ms == 0 {
             0
         } else {
             CHECKPOINT.fetch_add(1, Ordering::Relaxed) + 1
         },
         dwWaitHint: wait_hint_ms,
-        ..Default::default()
     };
     // SAFETY: the handle came from RegisterServiceCtrlHandlerExW on this
     // process's own service name, and the status is ours.
@@ -377,18 +412,42 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         0,
     );
 
-    if let Err(e) = serve() {
-        tracing::error!("{e:#}");
-    }
+    let failed = match serve() {
+        Ok(()) => false,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            true
+        }
+    };
 
-    report(SERVICE_STOPPED, 0, 0);
+    if failed {
+        // `ERROR_SERVICE_SPECIFIC_ERROR` with a specific code is how a
+        // service says "I failed for a reason of my own" rather than
+        // borrowing a system error number that would be read as
+        // something it is not. What it failed at is in the log; what the
+        // manager needs is only that it failed, so that the restart
+        // actions apply.
+        report_with(
+            SERVICE_STOPPED,
+            0,
+            0,
+            ERROR_SERVICE_SPECIFIC_ERROR.0,
+            FAILED_TO_SERVE,
+        );
+    } else {
+        report(SERVICE_STOPPED, 0, 0);
+    }
     // Reported stopped exactly once, and then nothing: the first stop
     // report closes the manager's handle and a second can take the process
     // down with it. Exiting here is also what releases the worker -- the
     // pipe closes with the process, and the worker exits when it does, so
     // no process running as the system account is left on the logon
     // desktop.
-    std::process::exit(0);
+    //
+    // Non-zero when it failed, for the same reason as the status above:
+    // the manager decides whether to apply the restart actions by the
+    // process's exit code as well.
+    std::process::exit(if failed { 1 } else { 0 });
 }
 
 /// Everything the service does, once it is a service.
@@ -423,13 +482,48 @@ fn serve() -> Result<()> {
     outcome
 }
 
+/// What a look at the input desktop turned into.
+enum Looked {
+    /// A name, which is both what `watch` decides on and what `reach`
+    /// compares the worker's desktop against.
+    Named(String),
+    /// It would not say. For the system account this should not happen.
+    Unreadable,
+}
+
 /// Poll the input desktop and keep a worker on it.
 fn mind_workers(exe: &Path, link: Arc<link::Link>) {
     let mut watch = Watch::new();
     let mut running: Option<token::Started> = None;
+    // Whether "nobody is logged in yet" has already been said once.
+    let mut said_no_session = false;
 
     while !STOPPING.load(Ordering::SeqCst) {
         std::thread::sleep(watch::LOOK_EVERY);
+
+        // Before anything else, because it is a wait rather than a fault
+        // and must not be counted as one. At boot, before the first
+        // login, there may be no console session for a moment while the
+        // input desktop is already `Winlogon`; feeding that to
+        // `worker_failed` exhausted `GIVE_UP_AFTER` within about a second
+        // and latched give-up on `Winlogon`, so the lock screen was
+        // unreachable until somebody had logged in once -- with a log
+        // line reading like a permission problem. `console_session`'s own
+        // doc comment always said this was a wait; now the code agrees.
+        if token::console_session().is_none() {
+            if !said_no_session {
+                tracing::info!(
+                    "nobody is logged in at the screen yet, so there is no session to put \
+                     a worker in. Waiting; this is not a failure"
+                );
+                said_no_session = true;
+            }
+            continue;
+        }
+        if said_no_session {
+            tracing::info!("a session is at the screen now");
+            said_no_session = false;
+        }
 
         if let Some(started) = &running {
             if started.gone() {
@@ -444,17 +538,34 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
             }
         }
 
-        let seen = match smkvm_input::platform::windows::desktop::current() {
+        let looked = match smkvm_input::platform::windows::desktop::current() {
             smkvm_input::platform::windows::desktop::InputDesktop::Ours => {
                 match smkvm_input::platform::windows::desktop::ours() {
-                    Some(name) => Seen::Desktop(name),
-                    None => Seen::Unreadable,
+                    Some(name) => Looked::Named(name),
+                    None => Looked::Unreadable,
                 }
             }
             smkvm_input::platform::windows::desktop::InputDesktop::Elsewhere(name) => {
-                Seen::Desktop(name)
+                Looked::Named(name)
             }
-            smkvm_input::platform::windows::desktop::InputDesktop::OutOfReach => Seen::Unreadable,
+            smkvm_input::platform::windows::desktop::InputDesktop::OutOfReach => Looked::Unreadable,
+        };
+
+        // Told to the daemon's side on every look, whether or not the
+        // worker moves. This is what stops the client injecting into a
+        // worker that is still on the desktop the input has just left --
+        // for up to a quarter of a second, which is long enough for the
+        // first characters of a password typed at a consent prompt to
+        // land in a window behind it.
+        let seen = match &looked {
+            Looked::Named(name) => {
+                link.input_desktop(Some(name));
+                Seen::Desktop(name.clone())
+            }
+            Looked::Unreadable => {
+                link.input_desktop(None);
+                Seen::Unreadable
+            }
         };
 
         match watch.saw(seen) {
@@ -538,7 +649,18 @@ fn start_worker(exe: &Path, on: &str, link: &Arc<link::Link>) -> Result<(token::
         return Err(e);
     }
 
-    let mut reading = listening.share()?;
+    let mut reading = match listening.share() {
+        Ok(reading) => reading,
+        Err(e) => {
+            // Killed here as on every other early return. Dropping the
+            // pipe would collect it too, since the worker exits when its
+            // read fails, but relying on that makes this function's
+            // cleanup depend on the worker's behaviour rather than on
+            // this function.
+            started.kill();
+            return Err(e);
+        }
+    };
 
     // The hello is read and judged before the worker is spoken to at all:
     // `link.attach` sends an instruction, and sending one to a process
@@ -559,17 +681,28 @@ fn start_worker(exe: &Path, on: &str, link: &Arc<link::Link>) -> Result<(token::
         }
     };
 
-    link.attach(listening);
+    link.attach(listening, &landed);
 
-    let link = link.clone();
-    std::thread::Builder::new()
-        .name("smkvm-worker-reader".into())
-        .spawn(move || {
-            while let Ok(said) = wire::read_frame::<wire::FromWorker, _>(&mut reading) {
-                link.heard(said);
-            }
-        })
-        .context("starting the thread that reads from the worker")?;
+    let reader = {
+        let link = link.clone();
+        std::thread::Builder::new()
+            .name("smkvm-worker-reader".into())
+            .spawn(move || {
+                while let Ok(said) = wire::read_frame::<wire::FromWorker, _>(&mut reading) {
+                    link.heard(said);
+                }
+            })
+    };
+    if let Err(e) = reader {
+        // The pipe is already attached at this point, so without both of
+        // these the worker survives, attached, while the caller records a
+        // failure and holds nothing that could kill it.
+        link.detach();
+        started.kill();
+        return Err(
+            anyhow::Error::from(e).context("starting the thread that reads from the worker")
+        );
+    }
 
     Ok((started, landed))
 }

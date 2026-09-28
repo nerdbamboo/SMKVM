@@ -28,6 +28,14 @@
 //! from here has a deadline, and a write that misses it means the worker
 //! is dead: the pipe is dropped, the reach says no worker, the cursor goes
 //! home, and `watch` starts another.
+//!
+//! One second is still one second. The first caller to meet a wedged
+//! worker waits out the deadline holding the lock every other injection
+//! wants, so a stall shows as a second of dead pointer rather than an
+//! immediate hand-back. That is a hundred times better than the for-ever
+//! it replaced and not worth more machinery; if it ever does matter, the
+//! answer is to have the reader thread mark the link dead the moment its
+//! read fails, so later writers fail at once instead of queueing.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -37,7 +45,7 @@ use smkvm_layout::Monitor;
 use smkvm_proto::{Key, MouseButton, Scroll};
 use tokio::sync::mpsc::Sender;
 
-use crate::secure::reach::{Blocked, Reach};
+use crate::secure::reach::Reach;
 use crate::secure::windows::pipe::{Pipe, WRITE_WITHIN};
 use crate::secure::wire::{frame, FromWorker, ToWorker};
 
@@ -81,10 +89,16 @@ impl Link {
     /// accepted. Attaching first and checking afterwards -- which is what
     /// this did -- means an instruction has already been sent to a process
     /// whose build has not been established.
-    pub fn attach(&self, pipe: Pipe) {
+    pub fn attach(&self, pipe: Pipe, desktop: &str) {
         let swallowing = *self.swallow.lock().expect("not poisoned");
         *self.write.lock().expect("not poisoned") = Some(pipe);
-        self.reach.lock().expect("not poisoned").attached(true);
+        // The desktop the worker said it landed on, not the one it was
+        // sent to. Anything sent while those differ lands on the wrong
+        // desktop, which is worse than not landing.
+        self.reach
+            .lock()
+            .expect("not poisoned")
+            .attached(Some(desktop));
         self.say(&ToWorker::Swallow(swallowing));
     }
 
@@ -92,7 +106,7 @@ impl Link {
     pub fn detach(&self) {
         *self.write.lock().expect("not poisoned") = None;
         self.answers.lock().expect("not poisoned").monitors = None;
-        self.reach.lock().expect("not poisoned").attached(false);
+        self.reach.lock().expect("not poisoned").attached(None);
     }
 
     /// Where captured input should go. Set once, by the server glue.
@@ -100,12 +114,19 @@ impl Link {
         *self.capture.lock().expect("not poisoned") = Some(events);
     }
 
-    /// Is input reaching a screen, and if not, why not?
-    pub fn blocked(&self) -> Option<Blocked> {
+    /// What the service's poll of the input desktop saw, so that a
+    /// worker left behind on the desktop the input has moved off is known
+    /// to be the wrong place to send anything.
+    pub fn input_desktop(&self, desktop: Option<&str>) {
         self.reach
             .lock()
             .expect("not poisoned")
-            .blocked(Instant::now())
+            .input_desktop(desktop);
+    }
+
+    /// Is input reaching a screen, and if not, why not -- in words.
+    pub fn blocked(&self) -> Option<String> {
+        self.reach.lock().expect("not poisoned").why(Instant::now())
     }
 
     /// Would an injection land right now? The other half of [`Link::blocked`],
@@ -158,7 +179,17 @@ impl Link {
             // must go home now, not in a quarter of a second.
             *held = None;
             drop(held);
-            self.reach.lock().expect("not poisoned").attached(false);
+            self.reach.lock().expect("not poisoned").attached(None);
+        } else {
+            // Something went out. Whether it lands is the worker's to
+            // say, and it says so by *not* reporting a refusal; that is
+            // what ends a run of them and puts the backoff back to the
+            // start.
+            drop(held);
+            self.reach
+                .lock()
+                .expect("not poisoned")
+                .sent(Instant::now());
         }
         sent
     }

@@ -68,7 +68,7 @@ pub fn injection_blocked() -> Option<(smkvm_proto::SuspendReason, String)> {
         if let Some(link) = crate::secure::windows::link::worker() {
             return link
                 .blocked()
-                .map(|why| (SuspendReason::SecureDesktop, why.why().to_string()));
+                .map(|why| (SuspendReason::SecureDesktop, why));
         }
 
         match desktop::current() {
