@@ -283,7 +283,9 @@ whether it can set hooks there, or only inject; whether
 pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by `CreateNamedPipeW`; whether
 the overlapped waits behave as intended; whether the input-desktop poll
 sees the switch promptly enough to be useful; whether the service now
-stops when asked; whether a failed start does produce the restart actions;
+stops when asked; whether a failed start does produce the restart actions; whether a worker
+ever in fact fails to read its own desktop name, which is now a refusal
+to start rather than a loop;
 whether the quarter-second desktop comparison is in fact quick enough that
 nothing is typed into the wrong desktop, as opposed to merely narrower
 than it was; and what the clipboard and the drag catcher do in a process
@@ -373,13 +375,29 @@ permission problem. The session is checked before anything else in the
 loop now, and says so once rather than four times a second.
 
 **A refusal believed for a flat interval turns a stuck worker into a
-flapping cursor.** Two seconds, expire, take the cursor back, refused
-again, two seconds: a pointer jumping between machines on a beat, with a
-warning, an informational line and two network messages each turn. The
-interval doubles per consecutive refusal to a ceiling, and resets on an
-injection that goes out after the window closes with nothing coming back
-about it -- which is as close to "an injection that was not refused" as is
-observable, since refusals arrive asynchronously.
+flapping cursor, and the obvious way to reset the backoff cancels it.**
+The interval doubles per consecutive refusal to a ceiling. What took two
+attempts to get right is when a run of refusals is allowed to end. The
+first version reset the streak when an injection was *sent* on the
+reasoning that an injection which goes out and is not refused means the
+trouble is over -- which is sound, and worthless at that moment: the
+client only injects once the wait has expired, so the first injection
+after every resume satisfied the test by construction, before the
+refusal it was about could possibly have arrived. The doubling never took
+effect once. A simulation of a minute of continuous refusal measured 29
+resumes with that reset and 4 without it, so the reset was worse than
+having none, and the unit test asserted it as the intended behaviour.
+Both are fixed, and the test now asserts the *rate* over a simulated
+minute, because the rate is the thing that was wrong; the old test
+passed throughout because it never ran two cycles.
+
+The second attempt had the same shape in a different place: suspending
+is itself several injections -- the held keys are released and the
+pointer shown -- and those go out microseconds after the refusal that
+caused the suspension. Counting them made every refusal look survived one
+grace period later. A send is only evidence if it was made while input
+was believed to be landing, and only once the time a refusal would have
+taken to arrive has passed with nothing.
 
 **A service that does not answer a stop is killed, and on a server that
 means the keyboard is not given back.** The daemon has always stopped on
@@ -391,6 +409,29 @@ one `stopping()` that replaced `ctrl_c()` everywhere the daemon waited on
 it. A `STOP_PENDING` report also has to carry `dwWaitHint` and a rising
 `dwCheckPoint`, or the manager has no reason to keep waiting and treats
 the service as hung.
+
+**A worker that cannot name its desktop is a relaunch loop with the guard
+missing.** It used to report `"?"`, which was accepted. `"?"` can never
+equal the name the service's poll reads, so the service replaced the
+worker on every look -- and a deliberate replacement counts no failure,
+so the give-up counter never reached its limit: a process running as the
+system account started and killed four times a second, indefinitely. That
+is the same bad outcome as the relaunch loop fixed two rounds ago,
+through a door `watch` did not guard. Shut from both sides now: the
+worker fails rather than reporting a name it could not read,
+`wire::welcome` refuses a name that is not a desktop name, and
+`watch::worker_started` counts a worker that lands somewhere other than
+where it was sent as a failure of the desktop it was sent to, so any
+future name that can never match is given up on rather than looped on.
+
+**A `continue` skips everything below it, including the things that keep
+the truth current.** The "nobody is logged in yet" wait was put at the
+top of the minding loop, above both the worker-liveness check and the
+input-desktop update. Log off while a worker is running and neither ran:
+`Reach` went on holding a worker and a matching desktop for a screen with
+no session on it, claiming input was landing, until the next injection
+timed out a second later. The wait now goes *after* the observing, and
+detaches before it waits.
 
 **A structure read back out of a `Vec<u8>` is unaligned, and that is
 undefined whatever the hardware tolerates.** `GetTokenInformation` and
