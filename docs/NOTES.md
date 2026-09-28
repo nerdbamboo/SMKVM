@@ -219,19 +219,82 @@ half is under `secure/windows/`: `token` (the session's token and starting
 a process on a named desktop), `pipe`, `scm` (registering the service, and
 being it), `worker`, `link` (the daemon's end).
 
-**What has not been done.** None of it has run on Windows. `cargo xwin`
-links it and clippy is clean for both targets, and that is the whole of the
-evidence. In particular, unverified: whether `WTSQueryUserToken` succeeds
-(it wants SeTcbPrivilege *enabled*, not merely held -- see the
-`AdjustTokenPrivileges` in `token.rs`); whether a worker started with
-`lpDesktop = WinSta0\Winlogon` can actually set hooks there, or only
-inject; whether the pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by
-`CreateNamedPipeW` as written; whether the input-desktop poll sees the
-switch promptly enough to be useful; and what the clipboard and the drag
-catcher do in a process that is not the one with the person's desktop.
+**Whose token the worker wears, which is the whole thing.** The worker
+runs as LocalSystem, and it gets there by wearing the *service's own*
+token moved into the console session: `OpenProcessToken` on ourselves,
+`DuplicateTokenEx` to a primary token, `SetTokenInformation` with
+`TokenSessionId`, then `CreateProcessAsUser`. It does **not** wear the
+logged-in person's token, and the difference is not a nicety. A security
+review caught the first draft calling `WTSQueryUserToken`, which hands
+back the person's token, while three comments and this file said SYSTEM.
+Three separate things followed from that one line: the `Winlogon`
+desktop's access list admits LocalSystem and nobody else, so the process
+could not have been created there at all; on `Default` the worker would
+have run at medium integrity, which is *lower* than the scheduled task
+runs today, so `--system` would have been a regression traded for
+nothing; and the pipe's own list admits LocalSystem, so the worker could
+not have opened it either. `SetTokenInformation(TokenSessionId)` is what
+still needs `SeTcbPrivilege`, so `enable_tcb_privilege` stays.
 
-**How to tell whether it is working**, in the log on the client: `running as
-a service` and then `a worker is on the input desktop` with a desktop name.
+Nothing widens the access list on `WinSta0` or on any desktop, and
+nothing should. LocalSystem already has full access to both, which is
+exactly why this arrangement reaches the secure desktop; granting the
+interactive user access to the `Winlogon` desktop would take apart the
+boundary that makes a consent prompt mean anything. If anything in here
+ever reaches for `SetSecurityInfo` on a window station, something else
+has gone wrong.
+
+**The other half of the pipe's security.** The access list settles who may
+connect to the pipe the service made. It says nothing about whether the
+pipe the *worker* opened is that one, and any authenticated user may
+create a name in the pipe namespace. The first draft used a counter --
+`smkvm-worker-0000000000000001` from every boot -- and started the worker
+without waiting to see whether its own pipe had been created, so anything
+on the machine could have made that name first and had a process running
+as the system account connect to it, drive keystrokes onto whatever
+desktop it was attached to, and by default impersonate it outright. Three
+things now rule that out, written down as `acl::Guard` so that dropping
+one is a deletion somebody has to make on purpose: the name comes from
+`BCryptGenRandom`; the pipe is created and proved to be ours *before* the
+worker is started; the worker opens with `SECURITY_SQOS_PRESENT |
+SECURITY_IDENTIFICATION` and checks that the process serving the pipe is
+the system account before it says a word.
+
+**Every wait has a deadline.** The service's side of the pipe is
+overlapped for one reason: the first draft waited in `ConnectNamedPipe`
+with no timeout, on the thread that also minds the worker, so a worker
+that never arrived deadlocked that thread on its first poll -- no
+relaunch, no giving up, no stopping the service, and no error, because a
+hang is not an error. Writes are bounded too (`pipe::WRITE_WITHIN`): a
+worker wedged on the Winlogon desktop stops reading, the buffer fills,
+and an injection that blocks for ever holds the lock every other
+injection wants. A missed deadline means the worker is dead, which is a
+thing the rest of the program already knows what to do with.
+
+**What has not been done.** None of it has run on Windows. `cargo xwin`
+links it and clippy is clean for both targets; the workspace tests pass
+but they compile **none** of `secure/windows/`, so what they prove is the
+five pure modules (`acl`, `plan`, `reach`, `watch`, `wire`) and nothing
+else. In particular, unverified: whether a worker wearing a
+session-shifted SYSTEM token is in fact created on `WinSta0\Winlogon`;
+whether it can set hooks there, or only inject; whether
+`SetTokenInformation(TokenSessionId)` succeeds as written; whether the
+pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by `CreateNamedPipeW`; whether
+the overlapped waits behave as intended; whether the input-desktop poll
+sees the switch promptly enough to be useful; whether the service now
+stops when asked; and what the clipboard and the drag catcher do in a
+process that is not the one with the person's desktop.
+
+**Capture on the Winlogon desktop is the thing to test rather than reason
+about.** `worker.rs` already degrades when `Capture::start()` fails:
+injection without capture, which is the half that matters at a consent
+prompt, because what is typed there is typed from the other machine. The
+design survives the answer being "inject only" and it should stay that
+way.
+
+**How to tell whether it is working**, in the log on the client: `running
+as a service` and then `a worker is on the input desktop` with a desktop
+name.
 Raise a consent prompt and look for a second `a worker is on the input
 desktop`, this time saying `Winlogon`. If instead the log says `could not
 put a worker on WinSta0\Winlogon`, the message after it is the Win32 error
@@ -263,10 +326,31 @@ test was gone. This is what made the phantom above so persistent.
 first, and check the hash on both ends afterwards — a stale binary produces
 behaviour that matches no source you can read.
 
+**`sc.exe`'s printing is translated, so parsing it fails exactly where it
+is deployed.** `describe()` used to look for lines beginning `STATE` and
+`SERVICE_START_NAME`; on a Korean or Japanese Windows neither is there
+and both fell through to a question mark -- in the status line somebody
+reads when they are already trying to work out why nothing works. It asks
+the service control manager directly now
+(`QueryServiceConfigW` / `QueryServiceStatusEx`). `sc.exe` is still used
+to *change* things, where a person is watching and the exit code is the
+answer.
+
 **Windows makes its own firewall rules**, and when the prompt goes unanswered it
 makes *Block* ones, which beat any Allow. The port looked open from inside and
 was unreachable from outside. Remove the automatic rules and add an explicit
 allow.
+
+**A service that does not answer a stop is killed, and on a server that
+means the keyboard is not given back.** The daemon has always stopped on
+Ctrl+C, which a service never gets: the manager delivers a stop to a
+handler on a thread of its own. The first draft set a flag the daemon
+never read, so the service ran until the manager's patience ran out.
+There are now two ways to ask -- Ctrl+C and `ask_to_stop` -- arriving at
+one `stopping()` that replaced `ctrl_c()` everywhere the daemon waited on
+it. A `STOP_PENDING` report also has to carry `dwWaitHint` and a rising
+`dwCheckPoint`, or the manager has no reason to keep waiting and treats
+the service as hung.
 
 **Keystrokes must never be logged.** Debug logging briefly recorded every key to
 a file on disk, which is how a password would leak. The key identity is not
@@ -299,6 +383,18 @@ on a connection is what makes it stick -- `get_input_focus().reply()` is the
 cheap one. The same applies anywhere a connection is closed right after a
 send.
 
+**Asking "can input reach the screen" from a service asks about the wrong
+screen.** `platform::injection_blocked` and `injection_possible` answer by
+looking around the process that asks -- which desktop has the input, what
+is in front, does a probe land. In the daemon that is right, because the
+process that asks is the process that injects. In the service it is wrong
+in the silent direction: it asks from session 0 on `Service-0x0-3e7$`,
+which has no screen and never will, so the answer is "blocked" for ever
+however well the worker is doing, and the client suspends at the first
+refusal and never resumes. Both now take the worker's word in service
+mode (`secure::reach`), and the accounting is pure so it is tested on
+whatever machine is building.
+
 **A service is not in the person's session, and a null `lpDesktop` does not
 say so.** A service lives in session 0 on the window station
 `Service-0x0-3e7$`, which has no screen. `CreateProcessAsUser` with
@@ -309,8 +405,9 @@ or `WinSta0\Winlogon`; a bare desktop name means "on my station", which is
 the wrong one. `watch::on_station` is where that is built, and it is tested.
 
 **A privilege that is held is not a privilege that is on.**
-`WTSQueryUserToken` needs SeTcbPrivilege, which LocalSystem's token holds
-and which is *disabled* until `AdjustTokenPrivileges` switches it on. Worse,
+`SetTokenInformation(TokenSessionId)` needs SeTcbPrivilege, which
+LocalSystem's token holds and which is *disabled* until
+`AdjustTokenPrivileges` switches it on. Worse,
 that call reports "you do not have it" by succeeding and setting the last
 error to `ERROR_NOT_ALL_ASSIGNED`, so the obvious code says nothing and the
 failure appears two calls later as an access denial that looks like the
