@@ -317,6 +317,25 @@ input desktop` saying `Winlogon`, and between the two the client should
 log that it handed the cursor back because the worker had not moved yet.
 Then `smkvm service stop` and confirm it stops rather than timing out.
 
+**The two desktop names must agree, and that is the one check no test on
+a Linux machine can make.** Each worker logs
+`the worker is on the desktop and connected` with a `desktop=` field, and
+the service logs `a worker is on the input desktop` with its own
+`desktop=`. Those two come from different places -- the worker's
+`desktop::ours()` and the name the service polled -- so when they agree,
+the worker really is where the service thinks it is. Read them as a pair
+at each switch:
+
+    desktop=Default   when the ordinary desktop has the input
+    desktop=Winlogon  while a consent prompt or the lock screen is up
+
+A worker whose line says `Default` while a prompt is up is the bug
+described in the traps below, back again: input would be going to a
+worker bound to `Winlogon` and landing nowhere. There is no way to
+exercise this without Windows -- the call it turns on exists only there,
+and the fix removed the decision rather than making it testable -- so
+this log pair is the whole of the evidence for it.
+
 **Getting out of it.** `smkvm service uninstall` removes whichever of the
 two is registered, and `smkvm service install` with no flag puts the
 scheduled task back. The two are never both registered; `secure::plan` is
@@ -409,6 +428,24 @@ one `stopping()` that replaced `ctrl_c()` everywhere the daemon waited on
 it. A `STOP_PENDING` report also has to carry `dwWaitHint` and a rising
 `dwCheckPoint`, or the manager has no reason to keep waiting and treats
 the service as hung.
+
+**"Which desktop has the input" and "which desktop am I on" are different
+questions, and the call that answers the first will hand you a name that
+looks like an answer to the second.** `desktop::current()` answers the
+first; its `Elsewhere(name)` carries the *input* desktop's name. The
+worker used it to report its own, which was harmless until
+`worker_started` began comparing where a worker landed against where it
+was sent. Then: a prompt appears, the service starts a worker for
+`Winlogon`, the person dismisses the prompt before the worker connects,
+and the worker -- genuinely bound to `Winlogon` -- looks at the input,
+sees `Default`, and reports `"Default"`. The service now believes the
+worker is exactly where the input is, so every look is `Step::Stay` and
+the reach agrees, while every keystroke goes to a worker that can only
+inject onto a desktop nobody is looking at. They vanish, silently and
+confidently, until the next desktop switch happens to replace it.
+`desktop::ours()` is the call for this, and the worker no longer looks at
+the input desktop at all -- not even in a match arm, so the wrong arm
+cannot be picked again.
 
 **A worker that cannot name its desktop is a relaunch loop with the guard
 missing.** It used to report `"?"`, which was accepted. `"?"` can never
