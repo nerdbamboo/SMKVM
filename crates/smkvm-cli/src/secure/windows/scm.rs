@@ -501,30 +501,6 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
     while !STOPPING.load(Ordering::SeqCst) {
         std::thread::sleep(watch::LOOK_EVERY);
 
-        // Before anything else, because it is a wait rather than a fault
-        // and must not be counted as one. At boot, before the first
-        // login, there may be no console session for a moment while the
-        // input desktop is already `Winlogon`; feeding that to
-        // `worker_failed` exhausted `GIVE_UP_AFTER` within about a second
-        // and latched give-up on `Winlogon`, so the lock screen was
-        // unreachable until somebody had logged in once -- with a log
-        // line reading like a permission problem. `console_session`'s own
-        // doc comment always said this was a wait; now the code agrees.
-        if token::console_session().is_none() {
-            if !said_no_session {
-                tracing::info!(
-                    "nobody is logged in at the screen yet, so there is no session to put \
-                     a worker in. Waiting; this is not a failure"
-                );
-                said_no_session = true;
-            }
-            continue;
-        }
-        if said_no_session {
-            tracing::info!("a session is at the screen now");
-            said_no_session = false;
-        }
-
         if let Some(started) = &running {
             if started.gone() {
                 tracing::warn!("the worker exited; another will be started");
@@ -568,6 +544,34 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
             }
         };
 
+        // Only now, once what is true has been recorded. This check used
+        // to sit at the top of the loop and `continue` past both the
+        // liveness check above and the desktop update just made, which
+        // meant that logging off while a worker was running left `Reach`
+        // holding a worker and a matching desktop for a screen that no
+        // longer had a session on it -- claiming input was landing, and
+        // only unstuck when the next injection timed out a second later.
+        // A stale reach claiming reach is the whole subject of this
+        // module, so the wait goes after the observing, not before it.
+        if token::console_session().is_none() {
+            if !said_no_session {
+                tracing::info!(
+                    "nobody is logged in at the screen yet, so there is no session to put \
+                     a worker in. Waiting; this is not a failure"
+                );
+                said_no_session = true;
+            }
+            // And nothing is reachable meanwhile. Said plainly rather
+            // than left to be discovered by a write that fails: without
+            // a session there is no screen for anything to land on.
+            link.detach();
+            continue;
+        }
+        if said_no_session {
+            tracing::info!("a session is at the screen now");
+            said_no_session = false;
+        }
+
         match watch.saw(seen) {
             Step::Stay => {}
             Step::GiveUp { desktop, tries } => tracing::error!(
@@ -597,7 +601,7 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
                             pid = started.pid,
                             "a worker is on the input desktop"
                         );
-                        watch.worker_started(&landed, Instant::now());
+                        watch.worker_started(&landed, &desktop, Instant::now());
                         running = Some(started);
                     }
                     Err(e) => {

@@ -115,8 +115,32 @@ pub enum NotWelcome {
     WrongProtocol { theirs: u32, ours: u32 },
     #[error("the worker said something else before saying hello")]
     SpokeOutOfTurn,
-    #[error("the worker would not say which desktop it is on")]
-    NamelessDesktop,
+    #[error(
+        "the worker called its desktop {0:?}, which is not a name a desktop has. It could \
+         not read its own, and a worker that does not know where it is cannot be placed"
+    )]
+    NamelessDesktop(String),
+}
+
+/// Is this something Windows would call a desktop?
+///
+/// `Default`, `Winlogon` and `Screen-saver` are the ones that matter, and
+/// a desktop name is a window-station object name: letters, digits and a
+/// little punctuation, never empty. The reason to check rather than take
+/// whatever arrives is not tidiness. A worker that cannot read its own
+/// desktop used to report `"?"`, which was accepted -- and then `"?"` can
+/// never equal the name the service's poll reads, so the service replaces
+/// the worker on every look. A deliberate replacement counts no failure,
+/// so nothing ever gave up: a process running as the system account
+/// started and killed four times a second, indefinitely. Refusing the
+/// name turns that into a start that failed, which the give-up counter
+/// does cover.
+fn is_a_desktop_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.'))
 }
 
 /// Read the worker's first frame, and say whether it may be spoken to.
@@ -135,10 +159,10 @@ pub fn welcome(first: FromWorker) -> Result<String, NotWelcome> {
                 ours: WORKER_PROTOCOL,
             })
         }
-        FromWorker::Ready { desktop, .. } if desktop.trim().is_empty() => {
-            Err(NotWelcome::NamelessDesktop)
+        FromWorker::Ready { desktop, .. } if !is_a_desktop_name(desktop.trim()) => {
+            Err(NotWelcome::NamelessDesktop(desktop))
         }
-        FromWorker::Ready { desktop, .. } => Ok(desktop),
+        FromWorker::Ready { desktop, .. } => Ok(desktop.trim().to_string()),
         _ => Err(NotWelcome::SpokeOutOfTurn),
     }
 }
@@ -316,8 +340,38 @@ mod tests {
                 protocol: WORKER_PROTOCOL,
                 desktop: "  ".into()
             }),
-            Err(NotWelcome::NamelessDesktop)
+            Err(NotWelcome::NamelessDesktop("  ".into()))
         );
+    }
+
+    #[test]
+    fn a_worker_that_could_not_read_its_own_desktop_is_not_welcome() {
+        // `"?"` was what the worker reported when `GetUserObjectInformationW`
+        // would not answer, and it was accepted. A name the service's poll
+        // can never match makes the service replace the worker on every
+        // look, and a deliberate replacement counts no failure -- so a
+        // process running as the system account is started and killed four
+        // times a second for ever. Refused here, it is a start that failed,
+        // which the give-up counter covers.
+        for bad in ["?", "", "   ", "Win\\logon", "a\u{0}b", &"x".repeat(65)] {
+            assert!(
+                welcome(FromWorker::Ready {
+                    protocol: WORKER_PROTOCOL,
+                    desktop: bad.into()
+                })
+                .is_err(),
+                "{bad:?} was welcomed"
+            );
+        }
+        for good in ["Default", "Winlogon", "Screen-saver"] {
+            assert_eq!(
+                welcome(FromWorker::Ready {
+                    protocol: WORKER_PROTOCOL,
+                    desktop: good.into()
+                }),
+                Ok(good.to_string())
+            );
+        }
     }
 
     #[test]

@@ -54,6 +54,16 @@ use std::time::{Duration, Instant};
 /// question is asked again by trying.
 pub const REFUSAL_STANDS_FOR: Duration = Duration::from_secs(2);
 
+/// How long a refusal has to arrive in, for its absence to mean anything.
+///
+/// A refusal travels from the worker's failed `SendInput`, down the pipe,
+/// through the service's reader thread. That is sub-millisecond work; a
+/// second is a thousand times it. The number matters because "this
+/// injection was not refused" is the only evidence that a run of refusals
+/// is over, and that evidence does not exist at the moment of sending --
+/// it exists once this much time has passed with nothing coming back.
+pub const REFUSAL_ARRIVES_WITHIN: Duration = Duration::from_secs(1);
+
 /// The longest a run of refusals is believed for.
 ///
 /// A flat two seconds turns a *persistent* refusal into a flap: believed,
@@ -72,6 +82,9 @@ pub struct Reach {
     /// The desktop that had the input when the service last looked.
     input_on: Option<String>,
     refused_at: Option<Instant>,
+    /// The first injection sent since the last refusal, if any has been.
+    /// Not evidence of anything yet -- see [`Reach::run_is_over`].
+    sent_at: Option<Instant>,
     /// How many refusals in a row, for the backoff.
     streak: u32,
 }
@@ -100,12 +113,28 @@ impl Reach {
         // across would suspend the cursor over something that happened on
         // a desktop that is no longer there.
         self.refused_at = None;
+        self.sent_at = None;
         self.streak = 0;
     }
 
     /// What the service's poll saw. `None` when the input desktop would
     /// not say its name, which for the system account should not happen;
     /// the last name read is kept rather than guessed at.
+    ///
+    /// Keeping it cuts both ways and the asymmetry is deliberate. A known
+    /// *mismatch* must survive a look that read nothing, or one failed
+    /// poll would say the worker is in the right place when the last
+    /// thing actually observed said it was not -- and that is the case
+    /// with the bad outcome. A known *agreement* also survives, so if the
+    /// input moves at the same moment the poll starts failing, this keeps
+    /// saying reachable until a poll succeeds. That is the smaller risk
+    /// of the two and it needs `OpenInputDesktop` to fail for the system
+    /// account, which is the thing this module elsewhere says should not
+    /// happen; `watch` holds still on the same reading for the same
+    /// reason. The converse -- treating an unreadable poll as unknown and
+    /// suspending -- would hand the cursor back every time a poll
+    /// hiccupped. If it ever does matter, the answer is to age the
+    /// reading and call a name older than a few polls unknown.
     pub fn input_desktop(&mut self, desktop: Option<&str>) {
         if let Some(desktop) = desktop {
             self.input_on = Some(desktop.to_owned());
@@ -114,24 +143,67 @@ impl Reach {
 
     /// The worker reported a refused injection.
     pub fn refused(&mut self, at: Instant) {
+        // Whether this refusal continues a run or starts a new one is
+        // decided here, by whether the previous run had been shown to be
+        // over. Deciding it when the injection was *sent* is what broke
+        // this: see [`Reach::sent`].
+        if self.run_is_over(at) {
+            self.streak = 0;
+        }
         self.refused_at = Some(at);
+        self.sent_at = None;
         self.streak = self.streak.saturating_add(1);
     }
 
-    /// An injection went to the worker and nothing has come back refusing
-    /// it, long enough after the last refusal that the last refusal is
-    /// over. This is what ends a run and puts the backoff back to the
-    /// start; a refusal is reported asynchronously, so "was not refused"
-    /// can only be read as "was sent, and the window in which a refusal
-    /// would have arrived has passed".
+    /// An injection went to the worker. Recorded, not believed.
+    ///
+    /// This used to end the run of refusals there and then, on the
+    /// reasoning that an injection which went out and was not refused is
+    /// evidence the trouble is over. The reasoning is sound and the
+    /// timing made it worthless, in a way that measuring found and
+    /// reading did not: the client only injects once `blocked()` has
+    /// returned `None`, which happens exactly when the current interval
+    /// expires, so the very first injection after every resume satisfied
+    /// the test by construction -- and did so before the refusal for that
+    /// injection could possibly have arrived. The streak reset on every
+    /// cycle and the doubling below never took effect at all. Simulated
+    /// over a minute of a worker refusing everything: twenty-nine resumes
+    /// with the reset, four without it. The reset was worse than not
+    /// having one.
+    ///
+    /// So the send is only remembered. What makes it evidence is
+    /// [`REFUSAL_ARRIVES_WITHIN`] passing with nothing coming back, which
+    /// is a judgement about the past and can only be made later.
     pub fn sent(&mut self, at: Instant) {
-        let Some(last) = self.refused_at else {
+        // Only an injection made while input was believed to be landing
+        // says anything about whether it lands. Suspending is itself
+        // several injections -- the keys held are released and the
+        // pointer is shown -- and those go out microseconds after the
+        // refusal that caused the suspension. Counting them would make
+        // every refusal look like it had been survived one grace period
+        // later, which is the same defect as resetting at send time
+        // wearing different clothes, and a test caught it being written
+        // for the second time.
+        if self.blocked(at).is_some() {
             return;
-        };
-        if at.saturating_duration_since(last) >= self.believed_for() {
-            self.refused_at = None;
-            self.streak = 0;
         }
+        // The first send since the last refusal is the one the grace
+        // period is measured from; later ones say nothing new.
+        if self.sent_at.is_none() {
+            self.sent_at = Some(at);
+        }
+    }
+
+    /// Has an injection survived long enough with no refusal to say the
+    /// run of refusals is over?
+    fn run_is_over(&self, now: Instant) -> bool {
+        let (Some(sent), Some(refused)) = (self.sent_at, self.refused_at) else {
+            return false;
+        };
+        // `sent_at` is cleared by every refusal, so a send that is still
+        // recorded is necessarily one no refusal has followed. All that
+        // remains is whether a refusal would have arrived by now.
+        sent > refused && now.saturating_duration_since(sent) >= REFUSAL_ARRIVES_WITHIN
     }
 
     /// How long the current run of refusals is believed for.
@@ -161,7 +233,10 @@ impl Reach {
             }
         }
         match self.refused_at {
-            Some(at) if now.saturating_duration_since(at) < self.believed_for() => {
+            Some(at)
+                if now.saturating_duration_since(at) < self.believed_for()
+                    && !self.run_is_over(now) =>
+            {
                 Some(Blocked::Refused)
             }
             _ => None,
@@ -325,22 +400,123 @@ mod tests {
         assert_eq!(reach.blocked(now + REFUSAL_BACKS_OFF_TO), None);
     }
 
+    /// One minute of a worker that refuses every injection, at the
+    /// granularity the real loop runs at, returning the gap before each
+    /// resume.
+    ///
+    /// The client only injects once `possible()` is true, and the refusal
+    /// for that injection comes back a moment later. That is the whole
+    /// cycle, and its *rate* is the property that was wrong: the doubling
+    /// and the ceiling were both implemented correctly and were both
+    /// cancelled by resetting the streak at the moment of sending. A test
+    /// that asserted the interval doubles once passed throughout, because
+    /// it never ran two cycles.
+    fn resumes_in_a_minute() -> Vec<Duration> {
+        let start = Instant::now();
+        let mut reach = settled("Default");
+        // The first injection has already been refused; the client is
+        // suspended and waiting to try again.
+        reach.sent(start);
+        reach.refused(start);
+
+        let mut suspended = true;
+        let mut refusal_due: Option<Instant> = None;
+        let mut resumes = Vec::new();
+        let mut last = start;
+
+        for tick in 1..=6_000u64 {
+            let now = start + Duration::from_millis(10 * tick);
+            if let Some(due) = refusal_due {
+                if due <= now {
+                    reach.refused(due);
+                    refusal_due = None;
+                    suspended = true;
+                }
+            }
+            if suspended && reach.possible(now) {
+                suspended = false;
+                resumes.push(now.saturating_duration_since(last));
+                last = now;
+                // Resuming injects, and that injection is refused a
+                // moment later, like every other one.
+                reach.sent(now);
+                refusal_due = Some(now + Duration::from_millis(10));
+            }
+        }
+        resumes
+    }
+
     #[test]
-    fn an_injection_that_was_not_refused_puts_the_backoff_back_to_the_start() {
+    fn a_worker_that_refuses_everything_is_not_retried_thirty_times_a_minute() {
+        // The measurement, not the argument. Before the fix this was 29
+        // resumes a minute, every gap 2.01 s: the person watches the
+        // pointer jump between machines twice a second-and-a-bit for as
+        // long as the worker stays stuck, with a warning, an
+        // informational line and two network messages each time. With the
+        // reset simply deleted it was 4. This asserts the rate, because
+        // the rate is what was wrong; asserting that the interval doubles
+        // once passed the whole time it was broken.
+        let resumes = resumes_in_a_minute();
+        assert!(
+            resumes.len() <= 6,
+            "{} resumes in a minute under continuous refusal: {resumes:?}",
+            resumes.len()
+        );
+        // And it really is backing off rather than merely being slow.
+        for pair in resumes.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "the wait got shorter across a run of refusals: {resumes:?}"
+            );
+        }
+        assert!(
+            resumes
+                .last()
+                .is_some_and(|gap| *gap >= REFUSAL_STANDS_FOR * 4),
+            "the last wait of the minute should be well past the first: {resumes:?}"
+        );
+    }
+
+    #[test]
+    fn an_injection_that_outlives_the_wait_for_a_refusal_ends_the_run() {
         let mut reach = settled("Default");
         let now = Instant::now();
         reach.refused(now);
         reach.refused(now);
         reach.refused(now);
-        // Something went out after the run's window closed and nothing
-        // came back about it, so the run is over.
-        reach.sent(now + REFUSAL_BACKS_OFF_TO);
-        let later = now + REFUSAL_BACKS_OFF_TO;
+        // Something went out after the run's window closed, and the time
+        // in which a refusal would have come back has passed with
+        // nothing. Only now is the run over.
+        let out = now + REFUSAL_BACKS_OFF_TO;
+        reach.sent(out);
+        let later = out + REFUSAL_ARRIVES_WITHIN;
         reach.refused(later);
         assert_eq!(
             reach.blocked(later + REFUSAL_STANDS_FOR),
             None,
             "the next refusal should be believed for the first interval again"
+        );
+    }
+
+    #[test]
+    fn an_injection_is_not_evidence_at_the_moment_it_is_sent() {
+        // The defect exactly. The client injects the instant the wait
+        // expires, so a send judged at send time always looks like
+        // success -- before the refusal it is about could have arrived.
+        let mut reach = settled("Default");
+        let now = Instant::now();
+        reach.refused(now);
+        reach.refused(now);
+        let expired = now + REFUSAL_STANDS_FOR * 2;
+        assert_eq!(reach.blocked(expired), None, "the wait is up");
+        reach.sent(expired);
+        // The refusal for that injection lands a moment later. It must
+        // continue the run rather than start a new one.
+        reach.refused(expired + Duration::from_millis(10));
+        assert_eq!(
+            reach.blocked(expired + Duration::from_millis(10) + REFUSAL_STANDS_FOR * 2),
+            Some(Blocked::Refused),
+            "the third refusal was believed for no longer than the second"
         );
     }
 

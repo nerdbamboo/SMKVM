@@ -48,9 +48,17 @@ pub fn run(pipe_name: &str) -> Result<()> {
     // since; it is the service's business to know, and only this process
     // can see from here.
     let here = match desktop::current() {
-        desktop::InputDesktop::Ours => our_desktop(),
         desktop::InputDesktop::Elsewhere(name) => name,
-        desktop::InputDesktop::OutOfReach => our_desktop(),
+        // Either the input desktop is this one, or it would not say --
+        // and this process's own desktop is the answer to the question
+        // being asked either way, which is where *it* is.
+        desktop::InputDesktop::Ours | desktop::InputDesktop::OutOfReach => desktop::ours()
+            .context(
+                "this worker cannot read the name of the desktop it is on. It is not \
+                 started rather than reported as being somewhere unnameable: the service \
+                 compares that name against the desktop with the input, and a name that \
+                 can never match makes it replace this process on every look",
+            )?,
     };
     say(
         &mut to_service,
@@ -163,9 +171,4 @@ fn mirror(event: Captured) -> Saw {
         Captured::Wheel(scroll) => Saw::Wheel(scroll),
         Captured::Key { key, down, repeat } => Saw::Key { key, down, repeat },
     }
-}
-
-/// The name of the desktop this process is on.
-fn our_desktop() -> String {
-    desktop::ours().unwrap_or_else(|| "?".into())
 }

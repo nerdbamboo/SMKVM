@@ -161,9 +161,25 @@ impl Watch {
     /// let the relaunch loop run for ever. It is cleared in
     /// [`Watch::worker_gone`], once the worker has lasted long enough to
     /// have been worth starting.
-    pub fn worker_started(&mut self, desktop: &str, at: Instant) {
-        self.worker_on = Some(desktop.to_string());
+    ///
+    /// `wanted` is the desktop it was sent to. A worker that lands
+    /// somewhere else is counted as a failure of the desktop it was sent
+    /// to, and that is the second door into the relaunch loop. The first
+    /// was a worker that died at once, which [`Watch::worker_gone`]
+    /// covers. This one is a worker that lives but is never where it was
+    /// asked to be: the next look sees the mismatch, replaces it, and a
+    /// replacement counts nothing -- so a process running as the system
+    /// account is started and killed four times a second with no counter
+    /// ever reaching its limit. It was reachable through a desktop name
+    /// that could not be read, and `wire::welcome` now refuses those; this
+    /// is the same door shut from the other side, so that the next name
+    /// which cannot match does not reopen it.
+    pub fn worker_started(&mut self, landed_on: &str, wanted: &str, at: Instant) {
+        self.worker_on = Some(landed_on.to_string());
         self.worker_since = Some(at);
+        if landed_on != wanted {
+            self.count_failure(wanted);
+        }
     }
 
     /// A worker could not be started for this desktop.
@@ -240,7 +256,7 @@ mod tests {
         let mut watch = Watch::new();
         let now = Instant::now();
         saw(&mut watch, "Default");
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Default", now);
         assert_eq!(saw(&mut watch, "Default"), Step::Stay);
         assert_eq!(saw(&mut watch, "Default"), Step::Stay);
     }
@@ -250,7 +266,7 @@ mod tests {
         let mut watch = Watch::new();
         let now = Instant::now();
         saw(&mut watch, "Default");
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Default", now);
         assert_eq!(
             saw(&mut watch, "Winlogon"),
             Step::Move {
@@ -258,7 +274,7 @@ mod tests {
                 on: r"WinSta0\Winlogon".into()
             }
         );
-        watch.worker_started("Winlogon", now);
+        watch.worker_started("Winlogon", "Winlogon", now);
         assert_eq!(saw(&mut watch, "Winlogon"), Step::Stay);
         assert_eq!(
             saw(&mut watch, "Default"),
@@ -274,7 +290,7 @@ mod tests {
         let mut watch = Watch::new();
         let now = Instant::now();
         saw(&mut watch, "Default");
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Default", now);
         assert_eq!(watch.saw(Seen::Unreadable), Step::Stay);
         assert_eq!(watch.worker_on(), Some("Default"));
     }
@@ -287,7 +303,7 @@ mod tests {
         let mut watch = Watch::new();
         let now = Instant::now();
         saw(&mut watch, "Winlogon");
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Winlogon", now);
         assert_eq!(
             saw(&mut watch, "Winlogon"),
             Step::Move {
@@ -302,7 +318,7 @@ mod tests {
         let mut watch = Watch::new();
         let now = Instant::now();
         saw(&mut watch, "Default");
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Default", now);
         watch.worker_gone(later(now));
         assert!(matches!(saw(&mut watch, "Default"), Step::Move { .. }));
     }
@@ -337,7 +353,7 @@ mod tests {
         let mut now = Instant::now();
         for _ in 0..GIVE_UP_AFTER {
             assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
-            watch.worker_started("Winlogon", now);
+            watch.worker_started("Winlogon", "Winlogon", now);
             now += Duration::from_millis(250);
             watch.worker_gone(now);
         }
@@ -362,7 +378,7 @@ mod tests {
             watch.worker_failed("Winlogon");
         }
         saw(&mut watch, "Winlogon");
-        watch.worker_started("Winlogon", now);
+        watch.worker_started("Winlogon", "Winlogon", now);
         watch.worker_gone(later(now));
         for _ in 0..GIVE_UP_AFTER {
             assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
@@ -379,10 +395,10 @@ mod tests {
         let mut watch = Watch::new();
         let now = Instant::now();
         saw(&mut watch, "Default");
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Default", now);
         watch.worker_gone(later(now));
         saw(&mut watch, "Winlogon");
-        watch.worker_started("Winlogon", later(now));
+        watch.worker_started("Winlogon", "Winlogon", later(now));
         watch.worker_gone(later(later(now)));
         // Nothing has been counted against anything.
         assert!(matches!(saw(&mut watch, "Default"), Step::Move { .. }));
@@ -401,7 +417,49 @@ mod tests {
         // And coming back to it is a fresh question, because whatever was
         // in the way -- a desktop still being built, a session still
         // logging in -- may not be any more.
-        watch.worker_started("Default", now);
+        watch.worker_started("Default", "Default", now);
+        assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
+    }
+
+    #[test]
+    fn a_worker_that_never_lands_where_it_was_sent_is_given_up_on() {
+        // The second door into the relaunch loop. A worker that starts,
+        // says hello and lives, but reports a desktop that is not the one
+        // it was sent to, is replaced on the very next look -- and a
+        // replacement counts no failure, so without this nothing ever
+        // reaches the limit and a process running as the system account
+        // is started and killed four times a second for ever.
+        let mut watch = Watch::new();
+        let now = Instant::now();
+        for _ in 0..GIVE_UP_AFTER {
+            assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
+            watch.worker_started("somewhere else", "Winlogon", now);
+        }
+        assert_eq!(
+            saw(&mut watch, "Winlogon"),
+            Step::GiveUp {
+                desktop: "Winlogon".into(),
+                tries: GIVE_UP_AFTER
+            }
+        );
+    }
+
+    #[test]
+    fn one_worker_losing_a_race_to_a_moving_input_is_not_held_against_it() {
+        // The input really can move between the decision and the start,
+        // and that is not the desktop's fault. One mismatch counts, and a
+        // worker that then lands where it was sent and lasts clears it.
+        let mut watch = Watch::new();
+        let now = Instant::now();
+        saw(&mut watch, "Winlogon");
+        watch.worker_started("Default", "Winlogon", now);
+        saw(&mut watch, "Winlogon");
+        watch.worker_started("Winlogon", "Winlogon", now);
+        watch.worker_gone(later(now));
+        for _ in 0..GIVE_UP_AFTER - 1 {
+            assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
+            watch.worker_failed("Winlogon");
+        }
         assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
     }
 
