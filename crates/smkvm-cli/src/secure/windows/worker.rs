@@ -43,23 +43,34 @@ pub fn run(pipe_name: &str) -> Result<()> {
     })?;
     let mut from_service = to_service.share()?;
 
-    // Which desktop this actually is, asked rather than assumed. The
+    // Which desktop *this process* is on, asked rather than assumed. The
     // service decided some milliseconds ago and the input may have moved
-    // since; it is the service's business to know, and only this process
-    // can see from here.
-    let here = match desktop::current() {
-        desktop::InputDesktop::Elsewhere(name) => name,
-        // Either the input desktop is this one, or it would not say --
-        // and this process's own desktop is the answer to the question
-        // being asked either way, which is where *it* is.
-        desktop::InputDesktop::Ours | desktop::InputDesktop::OutOfReach => desktop::ours()
-            .context(
-                "this worker cannot read the name of the desktop it is on. It is not \
-                 started rather than reported as being somewhere unnameable: the service \
-                 compares that name against the desktop with the input, and a name that \
-                 can never match makes it replace this process on every look",
-            )?,
-    };
+    // since; it is the service's business to reconcile the two, and only
+    // this process can answer the half about itself.
+    //
+    // Deliberately not `desktop::current()`, and deliberately not a match
+    // on it. That call answers a different question -- which desktop has
+    // the *input*, and whether it is this one -- and its `Elsewhere(name)`
+    // carries the input desktop's name, not ours. Reporting that name
+    // here was a real bug with a silent, confident failure: a worker
+    // started for `Winlogon` while the person dismisses the prompt before
+    // it connects is genuinely bound to `Winlogon`, sees the input back on
+    // `Default`, and says `"Default"`. The service then believes the
+    // worker is exactly where the input is, so every look is `Step::Stay`
+    // and the reach agrees, while every keystroke goes to a worker that
+    // can only inject onto a desktop nobody is looking at. They vanish
+    // until the next desktop switch happens to replace it.
+    //
+    // So the input desktop is not consulted at all, and the match that
+    // made it possible to consult the wrong arm of it is gone with it:
+    // there is exactly one question here and exactly one call that
+    // answers it.
+    let here = desktop::ours().context(
+        "this worker cannot read the name of the desktop it is on. It is not started \
+         rather than reported as being somewhere unnameable: the service compares that \
+         name against the desktop with the input, and a name that can never match makes \
+         it replace this process on every look",
+    )?;
     say(
         &mut to_service,
         &FromWorker::Ready {

@@ -62,6 +62,21 @@ pub const REFUSAL_STANDS_FOR: Duration = Duration::from_secs(2);
 /// injection was not refused" is the only evidence that a run of refusals
 /// is over, and that evidence does not exist at the moment of sending --
 /// it exists once this much time has passed with nothing coming back.
+///
+/// **This is what the backoff hangs on, so it is what to look at if the
+/// backoff ever stops working.** A refusal that took longer than this to
+/// arrive would be a refusal that arrived after its own injection had
+/// already been counted as survived, and the run would end on every
+/// cycle -- which collapses the doubling to a flat
+/// [`REFUSAL_STANDS_FOR`], the exact defect the doubling was added to
+/// fix, silently and with the code still reading as though it backs off.
+/// The margin today is about a thousandfold, so it holds comfortably;
+/// what would eat it is putting anything slow between the worker's
+/// `SendInput` and the service reading the frame -- a queue, a retry, a
+/// batching layer, a worker that reports refusals on a timer rather than
+/// as they happen. Anyone changing that path should change this number
+/// with it, or the test that measures the resume rate over a simulated
+/// minute will be the only thing that notices.
 pub const REFUSAL_ARRIVES_WITHIN: Duration = Duration::from_secs(1);
 
 /// The longest a run of refusals is believed for.
