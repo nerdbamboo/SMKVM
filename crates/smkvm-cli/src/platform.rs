@@ -20,6 +20,13 @@ use crate::clipboard::Backends;
 pub fn injector() -> Result<Box<dyn InjectAndReport>> {
     #[cfg(windows)]
     {
+        // Running as the service, the screen is reached through a worker on
+        // whichever desktop has the input rather than by calling SendInput
+        // from here -- which from a service in session 0 would reach
+        // nothing at all. Everything above this is unchanged and unaware.
+        if let Some(link) = crate::secure::windows::link::worker() {
+            return Ok(Box::new(crate::secure::windows::link::Arm(link)));
+        }
         Ok(Box::new(smkvm_input::platform::windows::WindowsInput::new()))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -230,6 +237,15 @@ pub fn native_drop(paths: Vec<PathBuf>) -> bool {
 pub fn start_capture(events: Sender<Event>) -> Result<CaptureHandle> {
     use smkvm_input::platform::windows::capture::{Capture, Captured};
 
+    // As the service, the hooks are the worker's: they have to be on the
+    // desktop that has the input, and a service's own desktop has none.
+    // What arrives here is what the worker saw, which is the same events by
+    // the time anything above this sees them.
+    if crate::secure::windows::link::capture_through_worker(events.clone()) {
+        tracing::info!("the keyboard and mouse are watched by a worker on the input desktop");
+        return Ok(CaptureHandle::ThroughWorker);
+    }
+
     let (capture, incoming) = Capture::start().context("installing the input hooks")?;
     std::thread::Builder::new()
         .name("smkvm-capture-pump".into())
@@ -268,19 +284,30 @@ pub fn start_capture(events: Sender<Event>) -> Result<CaptureHandle> {
             }
         })
         .context("starting the capture pump")?;
-    Ok(CaptureHandle { capture })
+    Ok(CaptureHandle::Here { capture })
 }
 
 #[cfg(windows)]
-pub struct CaptureHandle {
-    capture: smkvm_input::platform::windows::capture::Capture,
+pub enum CaptureHandle {
+    /// The hooks are in this process, on this process's desktop.
+    Here {
+        capture: smkvm_input::platform::windows::capture::Capture,
+    },
+    /// The hooks are a worker's, on whichever desktop has the input.
+    ThroughWorker,
 }
 
 #[cfg(windows)]
 impl CaptureHandle {
     /// Start or stop letting local input through to this machine.
     pub fn set_swallow(&self, swallow: bool) {
-        self.capture.set_swallow(swallow);
+        match self {
+            CaptureHandle::Here { capture } => capture.set_swallow(swallow),
+            // Remembered as well as sent: a worker started after this, on
+            // a desktop the cursor has just left for, must swallow from its
+            // first event rather than from the next time the answer changes.
+            CaptureHandle::ThroughWorker => crate::secure::windows::link::set_swallow(swallow),
+        }
     }
 }
 

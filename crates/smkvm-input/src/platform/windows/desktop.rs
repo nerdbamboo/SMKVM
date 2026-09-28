@@ -82,3 +82,17 @@ pub fn current() -> InputDesktop {
         (None, _) => InputDesktop::OutOfReach,
     }
 }
+
+/// The name of the desktop this thread is on.
+///
+/// Ordinarily the same as [`current`] and not worth asking, since a process
+/// in the person's session is on `Default` and stays there. It is worth
+/// asking from a process the service attached to a desktop by name: what it
+/// was attached to and what has the input now are two different questions,
+/// and only the answer to the first can be given from inside.
+pub fn ours() -> Option<String> {
+    // SAFETY: the current thread always has a desktop, and the handle it
+    // gives back is not ours to close.
+    let ours = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
+    name_of(HANDLE(ours.0))
+}

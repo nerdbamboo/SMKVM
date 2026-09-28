@@ -4,6 +4,7 @@ mod client;
 mod clipboard;
 mod hello;
 mod platform;
+mod secure;
 mod server;
 mod service;
 mod transfer;
@@ -117,6 +118,18 @@ enum Command {
     Forget { name_or_id: String },
     /// Print this machine's displays, and stop.
     Monitors,
+    /// How the service control manager starts this on Windows. Not a
+    /// command to run by hand: it hands the process to the manager, which
+    /// answers nothing when there is no manager asking.
+    #[command(hide = true)]
+    ServiceMain,
+    /// The arm the service puts on a desktop, started by the service with
+    /// the pipe it should report to. Not a command to run by hand.
+    #[command(hide = true)]
+    DesktopWorker {
+        #[arg(long)]
+        pipe: String,
+    },
     /// Write a starting configuration, migrating an existing Barrier setup.
     Import {
         /// Barrier's settings file. Defaults to where it usually lives.
@@ -145,6 +158,13 @@ enum ServiceAction {
         /// refuse input into any window running as administrator.
         #[arg(long)]
         limited: bool,
+        /// Windows: register a service running as the system account
+        /// instead of a task in your session. Only this reaches the
+        /// desktop a UAC prompt, the lock screen or Ctrl+Alt+Del is on,
+        /// because nothing in your own session may go there. Everything
+        /// else works the same either way.
+        #[arg(long)]
+        system: bool,
     },
     /// Stop starting at login, and stop now.
     Uninstall,
@@ -171,12 +191,18 @@ fn main() -> Result<()> {
         Command::Monitors => monitors(),
         Command::Status => status(cli.config),
         Command::Service { action } => match action {
-            ServiceAction::Install { user, limited } => service::install(user, limited),
+            ServiceAction::Install {
+                user,
+                limited,
+                system,
+            } => service::install(user, limited, system),
             ServiceAction::Uninstall => service::uninstall(),
             ServiceAction::Start => service::start(),
             ServiceAction::Stop => service::stop(),
             ServiceAction::Status => service::status(),
         },
+        Command::ServiceMain => service_main(),
+        Command::DesktopWorker { pipe } => desktop_worker(&pipe),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -319,6 +345,43 @@ fn init(
     println!("  3. Open smkvm-gui to arrange the screens; the daemon picks up the change at once.");
     println!("  4. `smkvm service install` makes it start at login (from an administrator prompt on Windows).");
     Ok(())
+}
+
+/// Hand the process to the service control manager, which then calls back
+/// into the service and does not return until it has stopped.
+fn service_main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        secure::windows::scm::run_as_service()
+    }
+    #[cfg(not(windows))]
+    {
+        bail!("services are a Windows arrangement; on Linux `smkvm service install` adds a login item")
+    }
+}
+
+/// Be the arm on a desktop. Started by the service and by nothing else.
+fn desktop_worker(pipe: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        secure::windows::worker::run(pipe)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pipe;
+        bail!("the desktop worker is a Windows arrangement")
+    }
+}
+
+/// Run the daemon, from inside the service.
+///
+/// The same `run` a person gets from `smkvm run`, reached the same way.
+/// Everything that makes the service different from a daemon started at
+/// login has already happened by the time this is called: the arm is set,
+/// and a worker is being minded on whichever desktop has the input.
+#[cfg(windows)]
+pub(crate) fn run_daemon_for_service() -> Result<()> {
+    block_on(run(None))
 }
 
 fn monitors() -> Result<()> {

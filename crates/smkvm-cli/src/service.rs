@@ -12,6 +12,17 @@
 //! principal and "run with highest privileges" is the one arrangement that has
 //! both, so that is what is registered.
 //!
+//! There is now a second Windows arrangement, behind `--system`: a service
+//! running as the system account, which puts a worker on whichever desktop
+//! has the input and so reaches the UAC prompt and the lock screen as well.
+//! It is opt-in and stays opt-in. The task above is what is running on real
+//! machines and what a plain `smkvm service install` still registers; the
+//! service is the newer and less proven of the two, and the difference
+//! between them is reach, not correctness. `crate::secure::plan` settles
+//! which of the two a machine ends up with, and settles that it is never
+//! both -- two daemons on one machine fight over the link and the loser is
+//! left holding keys down.
+//!
 //! On Linux the daemon needs the session's display, which a systemd user
 //! service does not reliably have. A desktop-autostart entry runs inside the
 //! session with everything the session has, and the daemon reconnects for
@@ -56,16 +67,21 @@ fn this_binary() -> Result<PathBuf> {
 /// for the case where the account registering is not the one sitting at the
 /// desk; `limited` gives up the elevation that lets it type into
 /// administrator windows.
-pub fn install(user: Option<String>, limited: bool) -> Result<()> {
+pub fn install(user: Option<String>, limited: bool, system: bool) -> Result<()> {
     let exe = this_binary()?;
     #[cfg(windows)]
     {
-        windows::install(&exe, user, limited)
+        windows::install(&exe, user, limited, system)
     }
     #[cfg(not(windows))]
     {
         if user.is_some() {
             bail!("--user is for Windows, where a task can be registered for another account");
+        }
+        if system {
+            bail!(
+                "--system is for Windows, where the secure desktop is a thing a service has                  to reach on the daemon's behalf"
+            );
         }
         if limited {
             eprintln!("note: --limited means nothing here; a login item runs as you already");
@@ -142,6 +158,8 @@ pub fn status() -> Result<()> {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use crate::secure::plan;
+    use crate::secure::windows::scm;
     use std::process::Command;
 
     /// Run a PowerShell script and hand back what it printed.
@@ -278,7 +296,58 @@ mod windows {
         )
     }
 
-    pub fn install(exe: &std::path::Path, user: Option<String>, limited: bool) -> Result<()> {
+    /// Is the scheduled task registered?
+    fn task_registered() -> bool {
+        powershell(&format!(
+            r#"if (Get-ScheduledTask -TaskName {} -ErrorAction SilentlyContinue) {{ "yes" }} else {{ "no" }}"#,
+            quote(NAME)
+        ))
+        .map(|said| said == "yes")
+        .unwrap_or(false)
+    }
+
+    fn present() -> plan::Present {
+        plan::Present {
+            task: task_registered(),
+            service: scm::installed(),
+        }
+    }
+
+    /// Make the arrangement the one that was asked for, and only that one.
+    pub fn install(
+        exe: &std::path::Path,
+        user: Option<String>,
+        limited: bool,
+        system: bool,
+    ) -> Result<()> {
+        if system && (user.is_some() || limited) {
+            bail!(
+                "--system runs as the system account on whichever desktop has the input, so                  --user and --limited have nothing to say about it"
+            );
+        }
+        let wanted = if system {
+            plan::Arrangement::Service
+        } else {
+            plan::Arrangement::Task
+        };
+        for step in plan::install(wanted, present()) {
+            match step {
+                plan::Step::RemoveTask => {
+                    println!("removing the login task, so only one of the two starts a daemon.");
+                    uninstall_task()?;
+                }
+                plan::Step::RemoveService => {
+                    println!("removing the service, so only one of the two starts a daemon.");
+                    scm::uninstall()?;
+                }
+                plan::Step::RegisterTask => register_task(exe, user.clone(), limited)?,
+                plan::Step::RegisterService => scm::install(exe)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn register_task(exe: &std::path::Path, user: Option<String>, limited: bool) -> Result<()> {
         let who = match user {
             Some(user) => quote(&user),
             None => "$null".to_string(),
@@ -338,7 +407,24 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
         Ok(())
     }
 
+    /// Undo whichever of the two is registered, without being told which.
     pub fn uninstall() -> Result<()> {
+        let there = present();
+        if plan::nothing_was_registered(there) {
+            println!("neither a login task nor a service is registered here.");
+            return Ok(());
+        }
+        for step in plan::uninstall(there) {
+            match step {
+                plan::Step::RemoveTask => uninstall_task()?,
+                plan::Step::RemoveService => scm::uninstall()?,
+                plan::Step::RegisterTask | plan::Step::RegisterService => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn uninstall_task() -> Result<()> {
         let _ = stop();
         powershell(&format!(
             "Unregister-ScheduledTask -TaskName {} -Confirm:$false -ErrorAction SilentlyContinue",
@@ -349,6 +435,9 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
     }
 
     pub fn start() -> Result<()> {
+        if scm::installed() {
+            return scm::start();
+        }
         if let Some(pid) = running_pid() {
             println!("already running as pid {pid} (started by hand, not by the task).");
             return Ok(());
@@ -360,6 +449,13 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
     }
 
     pub fn stop() -> Result<()> {
+        if scm::installed() {
+            // Stopping the service ends the daemon, and with it the pipe,
+            // and with the pipe the worker: so the hooks on whatever
+            // desktop it was on go too. This is the recovery command on a
+            // server in either arrangement.
+            return scm::stop();
+        }
         // Stopping the task ends the process, and with it the input hooks,
         // which is what gives the keyboard and mouse back on a server whose
         // cursor was elsewhere. A daemon started by hand is not the task's
@@ -385,6 +481,7 @@ if ($t) {{ "task: " + $t.State + ", runs as " + $t.Principal.UserId + " (" + $t.
             quote(NAME)
         ))?;
         println!("{said}");
+        println!("{}", scm::describe()?);
         Ok(())
     }
 }
