@@ -93,6 +93,23 @@ window. On Windows, one that is not elevated works everywhere except a
 window running as administrator, where the system refuses silently, so it is
 worth reading once after installing.
 
+Even at highest privileges the task cannot reach the desktop a UAC consent
+prompt, the lock screen or Ctrl+Alt+Del is on: Windows puts those on a
+separate desktop that nothing in your session may open, at any privilege at
+all. The cursor is handed back while one is up and comes back when it goes.
+To reach them as well, on a Windows machine:
+
+```
+smkvm service install --system
+```
+
+That registers a service running as the system account instead of the task,
+and the service puts a worker on whichever desktop has the input. It is the
+newer of the two arrangements and the less proven; everything but the reach
+is the same, `uninstall` removes whichever is registered, and the two are
+never both installed. If the service will not start, the daemon behaves
+exactly as the task's would.
+
 ## Where things live
 
 | | Linux | Windows |

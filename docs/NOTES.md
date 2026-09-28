@@ -85,6 +85,10 @@ Written and tested without hardware since the last run on the real machines
   report's 15 s does not get refused; `stop` also ends a daemon that was
   started by hand. `stop` on a server ends the hooks and gives the keyboard
   back, so it is the recovery command too.
+- **A service as the system account, behind `smkvm service install
+  --system`.** The one arrangement that reaches the desktop a UAC prompt or
+  the lock screen is on. See the section below; **none of it has run on a
+  Windows machine.**
 - **The daemon says at startup how far its input reaches.** On Windows a
   daemon at an ordinary integrity level works everywhere except a window
   running as administrator, where `SendInput` returns zero and the capture
@@ -152,7 +156,12 @@ say what each one was. What remains:
   PowerShell run as administrator on a client freezes the pointer there
   until the foreground changes. The client now says so and hands the cursor
   back; the cure is to run the client's scheduled task with "run with
-  highest privileges" so it outranks everything it has to type into.
+  highest privileges" so it outranks everything it has to type into. This
+  is fixed on the real machines: `reason=Elevated` refusals stopped the day
+  the task was registered at highest privileges and have not recurred.
+- **The secure desktop, and the service that is meant to reach it.** See
+  the section below. The code is written and nothing about it has been run
+  on Windows.
 - **A paste of files blocks the pasting application until they arrive.**
   Explorer or Nautilus asks for the list and gets it only once every file
   is on disk, so a large paste looks hung for the duration. `transfer.max_bytes`
@@ -177,6 +186,65 @@ say what each one was. What remains:
   its clients or the GUI reads the server's report over the link.
 - **Log lines print `DeviceId` as thirty-two decimal bytes.** Hex, or the
   machine's name, would make the clipboard lines readable.
+
+## The service, and the desktop a UAC prompt is on
+
+This is the part of `--system` that is not in the code, and the part
+somebody trying it on a real machine will need.
+
+**What the arrangement is.** A UAC consent prompt, the lock screen and
+Ctrl+Alt+Del run on a desktop winlogon makes ("Winlogon", on the WinSta0
+window station). Nothing in the person's session can open, hook or inject
+into it, at any integrity level -- that is the point of it, and the login
+task at highest privileges does not change it. The only thing that can is a
+service running as LocalSystem: it holds SeTcbPrivilege, so it may ask for
+the interactive session's token and start a process *in that session,
+attached to a desktop it names*. That process -- the worker -- does the
+hooking and injecting for whichever desktop has the input, and runs as
+SYSTEM, so nothing on the consent desktop outranks it. The service watches
+which desktop has the input four times a second and relaunches the worker
+when it changes. Synergy and Input Leap are built this way; it follows from
+who is allowed to do what rather than from anyone's taste.
+
+The service is the daemon. It runs the same `run` a person gets from
+`smkvm run`, with the same `smkvm-core` state machines and the same Noise
+link; the only difference is that `platform::injector` hands back an arm
+that writes down a pipe instead of calling `SendInput`.
+
+**Where each piece is.** `crates/smkvm-cli/src/secure/` -- `watch` decides
+when to move the worker, `acl` is the pipe's access list, `wire` is what
+the two say to each other, `plan` settles that a task and a service are
+never both registered. All four are pure and tested on Linux. The Win32
+half is under `secure/windows/`: `token` (the session's token and starting
+a process on a named desktop), `pipe`, `scm` (registering the service, and
+being it), `worker`, `link` (the daemon's end).
+
+**What has not been done.** None of it has run on Windows. `cargo xwin`
+links it and clippy is clean for both targets, and that is the whole of the
+evidence. In particular, unverified: whether `WTSQueryUserToken` succeeds
+(it wants SeTcbPrivilege *enabled*, not merely held -- see the
+`AdjustTokenPrivileges` in `token.rs`); whether a worker started with
+`lpDesktop = WinSta0\Winlogon` can actually set hooks there, or only
+inject; whether the pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by
+`CreateNamedPipeW` as written; whether the input-desktop poll sees the
+switch promptly enough to be useful; and what the clipboard and the drag
+catcher do in a process that is not the one with the person's desktop.
+
+**How to tell whether it is working**, in the log on the client: `running as
+a service` and then `a worker is on the input desktop` with a desktop name.
+Raise a consent prompt and look for a second `a worker is on the input
+desktop`, this time saying `Winlogon`. If instead the log says `could not
+put a worker on WinSta0\Winlogon`, the message after it is the Win32 error
+and is the thing to chase. `a worker cannot be started on this desktop`
+means it gave up after five tries, and the cursor is being handed back
+exactly as it was before any of this -- which is the fallback working, not
+a regression.
+
+**Getting out of it.** `smkvm service uninstall` removes whichever of the
+two is registered, and `smkvm service install` with no flag puts the
+scheduled task back. The two are never both registered; `secure::plan` is
+what makes that true and has a property test over every starting state.
+`sc delete SMKVMSystem` is the hand version if the CLI cannot be run.
 
 ## Traps that have already cost time
 
@@ -230,6 +298,24 @@ left holding a drag that never ended. A round trip after the last thing said
 on a connection is what makes it stick -- `get_input_focus().reply()` is the
 cheap one. The same applies anywhere a connection is closed right after a
 send.
+
+**A service is not in the person's session, and a null `lpDesktop` does not
+say so.** A service lives in session 0 on the window station
+`Service-0x0-3e7$`, which has no screen. `CreateProcessAsUser` with
+`lpDesktop` left null gives the child *that* station, so it starts, sees
+nothing, hooks nothing and reports no error -- the same silent shape as
+everything else on this page. The name has to be the full `WinSta0\Default`
+or `WinSta0\Winlogon`; a bare desktop name means "on my station", which is
+the wrong one. `watch::on_station` is where that is built, and it is tested.
+
+**A privilege that is held is not a privilege that is on.**
+`WTSQueryUserToken` needs SeTcbPrivilege, which LocalSystem's token holds
+and which is *disabled* until `AdjustTokenPrivileges` switches it on. Worse,
+that call reports "you do not have it" by succeeding and setting the last
+error to `ERROR_NOT_ALL_ASSIGNED`, so the obvious code says nothing and the
+failure appears two calls later as an access denial that looks like the
+wrong account. `token::enable_tcb_privilege` checks the last error and says
+which it is.
 
 **A scheduled task's process has a console even when nothing is on screen.**
 The daemon decided where to log by asking whether stderr was a terminal, and
