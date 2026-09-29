@@ -194,6 +194,20 @@ impl Fetch for AskTheService {
                 format: format.clone(),
             })
         });
+        // Said with the id, because the id is what ties this to the
+        // answer -- and an answer that arrives for an id nobody is
+        // waiting on is a fault this code has had before. Silence in
+        // between has been wrong three times in this path now, so
+        // both ends of both directions say what they saw.
+        say_without_waiting(format!(
+            "asked the service for {format:?} as paste {id}: {}",
+            match posted {
+                Some(Posted::Sent) => "sent".to_string(),
+                Some(Posted::NoRoom(n)) => format!("NOT SENT, {n} refused in a row"),
+                Some(Posted::Gone) => "NOT SENT, nobody is draining".to_string(),
+                None => "NOT SENT, the clipboard is not being served".to_string(),
+            }
+        ));
         if !posted.map(Posted::arrived).unwrap_or(false) {
             self.pastes.forget(id);
             self.asked.lock().expect("not poisoned").remove(&id);
@@ -300,10 +314,33 @@ impl Serving {
                 // frame still goes out under the shared lock and in
                 // order, so nothing is torn in half; what changed is
                 // only *who* waits for it.
+                let mut failing = false;
                 while let Ok(message) = receive.recv() {
-                    if !speak(&message) {
-                        return;
+                    if speak(&message) {
+                        if failing {
+                            tracing::info!("the worker's outbox is reaching the service again");
+                            failing = false;
+                        }
+                        continue;
                     }
+                    if !failing {
+                        // Said through `tracing` and not through the
+                        // outbox, which would be this line trying to
+                        // report its own failure to be reported.
+                        tracing::warn!(
+                            "the worker's outbox cannot reach the service; messages are                              being posted and going nowhere"
+                        );
+                        failing = true;
+                    }
+                    // Deliberately not returning. Ending this thread
+                    // drops the receiver, which is permanent: the
+                    // outbox is installed once per process, so every
+                    // later message -- including a paste request --
+                    // would be refused for the life of the worker on
+                    // the strength of one failed write. Staying here
+                    // costs nothing, because `recv` blocks, and it
+                    // lets a pipe that comes back carry traffic
+                    // again.
                 }
             })
             .context("starting the worker's outbox")?;
@@ -386,11 +423,12 @@ impl Serving {
     /// contents are kept for the next one rather than thrown away. That
     /// is the difference between "paste twice" and "paste, wait a
     /// minute, get nothing".
-    pub fn pasted(&self, id: u64, bytes: Result<Vec<u8>, String>) {
+    /// Returns whether anything was still waiting for this answer.
+    pub fn pasted(&self, id: u64, bytes: Result<Vec<u8>, String>) -> bool {
         let format = self.asked.lock().expect("not poisoned").remove(&id);
         let ok = bytes.clone().ok();
         if self.pastes.answer(id, bytes) {
-            return;
+            return true;
         }
         if let (Some(format), Some(bytes)) = (format, ok) {
             tracing::debug!(
@@ -404,6 +442,7 @@ impl Serving {
                 .expect("not poisoned")
                 .insert(format, bytes);
         }
+        false
     }
 
     /// Nothing more will be answered; wake anything mid-paste.
@@ -547,7 +586,26 @@ impl Clipboard {
                     },
                 );
                 if let Some(serving) = held.as_ref() {
-                    serving.pasted(id, bytes);
+                    let wanted = serving.pasted(id, bytes);
+                    if !wanted {
+                        // An answer with no asker. Either it came
+                        // after its render gave up -- ordinary, and
+                        // the contents are kept for the next paste --
+                        // or the id never matched anything, which
+                        // means the two sides disagree about what was
+                        // asked.
+                        tell(
+                            speak,
+                            Level::Info,
+                            format!("paste {id} came back with nobody waiting for it"),
+                        );
+                    }
+                } else {
+                    tell(
+                        speak,
+                        Level::Warn,
+                        format!("paste {id} came back, but this worker holds no clipboard"),
+                    );
                 }
             }
             ToWorker::CatchDrag { id } => {

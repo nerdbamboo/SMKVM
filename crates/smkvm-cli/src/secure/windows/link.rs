@@ -360,6 +360,12 @@ impl Link {
     /// would stop that thread for the length of a network transfer, so
     /// a slow paste would make the service blind to its own worker.
     fn someone_is_pasting(self: &Arc<Self>, id: u64, format: ClipFormat) {
+        // The first thing, before anything can go wrong. Whether this
+        // line appears is the difference between "the worker's
+        // request never arrived" and "it arrived and nothing came of
+        // it", and those two have looked identical from the log for
+        // two rounds.
+        tracing::info!(?format, id, "clipboard: the worker is asking for a paste");
         let standing = self.offer.lock().expect("not poisoned").clone();
         let Some((_, source)) = standing else {
             // Nothing is being announced, so there is nothing to fetch.
@@ -393,6 +399,21 @@ impl Link {
                     });
                     return;
                 };
+                // Said before the call, not only after it.
+                //
+                // `fetch` here has no deadline of its own --
+                // `SERVICE_FETCH_WITHIN` is measured against it, not
+                // imposed on it -- so if the far machine never
+                // answers, this thread waits for ever and the only
+                // record of the attempt is a line that never comes.
+                // That is precisely the shape of fault that cost
+                // three rounds on the render, and it is not going to
+                // cost another one by being invisible.
+                tracing::info!(
+                    ?format,
+                    id,
+                    "clipboard: asking the far machine for what it copied"
+                );
                 let asked_at = Instant::now();
                 let bytes = source
                     .fetch(&format)

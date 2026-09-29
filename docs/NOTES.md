@@ -1728,6 +1728,33 @@ write the bug. (This was found while adding the lines above, and is
 not the fault those lines were added to find: `NothingOffered` does
 not renew, so this path was not the one firing.)
 
+**Both ends of both directions say what they saw.** A paste crosses
+four boundaries: the worker posts `WantsPaste`, the service receives
+it, the service asks the far machine, and the answer comes back to
+the worker as `Pasted`. For two rounds the only evidence about that
+whole span was silence, and silence has been wrong three times in
+this file -- once it was a filtered message, once a wedged relay,
+once a blocking write. Each of the four now says so, with the paste's
+id, and the worker says whether anything was still waiting when the
+answer arrived, because an answer with no asker is a fault this code
+has had before.
+
+The service's line goes *before* its `fetch`, not only after. That
+`fetch` has no deadline of its own -- `SERVICE_FETCH_WITHIN` is
+measured against it, not imposed on it -- so a far machine that never
+answers leaves a thread waiting for ever and the only record of the
+attempt is a line that never comes. That is the exact shape that cost
+three rounds on the render.
+
+**The outbox drain does not exit on a failed write.** It used to
+return, which drops the receiver -- and since the outbox is installed
+once per process, every later message including a paste request would
+be refused for the life of the worker on the strength of one failed
+write. It stays and says so instead, once when it starts failing and
+once when it recovers, through `tracing` rather than through the
+outbox, which would be the line trying to report its own failure to
+be reported.
+
 **A limit should count only the thing it is named for, and say what
 that thing was.** `renewed 4 of 3 times` is a limit working
 perfectly, and it tells nobody what it was working against. The count
