@@ -697,8 +697,18 @@ fn start_worker(exe: &Path, on: &str, link: &Arc<link::Link>) -> Result<(token::
 
     let listening = pipe::create(&name)?;
 
-    let started =
-        token::start_on_desktop(&user, exe, &format!("desktop-worker --pipe {name}"), on)?;
+    // `--unattended` so the worker never decides where to log by asking
+    // whether stderr looks like a terminal. A process started with no
+    // console has no stderr worth the question, and this program has
+    // twice lost a deployment to a log that went somewhere nobody could
+    // read. The scheduled task learnt that; the worker should not have
+    // to learn it again.
+    let started = token::start_on_desktop(
+        &user,
+        exe,
+        &format!("desktop-worker --unattended --pipe {name}"),
+        on,
+    )?;
 
     // Bounded. A worker that never arrives is a counted failure that
     // `watch` can give up on, not a thread parked for ever.

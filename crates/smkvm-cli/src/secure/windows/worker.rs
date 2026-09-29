@@ -29,7 +29,8 @@ use crate::secure::acl;
 use crate::secure::watch::LOOK_EVERY as WATCH_EVERY;
 
 use crate::secure::windows::pipe;
-use crate::secure::windows::serving::{Clipboard, Speak};
+use crate::secure::windows::serving::{tell, Clipboard, Speak};
+use crate::secure::wire::Level;
 use crate::secure::wire::{frame, read_frame, FromWorker, Saw, ToWorker, WORKER_PROTOCOL};
 
 /// Run as the worker until the pipe closes.
@@ -93,7 +94,11 @@ pub fn run(pipe_name: &str) -> Result<()> {
         protocol: WORKER_PROTOCOL,
         desktop: here.clone(),
     });
-    tracing::info!(desktop = %here, "the worker is on the desktop and connected");
+    tell(
+        &speak,
+        Level::Info,
+        format!("on desktop {here}, connected to the service"),
+    );
 
     // Watching where the input has gone, which is a thing only
     // something inside the session can do. `OpenInputDesktop` is per
@@ -147,10 +152,31 @@ pub fn run(pipe_name: &str) -> Result<()> {
             // A desktop that will not take hooks is still a desktop that
             // takes injection, which is the half that matters on a consent
             // prompt: what is typed there is typed from the other machine.
-            tracing::warn!("the worker cannot watch this desktop's input: {e}");
+            tell(
+                &speak,
+                Level::Warn,
+                format!("cannot watch this desktop's input: {e}"),
+            );
             None
         }
     };
+
+    // Said plainly, once, at info, before anything else happens: what
+    // this process is and what it can do. Three rounds have now been
+    // spent on not being able to tell "it failed" from "it was never
+    // asked", and an inventory at startup is the cheapest answer to
+    // that question there is. It goes down the pipe as well as into the
+    // log, so it arrives even if this process's own logging is the
+    // thing that is broken.
+    tell(
+        &speak,
+        Level::Info,
+        format!(
+            "ready: desktop={here} capture={} clipboard=waiting-to-be-told log={}",
+            if capture.is_some() { "yes" } else { "no" },
+            smkvm_config::paths::log_file().display()
+        ),
+    );
 
     let mut input = WindowsInput::new();
     // The person's clipboard, which only something in their session can

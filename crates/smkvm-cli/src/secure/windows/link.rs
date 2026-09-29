@@ -51,7 +51,7 @@ use crate::secure::reach::Reach;
 use crate::secure::watch;
 use crate::secure::windows::clip::Waiting;
 use crate::secure::windows::pipe::{Pipe, WRITE_WITHIN};
-use crate::secure::wire::{frame, FromWorker, ToWorker};
+use crate::secure::wire::{frame, FromWorker, Level, ToWorker};
 
 /// How long to wait for a worker to say what displays the machine has.
 ///
@@ -335,6 +335,16 @@ impl Link {
             FromWorker::DragCaught { id, paths } => {
                 self.drags.answer(id, paths);
             }
+            FromWorker::Said { level, text } => match level {
+                // Marked, so that a line the worker asked for is never
+                // mistaken for one the service noticed itself -- they
+                // are two different processes and which of them saw a
+                // thing is most of the diagnosis.
+                Level::Debug => tracing::debug!("worker: {text}"),
+                Level::Info => tracing::info!("worker: {text}"),
+                Level::Warn => tracing::warn!("worker: {text}"),
+                Level::Error => tracing::error!("worker: {text}"),
+            },
             FromWorker::WantsPaste { id, format } => self.someone_is_pasting(id, format),
             FromWorker::Ready { .. } => {}
         }

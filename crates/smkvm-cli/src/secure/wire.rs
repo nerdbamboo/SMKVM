@@ -21,7 +21,7 @@ use smkvm_proto::{ClipFormat, Key, MouseButton, Scroll};
 /// worker rather than guessing, because the alternative -- misreading a
 /// frame and injecting whatever the bytes happen to decode as -- is a
 /// program typing at random into a consent prompt.
-pub const WORKER_PROTOCOL: u32 = 2;
+pub const WORKER_PROTOCOL: u32 = 3;
 
 /// Longest frame either side will send or accept.
 ///
@@ -145,6 +145,36 @@ pub enum FromWorker {
         id: u64,
         paths: Vec<PathBuf>,
     },
+
+    /// Something the worker wants in the log, relayed through the
+    /// service.
+    ///
+    /// The worker writes to the log file itself as well. This exists
+    /// because three rounds in a row have been lost not to a bug but
+    /// to silence, and the last of them to this exact silence: the
+    /// worker was injecting keystrokes perfectly -- so the pipe
+    /// demonstrably worked -- and had written not one line to the log
+    /// file across three restarts, which made it impossible to tell a
+    /// clipboard that failed to start from a clipboard that was never
+    /// asked for.
+    ///
+    /// A process with no voice cannot be diagnosed, and a second way
+    /// to speak, over a channel already known to work, is cheap. If
+    /// both appear the duplicate is a nuisance; if only one does, that
+    /// itself says which half is broken.
+    Said {
+        level: Level,
+        text: String,
+    },
+}
+
+/// How loud, for something the worker wants said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Level {
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 /// The events the worker captures, mirrored here rather than shared.
@@ -348,6 +378,10 @@ mod tests {
             id: 8,
             bytes: Err("the owning application would not hand it over".into()),
         });
+        round_trip(FromWorker::Said {
+            level: Level::Warn,
+            text: "cannot reach the person's clipboard".into(),
+        });
         round_trip(FromWorker::WantsPaste {
             id: 9,
             format: ClipFormat::Text,
@@ -355,6 +389,10 @@ mod tests {
         round_trip(FromWorker::DragCaught {
             id: 10,
             paths: vec![PathBuf::from(r"C:\a\b.txt")],
+        });
+        round_trip(FromWorker::Said {
+            level: Level::Warn,
+            text: "this worker cannot reach the clipboard".into(),
         });
         round_trip(FromWorker::InputDesktop(None));
         round_trip(FromWorker::Refused("SendInput returned 0".into()));

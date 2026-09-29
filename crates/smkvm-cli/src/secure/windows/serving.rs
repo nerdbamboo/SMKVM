@@ -19,7 +19,7 @@ use smkvm_clipboard::{CatchDrag, Drive, Fetch, Read, Watch, Write};
 use smkvm_proto::{ClipFormat, MouseButton};
 
 use crate::secure::windows::clip::{Waiting, PASTE_WITHIN};
-use crate::secure::wire::{FromWorker, ToWorker};
+use crate::secure::wire::{FromWorker, Level, ToWorker};
 
 /// The worker's end of the clipboard, while it holds one.
 pub struct Serving {
@@ -38,6 +38,24 @@ pub struct Serving {
 /// read.
 pub type Speak = Arc<dyn Fn(&FromWorker) -> bool + Send + Sync>;
 
+/// Say something, into this process's log *and* the service's.
+///
+/// Both, on purpose. The worker's own log has been silent across whole
+/// deployments for reasons nobody has yet pinned down, while the pipe
+/// has demonstrably worked the entire time -- it was carrying every
+/// keystroke. Until that is understood, anything worth knowing goes
+/// both ways, and which of the two arrives is itself a diagnosis.
+pub fn tell(speak: &Speak, level: Level, text: impl Into<String>) {
+    let text = text.into();
+    match level {
+        Level::Debug => tracing::debug!("{text}"),
+        Level::Info => tracing::info!("{text}"),
+        Level::Warn => tracing::warn!("{text}"),
+        Level::Error => tracing::error!("{text}"),
+    }
+    speak(&FromWorker::Said { level, text });
+}
+
 /// What a paste on this desktop does: ask the service, and wait.
 ///
 /// The service has to go to the machine that did the copying, which is
@@ -55,6 +73,11 @@ struct AskTheService {
 impl Fetch for AskTheService {
     fn fetch(&self, format: &ClipFormat) -> smkvm_clipboard::Result<Vec<u8>> {
         let (id, answer) = self.pastes.ask();
+        tracing::debug!("something here is pasting {format:?}; asking the service for it");
+        (self.speak)(&FromWorker::Said {
+            level: Level::Info,
+            text: format!("something on this desktop is pasting {format:?}"),
+        });
         if !(self.speak)(&FromWorker::WantsPaste {
             id,
             format: format.clone(),
@@ -108,6 +131,11 @@ impl Serving {
             .name("smkvm-worker-clipboard".into())
             .spawn(move || {
                 while let Some(available) = watch.next_change() {
+                    tell(
+                        &telling,
+                        Level::Debug,
+                        format!("somebody copied something here: {:?}", available.formats),
+                    );
                     if !telling(&FromWorker::ClipboardChanged(available.formats)) {
                         return;
                     }
@@ -205,22 +233,28 @@ impl Clipboard {
         let mut held = self.serving.lock().expect("not poisoned");
         match told {
             ToWorker::ServeClipboard(true) => {
-                if held.is_none() {
+                if held.is_some() {
+                    tell(speak, Level::Debug, "already holding the clipboard");
+                } else {
                     match Serving::start(speak.clone()) {
                         Ok(serving) => {
-                            tracing::info!("this worker holds the person's clipboard");
+                            tell(speak, Level::Info, "holding the person's clipboard");
                             *held = Some(serving);
                         }
                         // Not fatal. Input is the half that matters at a
                         // consent prompt, and a worker that cannot reach
                         // the clipboard can still type.
-                        Err(e) => tracing::warn!("this worker cannot reach the clipboard: {e:#}"),
+                        Err(e) => tell(
+                            speak,
+                            Level::Warn,
+                            format!("cannot reach the person's clipboard: {e:#}"),
+                        ),
                     }
                 }
             }
             ToWorker::ServeClipboard(false) => {
+                tell(speak, Level::Info, "putting the person's clipboard down");
                 if let Some(serving) = held.take() {
-                    tracing::info!("this worker is putting the person's clipboard down");
                     serving.nobody_is_answering();
                 }
             }
@@ -229,21 +263,55 @@ impl Clipboard {
                     Some(serving) => serving.read(&format),
                     None => Err("this worker does not hold the clipboard".into()),
                 };
+                tell(
+                    speak,
+                    Level::Debug,
+                    match &bytes {
+                        Ok(b) => format!("read {:?} off the clipboard: {} bytes", format, b.len()),
+                        Err(e) => format!("could not read {format:?} off the clipboard: {e}"),
+                    },
+                );
                 speak(&FromWorker::ClipboardRead { id, bytes });
             }
-            ToWorker::OfferClipboard { formats } => {
-                if let Some(serving) = held.as_mut() {
-                    if let Err(e) = serving.offer(&formats, speak.clone()) {
-                        tracing::warn!("could not announce the far clipboard here: {e}");
-                    }
-                }
-            }
+            ToWorker::OfferClipboard { formats } => match held.as_mut() {
+                Some(serving) => match serving.offer(&formats, speak.clone()) {
+                    Ok(()) => tell(
+                        speak,
+                        Level::Info,
+                        format!("announced the far machine's clipboard here: {formats:?}"),
+                    ),
+                    Err(e) => tell(
+                        speak,
+                        Level::Warn,
+                        format!("could not announce the far machine's clipboard here: {e}"),
+                    ),
+                },
+                // The case that would otherwise be entirely silent: an
+                // offer arriving at a worker that never took the
+                // clipboard up. The service's log would show the offer
+                // being made and nothing would ever be on the person's
+                // clipboard.
+                None => tell(
+                    speak,
+                    Level::Warn,
+                    "asked to announce the far machine's clipboard, but this worker does                      not hold one -- nothing will appear on the person's clipboard",
+                ),
+            },
             ToWorker::ReleaseClipboard => {
+                tell(speak, Level::Debug, "giving the clipboard back");
                 if let Some(serving) = held.as_mut() {
                     let _ = serving.release();
                 }
             }
             ToWorker::Pasted { id, bytes } => {
+                tell(
+                    speak,
+                    Level::Debug,
+                    match &bytes {
+                        Ok(b) => format!("the far machine sent {} bytes to paste", b.len()),
+                        Err(e) => format!("the far machine could not supply the paste: {e}"),
+                    },
+                );
                 if let Some(serving) = held.as_ref() {
                     serving.pasted(id, bytes);
                 }
