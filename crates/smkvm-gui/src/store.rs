@@ -146,7 +146,7 @@ impl Store {
 /// has stopped, so it is worth nothing: saying a machine is connected when
 /// nothing is running is worse than admitting nothing is known.
 fn current_status() -> Option<Status> {
-    Status::current(&paths::status_file())
+    Status::current(&paths::status_file_to_read())
 }
 
 /// Write through a neighbouring file and move it into place, so a daemon

@@ -43,5 +43,6 @@ pub mod link;
 pub mod pipe;
 pub mod scm;
 pub mod secret;
+pub mod store;
 pub mod token;
 pub mod worker;

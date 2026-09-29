@@ -44,7 +44,7 @@ pub const NAME: &str = "SMKVM";
 /// someone stops a daemon and starts it again; trusting the report alone
 /// there refuses the restart that was asked for.
 fn running_pid() -> Option<u32> {
-    let pid = Status::current(&paths::status_file())?.pid?;
+    let pid = Status::current(&paths::status_file_to_read())?.pid?;
     (crate::process_alive(pid) != Some(false)).then_some(pid)
 }
 
@@ -149,7 +149,7 @@ pub fn status() -> Result<()> {
         ),
         None => println!(
             "running: nothing (no recent report at {})",
-            paths::status_file().display()
+            paths::status_file_to_read().display()
         ),
     }
     Ok(())
@@ -159,7 +159,7 @@ pub fn status() -> Result<()> {
 mod windows {
     use super::*;
     use crate::secure::plan;
-    use crate::secure::windows::scm;
+    use crate::secure::windows::{scm, store};
     use std::process::Command;
 
     /// Run a PowerShell script and hand back what it printed.
@@ -341,7 +341,13 @@ mod windows {
                     scm::uninstall()?;
                 }
                 plan::Step::RegisterTask => register_task(exe, user.clone(), limited)?,
-                plan::Step::RegisterService => scm::install(exe)?,
+                plan::Step::RegisterService => {
+                    // Before the service is registered, so that a machine
+                    // whose files cannot be put where a service could read
+                    // them never gets a service pointed at it.
+                    carry_files_over()?;
+                    scm::install(exe)?;
+                }
             }
         }
         Ok(())
@@ -407,6 +413,48 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
         Ok(())
     }
 
+    /// Put this account's configuration, identity and paired machines
+    /// where a service running as the system account can read them.
+    ///
+    /// The service has no profile worth reading -- that is the whole
+    /// reason for `%ProgramData%\smkvm` -- but an empty directory there
+    /// is a machine with no identity, which means pairing with every
+    /// other machine again by comparing six digits on two screens. Against
+    /// the login task, which simply works, that would be a regression, so
+    /// the files are carried across once and the person is told what
+    /// happened to each of them.
+    fn carry_files_over() -> Result<()> {
+        let carried = store::prepare()?;
+        println!("machine-wide files in {}:", carried.directory.display());
+        for step in &carried.steps {
+            println!("  {}", step.said());
+        }
+        if !carried.missing.is_empty() {
+            println!();
+            if carried.missing.contains(&smkvm_config::paths::CONFIG_NAME) {
+                println!(
+                    "note: there is no configuration to carry over, so the service will \
+                     not start. Run `smkvm init` as yourself first, pair this machine, \
+                     then install again -- or put a {} in {} by hand.",
+                    smkvm_config::paths::CONFIG_NAME,
+                    carried.directory.display()
+                );
+            } else {
+                println!(
+                    "note: {} was not there to copy. The service will make what it needs, \
+                     and this machine will have to be paired again.",
+                    carried.missing.join(" and ")
+                );
+            }
+        }
+        println!(
+            "Only the system account and administrators can read {}, because it is the \
+             key the other machines trust this one by.",
+            smkvm_config::paths::IDENTITY_NAME
+        );
+        Ok(())
+    }
+
     /// Undo whichever of the two is registered, without being told which.
     pub fn uninstall() -> Result<()> {
         let there = present();
@@ -420,6 +468,9 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
                 plan::Step::RemoveService => scm::uninstall()?,
                 plan::Step::RegisterTask | plan::Step::RegisterService => {}
             }
+        }
+        if let Some(left) = store::what_is_left_behind() {
+            println!("{left}");
         }
         Ok(())
     }

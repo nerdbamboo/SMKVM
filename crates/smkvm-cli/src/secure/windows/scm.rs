@@ -452,6 +452,17 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 
 /// Everything the service does, once it is a service.
 fn serve() -> Result<()> {
+    // First, before anything reads a path. This process runs as the
+    // system account, whose `APPDATA` is the system profile -- a real
+    // directory that resolves perfectly well and has none of this
+    // machine's files in it. On the first real installation the daemon
+    // looked there, found no configuration, and exited; the whole of the
+    // fix is this line and the directory it chooses.
+    smkvm_config::paths::use_machine_scope();
+    tracing::info!(
+        configuration = %smkvm_config::paths::config_file().display(),
+        "reading this machine's files from the machine-wide directory, not a profile"
+    );
     token::enable_tcb_privilege()?;
     tracing::info!(
         "running as a service; workers will be started as the system account on whichever \

@@ -459,7 +459,9 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
     println!("status         {}", paths::status_file().display());
     println!();
 
-    let status_path = paths::status_file();
+    // Either scope may have written it: the service writes machine-wide
+    // and this command is run by the person at the desk.
+    let status_path = paths::status_file_to_read();
     let report = Status::load(&status_path)?;
     let Some(report) = report else {
         println!("smkvm is not running here (no report has been written).");
@@ -616,6 +618,26 @@ fn default_barrier_settings() -> PathBuf {
 fn load_config(path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
     let path = path.unwrap_or_else(paths::config_file);
     if !path.exists() {
+        // The advice has to match who is asking. Told to run `smkvm init`,
+        // a service running as the system account would write a fourth
+        // configuration into the system profile and still not find this
+        // one -- and that is not a guess about what somebody might do, it
+        // is what the message said on the first real installation, under a
+        // path reading `C:\WINDOWS\system32\config\systemprofile\...`
+        // which tells the reader almost nothing about what went wrong.
+        if paths::scope() == paths::Scope::Machine {
+            bail!(
+                "no configuration at {}. This is the service, which reads the machine's \
+                 own files rather than any person's profile, so `smkvm init` is not the \
+                 answer -- it would write one more configuration somewhere else again. \
+                 `smkvm service install --system` carries an existing configuration, \
+                 identity and paired-machines list across from the account that runs it; \
+                 run that from an administrator prompt on an account that already has \
+                 them, or put the three files in {} by hand.",
+                path.display(),
+                paths::machine_config_dir().display()
+            );
+        }
         bail!(
             "no configuration at {}. Run `smkvm init --role server` or `smkvm init --role \
              client --server <host>` to write one, or `smkvm import` to migrate an existing \
@@ -636,7 +658,9 @@ fn load_config(path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
 /// daemon that was stopped moments ago, and waiting out the interval would
 /// only make every restart take a quarter of a minute.
 fn ensure_not_running() -> Result<()> {
-    let path = paths::status_file();
+    // Both places, because the daemon this must not start beside may be a
+    // service, which reports machine-wide.
+    let path = paths::status_file_to_read();
     if let Some(report) = Status::current(&path) {
         if let Some(pid) = report.pid {
             if process_alive(pid) == Some(false) {
