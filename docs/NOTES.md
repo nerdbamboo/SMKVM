@@ -292,10 +292,14 @@ pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by `CreateNamedPipeW`; whether
 the overlapped waits behave as intended; whether the input-desktop poll
 sees the switch promptly enough to be useful; whether the service now
 stops when asked; whether a failed start does produce the restart actions; whether `icacls`
-applies the two lists as written and whether `%ProgramData%\smkvm` ends up
-readable by `smkvm status` and unreadable to an ordinary account for
-`device.toml`; whether carrying the three files across leaves an
-already-paired machine paired; whether a worker
+applies the lists as written, whether `/setowner` succeeds on a directory
+somebody else made, and whether `icacls /save` produces SDDL this build
+parses -- the read-back refuses when it cannot, so a parsing mistake here
+fails the install rather than passing it, which is the right way round but
+is still a thing to see once; whether `%ProgramData%\smkvm\public` ends up
+readable by `smkvm status` while `device.toml` is refused to an ordinary
+account; whether carrying the three files across leaves an already-paired
+machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
 to start rather than a loop;
 whether the quarter-second desktop comparison is in fact quick enough that
@@ -357,37 +361,109 @@ not there. A file already in the machine directory is left alone rather
 than overwritten, and the reason is `device.toml`: replacing it is not an
 update, it is becoming a different machine, because every other machine's
 paired list still names the old key. So a second `install --system` is
-safe, which is the thing somebody is most likely to try. `uninstall`
+safe, which is the thing somebody is most likely to try.
+
+Left alone, but not silently. The bytes are compared, because "already
+there" covers two very different situations. A second install of the same
+machine is one calm line. A machine that was paired again under the login
+task after an earlier `--system` install has a new key in the profile and
+the old one machine-wide, and the old one is what the service would
+introduce itself with -- so it connects and is turned away in the
+handshake, with nothing anywhere to explain it. That case now prints a
+warning naming both files and saying what to do. `uninstall`
 leaves the copies and says where they are, for the same reason -- deleting
 an identity is the one irreversible act here.
 
-**Who may read what, and why it is spelled out.** `%ProgramData%` grants
-every authenticated user read access by inheritance, so a directory made
-there and left alone would put this machine's private key where any local
-account could read it. That key is what the server trusts this machine by:
-a copy of it is a machine that can connect as this one and be handed the
-cursor, and therefore the keystrokes that follow it. So the directory gets
-an explicit list -- system account and administrators everything, ordinary
-users read only -- and `device.toml` gets one of its own with no ordinary
-users at all. `peers.toml` needs the other half of the argument: its
-contents are public keys and are not secret, but a peer written into it is
-a machine this one will accept a session from, which is why ordinary users
-get read and not write.
+**Who may read what: closed by construction.** `%ProgramData%` grants
+every authenticated account read by inheritance, so a directory made there
+and left alone puts this machine's private key where any local account can
+read it. That key is what the server trusts this machine by: a copy of it
+is a machine that can connect as this one and be handed the cursor, and
+therefore the keystrokes that follow it, including the ones typed into a
+password field on what the person believes is their own client.
 
-The status report stays readable on purpose. `smkvm status` and the window
-are run by the person at the desk, and would stop working the moment
-somebody chose `--system` otherwise; what it discloses is which machines
-are connected and where their screens are, to somebody already sitting at
-one of them. Readers look machine-wide first and in the profile second,
-because the writer and the reader need not be the same scope.
+The first version of this granted ordinary accounts read on the directory
+and then took it away again from each secret, and a review held the
+deployment over it. That shape was wrong in three ways at once, all of them
+the same mistake -- the default was open and protection was bolted on:
 
-The lists are applied with `icacls` naming the groups by their well-known
-identifiers rather than as "Administrators" and "Users", because those
-names are translated -- on the machines this is meant for they are
-something else entirely, and a rule that silently fails to apply is how a
-private key ends up readable while the install prints success. That lesson
-is in this file once already, about a service status parsed out of
-translated text.
+- a key the *service* generated later, on the documented path where there
+  was nothing to carry over, was never tightened at all, because the only
+  code that tightened anything ran at install time. It inherited the
+  directory's grant and stayed readable for ever, while the install printed
+  a line saying the opposite;
+- a key that *was* carried over was readable in the milliseconds between
+  being written and being tightened -- a race a local process wins easily
+  against a one-shot, user-initiated event;
+- and anything added later would have been open unless somebody remembered.
+
+So the directory grants the system account and administrators, inheritably,
+and nobody else. Anything created in it afterwards is closed without anyone
+having to think of it. Ordinary accounts get read on the directory *object*
+with no inheritance, enough to walk into the one readable subdirectory,
+`public`, which is where the daemon writes its report and where nothing else
+goes. A subdirectory rather than a permission on the report, because the
+report does not exist when the lists are set, and a file created later
+inherits what the directory says -- which is the whole lesson above.
+
+`peers.toml` needs the other half of the argument: its contents are public
+keys and are not secret, but a peer written into it is a machine this one
+will accept a session from, so ordinary accounts get no write anywhere in
+the directory.
+
+**Ownership, which is the part a grant cannot fix.** `%ProgramData%` lets
+ordinary accounts create folders and grants `CREATOR OWNER` full control of
+what they create, so any local account can make `C:\ProgramData\smkvm`
+before the installer does and be its owner. `/inheritance:r` removes only
+inherited entries and `/grant:r` rewrites only the ones it names, so a
+stranger's explicit entry survives both -- and an owner holds `WRITE_DAC`
+implicitly, so stripping it would only postpone them putting it back. This
+is the pipe-name squatting from the first review against a different
+object, and `acl.rs` had already written the sentence for it: *the owner of
+an object can always rewrite its access control list.* The owner is now set
+to the system account before any grant, and a directory that was already
+there is a decision in the code rather than something `create_dir_all`
+steps over.
+
+**And the list is read back.** Setting one and believing the exit code is
+the same shape as the silent refused injection this project began with.
+`icacls` prints "Successfully processed 0 files; Failed processing 1 files"
+and has been known to exit zero doing it. So every list is read back with
+`icacls /save`, which emits SDDL -- machine-readable, and unlike the names
+in its ordinary printing not translated -- and checked by
+`acl::granted_to_anyone_but`, which is pure and tested. If anyone but the
+system account and administrators can reach the key, the install fails and
+the service is never registered. A list that cannot be *parsed* is also a
+refusal, because a check that fails open is worse than none.
+
+The service repeats the check at startup, before the key is used and
+before the link exists, and refuses to run if it fails -- because the
+install is not the only way a file gets into that directory. There the
+asymmetry is deliberate: a key anyone can read is a refusal, a list that
+cannot be read is a warning, since failing to parse is not evidence of a
+fault and taking the machine down over it would be a fault of its own.
+
+The check somebody will actually run is `type
+%ProgramData%\smkvm\device.toml` from an ordinary account, which must be
+refused. That one command would have caught all three of the faults above,
+and it is worth running first on any machine this is installed on.
+
+The groups are named to `icacls` by their well-known identifiers rather
+than as "Administrators" and "Users", because those names are translated --
+on the machines this is meant for they are something else entirely, and a
+rule that silently fails to apply is how a private key ends up readable
+while the install prints success. That lesson is in this file once already,
+about a service status parsed out of translated text.
+
+**Check the key before anything else.** From an *ordinary* account, not
+an administrator one:
+
+    type %ProgramData%\smkvm\device.toml
+
+It must be refused. That single command would have caught all three of the
+access-list faults, and it is worth running before the service is started
+for the first time. The install refuses by itself if the list is wrong, and
+so does the service at startup, but neither is a substitute for looking.
 
 **What the first session on real hardware should look like.** In order:
 the service starts and logs `running as a service`; if nobody is logged in
@@ -508,6 +584,18 @@ one `stopping()` that replaced `ctrl_c()` everywhere the daemon waited on
 it. A `STOP_PENDING` report also has to carry `dwWaitHint` and a rising
 `dwCheckPoint`, or the manager has no reason to keep waiting and treats
 the service as hung.
+
+**A report is chosen by when it was written, not by where it is.** The
+first version preferred the machine-wide file because it was first in the
+list. Nothing deletes that file when a service is uninstalled, so a dead
+report sat in `%ProgramData%` permanently and shadowed the live one a
+hand-started daemon was writing in its own profile: every reader picked
+the stale file, the freshness filter then threw it away, and `smkvm
+status` said nothing was running while the daemon ran perfectly, for ever,
+with no error anywhere. The report carries the time it was written, so the
+question has an answer that does not depend on which directory it is in.
+`uninstall` also deletes the machine-wide report now -- it is not an
+identity, and losing it costs nothing.
 
 **The system account has a profile, and it is not a useful one.**
 LocalSystem's `APPDATA` and `LOCALAPPDATA` resolve to real directories
