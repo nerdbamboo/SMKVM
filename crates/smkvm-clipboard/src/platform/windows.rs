@@ -105,6 +105,28 @@ const HELD_OPEN_GAP: Duration = Duration::from_millis(200);
 /// reporting that the clipboard could not be opened.
 const OPEN_ATTEMPTS_FOR_STATUS: u32 = 4;
 
+/// Why the clipboard is being given back, carried in `WM_RELEASE`'s
+/// `wparam`.
+///
+/// Every release used to look the same in the log, and releasing is
+/// the act that ends a person's ability to paste what the other
+/// machine copied. Two of these mean something is wrong here and one
+/// is ordinary housekeeping; a single line saying "giving the
+/// clipboard back" cannot be read as either.
+const WITHDRAWN: usize = 0;
+const RENDERS_KEPT_FAILING: usize = 1;
+const OFFER_VANISHED: usize = 2;
+
+fn why_released(reason: usize) -> &'static str {
+    match reason {
+        RENDERS_KEPT_FAILING => "because renders kept failing",
+        OFFER_VANISHED => "because the offer was gone before the render finished",
+        // The ordinary one: the service says the far machine's
+        // clipboard is no longer on offer.
+        _ => "because the offer was withdrawn",
+    }
+}
+
 /// The timer that lets a burst of change notices settle into one report.
 const SETTLE_TIMER: usize = 1;
 /// How long to wait for the burst to end. The steps of one copy are a few
@@ -355,7 +377,21 @@ struct State {
 struct Offer {
     formats: Vec<ClipFormat>,
     source: Box<dyn Fetch>,
-    renewals: u32,
+    /// Renders of this offer that could not be served, and what the
+    /// last of them said.
+    ///
+    /// Only renders, and only ones that failed. A limit is a
+    /// statement about one particular kind of event, and counting
+    /// anything else against it means giving up on something that
+    /// never went wrong -- which reads, from outside, as the program
+    /// withdrawing an offer for no reason at all.
+    ///
+    /// The reason is kept alongside the count because the count on
+    /// its own says only that a limit was reached. `4 of 3` is a
+    /// limit working perfectly and tells nobody what it was working
+    /// against.
+    failures: u32,
+    last_failure: Option<String>,
 }
 
 thread_local! {
@@ -420,7 +456,8 @@ fn render(format_id: u32) -> Rendered {
         match write_native(formats, &wanted, format_id, &bytes) {
             Ok(()) => {
                 if let Some(offer) = state.offer.as_mut() {
-                    offer.renewals = 0;
+                    offer.failures = 0;
+                    offer.last_failure = None;
                 }
                 Rendered::Served(bytes.len())
             }
@@ -431,32 +468,42 @@ fn render(format_id: u32) -> Rendered {
 
 /// Promise again, or give the clipboard back, after a render that kept
 /// nothing.
-fn after_a_render_that_kept_nothing(window: HWND, format_id: u32) {
-    let give_up = STATE.with(|cell| {
+fn after_a_render_that_kept_nothing(window: HWND, format_id: u32, outcome: &Rendered) {
+    let why = outcome.said();
+    let counted = STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let Some(state) = slot.as_mut() else {
-            return true;
-        };
-        // No offer means there is nothing to renew *and* nothing
-        // worth holding the clipboard for, so give it back at once
-        // rather than promising emptiness three more times.
-        let Some(offer) = state.offer.as_mut() else {
-            return true;
-        };
-        offer.renewals += 1;
-        offer.renewals > RENEWALS_BEFORE_GIVING_UP
+        // No state, or no offer, means there is nothing to renew
+        // *and* nothing worth holding the clipboard for.
+        let offer = slot.as_mut()?.offer.as_mut()?;
+        offer.failures += 1;
+        offer.last_failure = Some(why.clone());
+        Some(offer.failures)
     });
-    if give_up {
+    let Some(failures) = counted else {
         witness(&format!(
-            "promised format {format_id} {RENEWALS_BEFORE_GIVING_UP} times and served \
-             none of them, so the clipboard is being given back. Copying and pasting on \
-             this machine will work again; what the other machine copied is not \
-             available here"
+            "the offer was gone by the time the render of format {format_id} finished, \
+             so the clipboard is being given back"
         ));
         // SAFETY: posting to this window, which is this thread's own.
-        let _ = unsafe { PostMessageW(window, WM_RELEASE, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(window, WM_RELEASE, WPARAM(OFFER_VANISHED), LPARAM(0)) };
+        return;
+    };
+    if failures > RENEWALS_BEFORE_GIVING_UP {
+        witness(&format!(
+            "{failures} renders of format {format_id} could not be served, which is past \
+             the limit of {RENEWALS_BEFORE_GIVING_UP}, so the clipboard is being given \
+             back. The last one said: {why}. Copying and pasting on this machine will \
+             work again; what the other machine copied is not available here"
+        ));
+        // SAFETY: posting to this window, which is this thread's own.
+        let _ =
+            unsafe { PostMessageW(window, WM_RELEASE, WPARAM(RENDERS_KEPT_FAILING), LPARAM(0)) };
         return;
     }
+    witness(&format!(
+        "render {failures} of {RENEWALS_BEFORE_GIVING_UP} for format {format_id} could not \
+         be served ({why}), so the promise is being made again"
+    ));
     // SAFETY: posting to this window, which is this thread's own. Posted
     // rather than done here because the clipboard is still open for the
     // length of the handler this was called from.
@@ -613,13 +660,17 @@ unsafe extern "system" fn window_proc(
             done.was(&outcome);
             drop(done);
             if outcome.needs_renewing() {
-                after_a_render_that_kept_nothing(window, format_id);
+                after_a_render_that_kept_nothing(window, format_id, &outcome);
             }
             LRESULT(0)
         }
         WM_RENEW => {
             witness("promising the far machine's formats again");
-            if let Err(e) = take_clipboard(window) {
+            if let Err(e) = take_clipboard(
+                window,
+                "renewing after a render that \
+                 could not be served",
+            ) {
                 tracing::warn!("could not promise the far machine's clipboard again: {e}");
             }
             LRESULT(0)
@@ -665,7 +716,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_OFFER => {
-            let _ = take_clipboard(window);
+            let _ = take_clipboard(window, "a fresh announcement from the far machine");
             LRESULT(0)
         }
         WM_RELEASE => {
@@ -677,7 +728,10 @@ unsafe extern "system" fn window_proc(
                     state.cache.clear();
                 }
             });
-            witness(&format!("giving the clipboard back; {was} was on offer"));
+            witness(&format!(
+                "giving the clipboard back {}; {was} was on offer",
+                why_released(wparam.0)
+            ));
             LRESULT(0)
         }
         // SAFETY: handing anything else along is what the API requires.
@@ -701,8 +755,13 @@ fn on_offer_now() -> String {
         Some(state) => match state.offer.as_ref() {
             None => "nothing".to_string(),
             Some(offer) => format!(
-                "{:?} (renewed {} of {RENEWALS_BEFORE_GIVING_UP} times)",
-                offer.formats, offer.renewals
+                "{:?} ({} of {RENEWALS_BEFORE_GIVING_UP} renders could not be served{})",
+                offer.formats,
+                offer.failures,
+                match offer.last_failure.as_deref() {
+                    Some(why) => format!("; the last said: {why}"),
+                    None => String::new(),
+                }
             ),
         },
     })
@@ -751,7 +810,7 @@ impl Drop for Returning {
 }
 
 /// Take the clipboard, promising the offered formats without supplying them.
-fn take_clipboard(window: HWND) -> Result<()> {
+fn take_clipboard(window: HWND, asked_by: &str) -> Result<()> {
     let (formats, offered) = STATE.with(|cell| {
         let slot = cell.borrow();
         let state = slot.as_ref();
@@ -768,12 +827,15 @@ fn take_clipboard(window: HWND) -> Result<()> {
         // made and then lost, and telling those apart is the whole of
         // the current question.
         witness(&format!(
-            "asked to take the clipboard, but on offer is {}, so nothing was promised",
+            "asked to take the clipboard ({asked_by}), but on offer is {}, so nothing \
+             was promised",
             on_offer_now()
         ));
         return Ok(());
     };
-    witness(&format!("taking the clipboard to promise {offered:?}"));
+    witness(&format!(
+        "taking the clipboard to promise {offered:?} ({asked_by})"
+    ));
 
     let _open = Opened::take(window)?;
     // SAFETY: the clipboard is open and owned by this window.
@@ -1158,7 +1220,7 @@ impl WindowsHandle {
         self.offers
             .send((formats.to_vec(), source))
             .map_err(|_| ClipboardError::Display("the clipboard thread has stopped".into()))?;
-        let posted = self.post(WM_OFFER);
+        let posted = self.post(WM_OFFER, 0);
         if let Err(e) = &posted {
             // The channel now holds an offer nobody will collect, and
             // the next message to arrive would take *this* one. Said
@@ -1173,13 +1235,13 @@ impl WindowsHandle {
 
     pub fn release(&self) -> Result<()> {
         witness("asking the clipboard thread to give the clipboard back");
-        self.post(WM_RELEASE)
+        self.post(WM_RELEASE, WITHDRAWN)
     }
 
-    fn post(&self, message: u32) -> Result<()> {
+    fn post(&self, message: u32, reason: usize) -> Result<()> {
         // SAFETY: posting to a thread id is safe whether or not it is still
         // running.
-        unsafe { PostThreadMessageW(self.thread_id, message, WPARAM(0), LPARAM(0)) }
+        unsafe { PostThreadMessageW(self.thread_id, message, WPARAM(reason), LPARAM(0)) }
             .map_err(|_| last_error("reaching the clipboard thread"))
     }
 }
@@ -1217,7 +1279,7 @@ pub struct WindowsWatcher(pub WindowsClipboard);
 
 impl Drop for WindowsClipboard {
     fn drop(&mut self) {
-        let _ = self.handle().post(WM_QUIT);
+        let _ = self.handle().post(WM_QUIT, 0);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1368,7 +1430,8 @@ fn clipboard_thread(
                             state.offer = Some(Offer {
                                 formats,
                                 source,
-                                renewals: 0,
+                                failures: 0,
+                                last_failure: None,
                             });
                             state.cache.clear();
                         }
@@ -1389,8 +1452,13 @@ fn clipboard_thread(
             continue;
         }
         if message.message == WM_RELEASE {
+            // The reason travels in `wparam` and has to be carried
+            // across by hand here, because a thread message has no
+            // window to be dispatched to. Dropping it on the floor --
+            // which this did -- makes every release look like the
+            // ordinary one.
             // SAFETY: as above.
-            unsafe { window_proc(window, WM_RELEASE, WPARAM(0), LPARAM(0)) };
+            unsafe { window_proc(window, WM_RELEASE, WPARAM(message.wParam.0), LPARAM(0)) };
             continue;
         }
         // SAFETY: both take the message just filled in.

@@ -1728,6 +1728,33 @@ write the bug. (This was found while adding the lines above, and is
 not the fault those lines were added to find: `NothingOffered` does
 not renew, so this path was not the one firing.)
 
+**A limit should count only the thing it is named for, and say what
+that thing was.** `renewed 4 of 3 times` is a limit working
+perfectly, and it tells nobody what it was working against. The count
+is `failures` now -- renders that could not be served, nothing else
+-- and it carries `last_failure` beside it, so giving up says which
+failure kept happening rather than only that a number was reached.
+The count on its own could not distinguish "the far machine never
+answered" from "the offer was withdrawn"; with the reason attached,
+one line ends the question.
+
+**Every release says why.** Giving the clipboard back is the act that
+ends a person's ability to paste what the other machine copied, and
+there are three quite different reasons for it: the offer was
+withdrawn, renders kept failing, or the offer was gone before a
+render finished. Two of those mean something is wrong here and one is
+ordinary housekeeping, and a single line saying "giving the clipboard
+back" cannot be read as either. The reason travels in `WM_RELEASE`'s
+`wparam` -- which the message loop has to carry across by hand,
+because a thread message has no window to be dispatched to, and
+dropping it made every release look ordinary.
+
+**Every take says who asked for it.** There are two callers and they
+mean opposite things: a fresh announcement is the far machine
+offering something new, and a renewal is this machine failing to
+supply something old. Four takes with one announcement is a diagnosis
+on its own, and only if the log distinguishes them.
+
 **A line that must exist is said by a drop, not by a statement.**
 `WM_RENDERFORMAT for format N returned after ... ms` is the most
 important line in the Windows clipboard, and across several rounds it
