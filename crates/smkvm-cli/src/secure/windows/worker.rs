@@ -168,11 +168,21 @@ pub fn run(pipe_name: &str) -> Result<()> {
     // that question there is. It goes down the pipe as well as into the
     // log, so it arrives even if this process's own logging is the
     // thing that is broken.
+    // Measured rather than assumed. The whole account of why a paste
+    // does not reach this process rests on what integrity level it
+    // runs at, and until now that was inferred from how it was started
+    // -- a duplicated system token, moved into the session -- which is
+    // not the same as knowing. It is one existing call, and it should
+    // have been here from the first line of this file.
+    let rank = smkvm_input::platform::windows::privilege::our_level()
+        .map(smkvm_input::platform::windows::privilege::describe_level)
+        .unwrap_or("could not be read");
     tell(
         &speak,
         Level::Info,
         format!(
-            "ready: desktop={here} capture={} clipboard=waiting-to-be-told log={}",
+            "ready: desktop={here} integrity={rank} capture={} \
+             clipboard=waiting-to-be-told log={}",
             if capture.is_some() { "yes" } else { "no" },
             smkvm_config::paths::log_file().display()
         ),

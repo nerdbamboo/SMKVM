@@ -340,24 +340,59 @@ nothing about the window, the message loop or the render logic is
 wrong in itself. What differs is only who the worker is: the system
 account, at system integrity, rather than the person at medium.
 
-And that is the oldest rule in this program, met from the other side.
-UIPI refuses *input* injected into a window of higher integrity, which
-is the fault this whole branch began with -- `SendInput` returning
-zero, Windows saying nothing. It equally refuses *messages sent to* a
-window of higher integrity. Delayed rendering works by the system
-sending `WM_RENDERFORMAT` to the clipboard's owner on behalf of
-whoever is pasting; from a medium-integrity application to a
-system-integrity window, that send is exactly what UIPI exists to
-stop. The clipboard then lists the formats, names us as owner, and
-yields nothing, with no handler ever entered -- which is what the
-machine showed, precisely.
+The leading suspect is UIPI, met from the other side. It refuses
+*input* injected into a window of higher integrity -- the fault this
+whole branch began with, `SendInput` returning zero and Windows saying
+nothing. It also refuses *messages sent to* a window of higher
+integrity, and delayed rendering works by the system sending
+`WM_RENDERFORMAT` to the clipboard's owner on behalf of whoever is
+pasting. So the shape fits: the clipboard lists the formats, names us
+as owner, and yields nothing, with no handler ever entered.
 
-`ChangeWindowMessageFilterEx` is the documented way to say a window
-will accept a particular message from less privileged senders, and the
+`ChangeWindowMessageFilterEx` is the documented way for a window to
+accept a particular message from less privileged senders, and the
 window now asks for the three a clipboard owner must receive:
 `WM_RENDERFORMAT`, `WM_RENDERALLFORMATS`, `WM_DESTROYCLIPBOARD`. By
 name rather than wholesale, because nothing else needs to reach a
 window running as the system account.
+
+**But the control cuts against the simple version of that story, and
+it should be read as an open question rather than a settled
+mechanism.** The server's daemon is not a medium-integrity process
+either: its task runs at highest privileges and says so at every
+start, `running high enough for every window ... level="high (run as
+administrator)"`. So on the server a medium application pastes into a
+**high** window and the render arrives; on the client a medium
+application pastes into a **system** window and it does not. A plain
+"lower may not send to higher" rule would have broken the server too,
+and the server has been working throughout.
+
+So one of these is true and it is not yet known which:
+
+- the rule has a step in it that treats high and system differently,
+  and the message filter is the right cure for the reason given;
+- the message filter is the right cure for a different reason;
+- or the block is not UIPI at all and something else correlates with
+  running as the system account.
+
+There is one thing a positive result *would* settle, and it is worth
+being precise about it. `ChangeWindowMessageFilterEx` does nothing
+except adjust UIPI filtering. If adding it makes the paste work, then
+UIPI was blocking the message -- that much is confirmed. What stays
+unconfirmed is the account above of *why* high needs no such call and
+system does. Whoever reads this next will find the server sitting
+there working and should not be puzzled by it: that difference is not
+explained.
+
+Two cheap observations were added rather than reasoned about, being
+the lesson of the round before:
+
+- the worker now reports the integrity level it actually runs at,
+  measured with the call this program already had, instead of it being
+  inferred from how the process was started;
+- the window reports whether each message filter was applied, because
+  a call that quietly succeeded and a call that was never made look
+  identical afterwards.
 
 **This is a hypothesis with a control, not a certainty, so the run that
 tests it also proves which half was wrong.** Independently of the fix,
@@ -372,7 +407,8 @@ anything.
 So the next run distinguishes them without ambiguity:
 
 - `clipboard: WM_RENDERFORMAT entered` appears and the paste works ->
-  UIPI was the cause and the filter is the cure.
+  UIPI was blocking the message and the filter is the cure. Why the
+  server never needed it stays open; see above.
 - It appears and the paste still fails -> the handler runs, the
   message filter was not the problem, and the fault is inside the
   render after all, where the rest of the lines will say so.
@@ -380,6 +416,15 @@ So the next run distinguishes them without ambiguity:
   it either, and the question is which window holds the promise --
   which the new line after taking the clipboard answers outright, by
   reporting `GetClipboardOwner` against our own window handle.
+
+And run the same marker test on the **server**, which is the control
+and costs nothing: it runs the same binary under the task, so
+`WM_RENDERFORMAT entered` should appear in its log too. If it appears
+there and not on the client, the difference is real and located
+exactly where this says. If it appears in neither, the witness channel
+itself is not arriving and nothing below it can be read. Reaching for
+that control before reaching for code is the thing two rounds were
+lost to not doing.
 
 **Returning from a render without supplying data does not defer the
 question -- it answers it, with nothing.** This is the single most
@@ -1149,9 +1194,13 @@ rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
 
 **UIPI is a rule about messages, not only about input.** It was met
-first as injected keystrokes being refused, and it is the same rule
-that stops a lower-privileged application's paste reaching a
-higher-privileged clipboard owner. Anything the system does *on behalf
+first as injected keystrokes being refused; it also governs what a
+window will accept from a less privileged sender, which is why a
+clipboard owner may need `ChangeWindowMessageFilterEx` to be pasted
+from at all. Note that the threshold is *not* simply "any higher
+integrity level": a high-integrity owner on the server is pasted into
+happily by medium-integrity applications without asking for anything.
+Where exactly the step falls is not known here. Anything the system does *on behalf
 of* another process by sending a window a message is subject to it:
 rendering a clipboard format, drag and drop, and more. Running as the
 system account buys reach in one direction and costs it in the other,

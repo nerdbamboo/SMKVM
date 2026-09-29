@@ -852,21 +852,24 @@ fn clipboard_thread(
     // off wholesale: these three are what a clipboard owner must
     // receive, and nothing else needs to reach a window running as the
     // system account.
+    let mut allowed = Vec::new();
     for message in [WM_RENDERFORMAT, WM_RENDERALLFORMATS, WM_DESTROYCLIPBOARD] {
         // SAFETY: a window this thread made, and no filter structure.
-        if unsafe { ChangeWindowMessageFilterEx(window, message, MSGFLT_ALLOW, None) }.is_err() {
-            tracing::warn!(
-                message,
-                "could not ask to receive this message from lower-privileged \
-                 applications; if this process is more privileged than they are, pasting \
-                 will produce nothing"
-            );
-        }
+        let asked = unsafe { ChangeWindowMessageFilterEx(window, message, MSGFLT_ALLOW, None) };
+        // Both outcomes are said. A call that quietly succeeded and a
+        // call that was never made look identical afterwards, and
+        // telling those apart is the entire subject of this round.
+        allowed.push(format!(
+            "{message}={}",
+            if asked.is_ok() { "allowed" } else { "refused" }
+        ));
     }
 
     witness(&format!(
-        "the clipboard window is up: window={:?} thread={thread_id}",
-        window.0
+        "the clipboard window is up: window={:?} thread={thread_id} \
+         messages-from-less-privileged[{}]",
+        window.0,
+        allowed.join(" ")
     ));
     let _ = ready.send(Ok((thread_id, formats)));
 
