@@ -121,56 +121,262 @@ impl Guard {
 /// output they are not translated.
 pub const MAY_HOLD_THE_KEY: [&str; 2] = ["SY", "BA"];
 
+/// The entry types that cannot grant anybody anything.
+///
+/// The list is written this way round -- what is harmless -- and
+/// everything else counts as a grant, *including a type this build has
+/// never heard of*. The first version listed the two granting types it
+/// knew, `A` and `OA`, and ignored the rest. That left `XA` and `ZA`,
+/// the callback forms, invisible: a conditional allow with a trivially
+/// true condition grants Everyone full control and read back as a clean
+/// list. Not a theoretical gap -- it is available to exactly the
+/// attacker this check exists for, in exactly the scenario it exists
+/// for: somebody who owned the directory before the install and left an
+/// explicit entry, which `/setowner`, `/inheritance:r`, `/remove` and
+/// `/grant:r` all leave alone.
+///
+/// Denials (`D`, `OD`, `XD`, `ZD`) grant nothing by definition. Audit
+/// and alarm entries (`AU`, `AL`, `OU`, `OL`, `XU`) record access rather
+/// than permitting it. Mandatory labels (`ML`), resource attributes
+/// (`RA`), scoped policy ids (`SP`), process trust labels (`TL`) and
+/// access filters (`FL`) live in the system part and are not access.
+/// Anything else, known or not, is treated as letting somebody in.
+const NEVER_GRANTS: [&str; 14] = [
+    "D", "OD", "XD", "ZD", "AU", "AL", "OU", "OL", "XU", "ML", "RA", "SP", "TL", "FL",
+];
+
+/// What is said when the list grants everything to everybody.
+const NO_LIST: &str = "everyone (the list is absent, which grants all access)";
+
+/// One entry, as much as is needed of it.
+struct Entry<'a> {
+    kind: String,
+    flags: String,
+    trustee: &'a str,
+    raw: &'a str,
+    /// Whether it had the six fields every real entry has.
+    whole: bool,
+}
+
 /// Everyone an access list lets in, besides those named.
 ///
-/// Setting a list and believing it worked is the same class of mistake as
-/// the silent refused injection this whole project began with: the call
-/// reports success, nothing is visibly wrong, and the consequence is
-/// invisible until somebody goes looking. `icacls` in particular prints
-/// "Successfully processed 0 files; Failed processing 1 files" and has
-/// been known to exit zero doing it. So the list is read back and
-/// checked, and this is the checking -- pure, because it is the part
+/// Setting a list and believing it worked is the same class of mistake
+/// as the silent refused injection this whole project began with: the
+/// call reports success, nothing is visibly wrong, and the consequence
+/// is invisible until somebody goes looking. `icacls` in particular
+/// prints "Successfully processed 0 files; Failed processing 1 files"
+/// and has been known to exit zero doing it. So the list is read back
+/// and checked, and this is the checking -- pure, because it is the part
 /// with a decision in it, and because a parser that is wrong in the
-/// permissive direction would be worse than no check at all.
+/// permissive direction is worse than no check at all.
 ///
-/// Only allow entries are considered. A deny entry cannot grant anything,
-/// and an audit entry is not access.
+/// Every rule here fails towards "somebody can read it". An entry that
+/// cannot be read is an offender; a type that is not recognised is an
+/// offender; a list that says it does not exist is the worst answer
+/// rather than an empty one. The cost of being wrong that way is a
+/// refused install with a confusing message. The cost of being wrong the
+/// other way is a private key anyone on the machine can copy, which no
+/// rollback undoes.
 pub fn granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<String> {
+    let Some(entries) = read_list(sddl) else {
+        return vec![NO_LIST.into()];
+    };
     let mut found = Vec::new();
-    let mut rest = sddl;
-    // Only the discretionary part. A system part (`S:`) holds audit and
-    // integrity entries, which grant nobody anything, and reading them
-    // as grants would refuse lists that are perfectly correct.
-    if let Some(at) = rest.find("D:") {
-        rest = &rest[at + 2..];
-        if let Some(end) = rest.find("S:") {
-            rest = &rest[..end];
-        }
-    } else {
-        // No discretionary list at all means no restriction whatsoever --
-        // every access is granted to everyone. Reported as the worst
-        // possible answer rather than as an empty list of offenders,
-        // which is exactly how it would read if it were counted by ACEs.
-        return vec!["everyone (the list is absent, which grants all access)".into()];
-    }
-    for ace in rest.split('(').skip(1) {
-        let ace = ace.split(')').next().unwrap_or_default();
-        let fields: Vec<&str> = ace.split(';').collect();
-        if fields.len() < 6 {
+    for entry in entries {
+        if NEVER_GRANTS.contains(&entry.kind.as_str()) {
             continue;
         }
-        if !fields[0].eq_ignore_ascii_case("A") && !fields[0].eq_ignore_ascii_case("OA") {
+        if !entry.whole {
+            found.push(format!(
+                "an entry this build could not read: ({})",
+                entry.raw
+            ));
             continue;
         }
-        let trustee = fields[5].trim();
-        if trustee.is_empty() {
+        if entry.trustee.is_empty() {
+            found.push(format!("an entry naming nobody: ({})", entry.raw));
             continue;
         }
-        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(trustee)) {
-            found.push(trustee.to_string());
+        if !allowed
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(entry.trustee))
+        {
+            found.push(entry.trustee.to_string());
         }
     }
     found
+}
+
+/// Everyone a *directory's* list passes on to the files inside it,
+/// besides those named.
+///
+/// The directory itself may legitimately let ordinary accounts in -- they
+/// have to be able to walk into the readable corner. What they must not
+/// have is anything that propagates, because a file created later
+/// inherits it, and the file created later is the private key. So this
+/// asks a narrower question than [`granted_to_anyone_but`]: not "who is
+/// on this list" but "who does this list hand down".
+pub fn inheritably_granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<String> {
+    let Some(entries) = read_list(sddl) else {
+        return vec![NO_LIST.into()];
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        if NEVER_GRANTS.contains(&entry.kind.as_str()) {
+            continue;
+        }
+        if !entry.whole {
+            found.push(format!(
+                "an entry this build could not read: ({})",
+                entry.raw
+            ));
+            continue;
+        }
+        let inherits = entry.flags.contains("OI") || entry.flags.contains("CI");
+        if !inherits {
+            continue;
+        }
+        if entry.trustee.is_empty() {
+            found.push(format!("an entry naming nobody: ({})", entry.raw));
+            continue;
+        }
+        if !allowed
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(entry.trustee))
+        {
+            found.push(entry.trustee.to_string());
+        }
+    }
+    found
+}
+
+/// The entries of the discretionary list, or `None` when there is no
+/// list at all and therefore no restriction on anybody.
+fn read_list(sddl: &str) -> Option<Vec<Entry<'_>>> {
+    let dacl = discretionary_part(sddl)?;
+    let (flags, raws) = flags_and_entries(dacl);
+    // The spelling Windows actually emits for a null list. The first
+    // version tested a descriptor with no `D:` at all and believed that
+    // covered it -- a test written for precisely this bug that missed it
+    // by guessing how the system would say it.
+    if flags.to_ascii_uppercase().contains("NO_ACCESS_CONTROL") {
+        return None;
+    }
+    Some(
+        raws.into_iter()
+            .map(|raw| {
+                let fields: Vec<&str> = raw.split(';').collect();
+                Entry {
+                    kind: fields
+                        .first()
+                        .map(|k| k.trim().to_ascii_uppercase())
+                        .unwrap_or_default(),
+                    flags: fields
+                        .get(1)
+                        .map(|f| f.trim().to_ascii_uppercase())
+                        .unwrap_or_default(),
+                    trustee: fields.get(5).map(|t| t.trim()).unwrap_or_default(),
+                    raw,
+                    whole: fields.len() >= 6,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The text of the discretionary part, if there is one.
+///
+/// Found by walking the descriptor and noticing `D:` and the `S:` that
+/// ends it only *outside* brackets. Searching the whole string for them
+/// is what the first version did, and a conditional entry whose
+/// expression contains those two characters was enough to cut the list
+/// short so that every entry after it went unexamined -- a grant to
+/// Everyone, following an entry naming a perfectly allowed principal,
+/// read back clean. A condition is attacker-written text sitting inside
+/// the thing being parsed, so nothing may be located by searching
+/// through it.
+fn discretionary_part(sddl: &str) -> Option<&str> {
+    let bytes = sddl.as_bytes();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let marker = depth == 0
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b':'
+            && matches!(bytes[i].to_ascii_uppercase(), b'O' | b'G' | b'D' | b'S');
+        if marker {
+            if let Some(from) = start {
+                // A later component ends the discretionary one.
+                return Some(&sddl[from..i]);
+            }
+            if bytes[i].eq_ignore_ascii_case(&b'D') {
+                start = Some(i + 2);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    start.map(|from| &sddl[from..])
+}
+
+/// The flags before the first entry, and each entry's text without its
+/// outermost brackets.
+///
+/// Bracket depth is tracked rather than split on. Splitting on `(` --
+/// which is what this did -- tears a conditional entry into fragments
+/// that are each too short to look like an entry, so the real one is
+/// lost and the fragments are skipped as unreadable. A grant to an
+/// ordinary group written that way read back as a clean list. Getting
+/// this right is also what makes refusing a short entry safe: after
+/// tokenising properly, an entry with fewer than six fields is genuinely
+/// malformed rather than an artefact of the scan.
+fn flags_and_entries(dacl: &str) -> (&str, Vec<&str>) {
+    let bytes = dacl.as_bytes();
+    let mut depth = 0usize;
+    let mut flags_end = dacl.len();
+    let mut entries = Vec::new();
+    let mut entry_start = 0usize;
+    for (i, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => {
+                if depth == 0 {
+                    if entries.is_empty() {
+                        flags_end = flags_end.min(i);
+                    }
+                    entry_start = i + 1;
+                }
+                depth += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    entries.push(&dacl[entry_start..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Opened and never closed. Kept rather than dropped, so the field
+    // count refuses it instead of it vanishing.
+    if depth > 0 {
+        entries.push(&dacl[entry_start..]);
+    }
+    (&dacl[..flags_end], entries)
 }
 
 /// Pull the security descriptors out of what `icacls /save` writes.
@@ -246,10 +452,26 @@ mod tests {
         assert_eq!(pipe_name(&one).len(), 13 + NAME_BYTES * 2);
     }
 
+    fn strangers(sddl: &str) -> Vec<String> {
+        granted_to_anyone_but(sddl, &MAY_HOLD_THE_KEY)
+    }
+
+    /// The question every one of these asks: would this list be blessed
+    /// while somebody who should not be able to read the key can?
+    fn says_it_is_private(sddl: &str) -> bool {
+        strangers(sddl).is_empty()
+    }
+
     #[test]
     fn a_list_naming_only_the_two_that_may_hold_the_key_has_nobody_else_on_it() {
-        let good = "D:PAI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)";
-        assert!(granted_to_anyone_but(good, &MAY_HOLD_THE_KEY).is_empty());
+        assert!(says_it_is_private(
+            "D:PAI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)"
+        ));
+        // Lower case, and the components in the order Windows writes
+        // them, with an owner and a group in front.
+        assert!(says_it_is_private(
+            "O:BAG:BAd:pai(a;oiciid;fa;;;sy)(a;;fa;;;ba)"
+        ));
     }
 
     #[test]
@@ -259,39 +481,199 @@ mod tests {
         // directory produced, and the exact thing the install then
         // printed a line claiming was not so.
         let bad = "D:PAI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)";
-        assert_eq!(granted_to_anyone_but(bad, &MAY_HOLD_THE_KEY), vec!["BU"]);
+        assert_eq!(strangers(bad), vec!["BU"]);
     }
 
     #[test]
     fn a_stranger_who_made_the_directory_first_is_reported() {
-        // A local account that pre-created the directory keeps an
-        // explicit entry, written out as its full identifier rather than
-        // an alias. Anything not on the allowed list counts, whatever
-        // shape it takes.
         let squatted = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-11)";
+        assert_eq!(strangers(squatted), vec!["S-1-5-11"]);
+    }
+
+    // ---------------------------------------------------------------
+    // The four ways this said SAFE while the key was readable.
+    //
+    // Found by running inputs through it rather than by reading it, so
+    // they are kept verbatim: every one of these is a list the parser
+    // blessed and an attacker could have written. The tests that were
+    // here before were all inputs somebody had thought of, and the gap
+    // was the spelling nobody did.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn the_spelling_windows_actually_uses_for_no_list_at_all() {
+        // The old test covered a descriptor with *no* `D:` component.
+        // This is what the system emits instead, and it parsed to zero
+        // entries and read clean -- a test written for exactly this bug
+        // that missed it by guessing the wording.
+        assert!(!says_it_is_private("O:SYG:SYD:NO_ACCESS_CONTROL"));
+        assert!(strangers("O:SYG:SYD:NO_ACCESS_CONTROL")[0].contains("absent"));
+        assert!(!says_it_is_private("D:NO_ACCESS_CONTROLS:AI"));
+        // And still the case with no discretionary component at all.
+        assert!(!says_it_is_private("O:BAG:BA"));
+    }
+
+    #[test]
+    fn a_conditional_allow_is_a_grant_like_any_other() {
+        // `XA` and `ZA` were skipped entirely, because the type test
+        // listed the granting types instead of the harmless ones. A
+        // condition that is trivially true grants Everyone everything.
         assert_eq!(
-            granted_to_anyone_but(squatted, &MAY_HOLD_THE_KEY),
-            vec!["S-1-5-11"]
+            strangers(r#"D:P(A;;FA;;;SY)(XA;;FA;;;WD;(1==1))"#),
+            vec!["WD"]
+        );
+        assert_eq!(strangers(r#"D:P(A;;FA;;;SY)(ZA;;FA;;;WD;(x))"#), vec!["WD"]);
+    }
+
+    #[test]
+    fn a_condition_cannot_cut_the_list_short() {
+        // The `S:` inside the condition ended the scan, so the grant
+        // after it was never examined. Note the truncating entry names
+        // an *allowed* principal, so fixing the type test alone does
+        // nothing here: two separate faults, one attacker.
+        assert_eq!(
+            strangers(r#"D:P(XA;;FA;;;BA;(@a=="S:"))(A;;FA;;;WD)"#),
+            vec!["WD"]
+        );
+        // The same list without the trick, which always worked.
+        assert_eq!(
+            strangers(r#"D:P(XA;;FA;;;BA;(@a=="x"))(A;;FA;;;WD)"#),
+            vec!["WD"]
+        );
+        // And a condition may not smuggle in a discretionary part either.
+        assert_eq!(
+            strangers(r#"D:P(XA;;FA;;;BA;(@a=="D:(A;;FA;;;SY)"))(A;;FA;;;WD)"#),
+            vec!["WD"]
+        );
+    }
+
+    #[test]
+    fn a_condition_with_brackets_of_its_own_does_not_fragment_the_entry() {
+        // Splitting on `(` tore this into pieces that were each too
+        // short to look like an entry: the real one was lost to the type
+        // test and the fragments were skipped as unreadable, so a grant
+        // to an ordinary group read back clean.
+        assert_eq!(
+            strangers("D:P(XA;;FA;;;BU;(Member_of{SID(BA)}))"),
+            vec!["BU"]
+        );
+        // Deeper nesting, and a second entry after it that must still be
+        // seen.
+        assert_eq!(
+            strangers("D:P(XA;;FA;;;BA;(a((b))c))(A;;FA;;;WD)"),
+            vec!["WD"]
+        );
+    }
+
+    #[test]
+    fn a_truncated_entry_is_refused_rather_than_skipped() {
+        // Skipping what cannot be read is the permissive direction, and
+        // a short entry is exactly what somebody would write to be
+        // skipped. Safe to refuse only because entries are tokenised by
+        // brackets first -- before that, the scan produced short
+        // fragments of its own and refusing would have rejected sound
+        // input.
+        for broken in [
+            // Cut off mid-entry, with the closing bracket missing.
+            "D:P(A;;FA;;;",
+            // Cut off earlier, so it has too few fields to be an entry.
+            "D:P(A;;FA",
+            // An empty entry.
+            "D:P(A;;FA;;;SY)()",
+            // Whole, but naming nobody.
+            "D:P(A;;FA;;;SY)(A;;FA;;;)",
+        ] {
+            assert!(!says_it_is_private(broken), "{broken} was blessed");
+            let said = &strangers(broken)[0];
+            assert!(
+                said.contains("could not read") || said.contains("naming nobody"),
+                "{broken} was refused for an unexpected reason: {said}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Each type that grants nobody anything, pinned one at a time, so
+    // the list is a fact rather than an assumption.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn every_non_granting_type_is_ignored_and_nothing_else_is() {
+        for kind in [
+            "D", "OD", "XD", "ZD", "AU", "AL", "OU", "OL", "XU", "ML", "RA", "SP", "TL", "FL",
+        ] {
+            let list = format!("D:P(A;;FA;;;SY)({kind};;FA;;;WD)");
+            assert!(
+                says_it_is_private(&list),
+                "{kind} was treated as granting, and it cannot grant"
+            );
+        }
+        for kind in ["A", "OA", "XA", "ZA"] {
+            let list = format!("D:P(A;;FA;;;SY)({kind};;FA;;;WD)");
+            assert_eq!(strangers(&list), vec!["WD"], "{kind} grants and was missed");
+        }
+    }
+
+    #[test]
+    fn a_type_this_build_has_never_heard_of_counts_as_granting() {
+        // The rule that makes the list above safe to keep: being
+        // unrecognised must not be a way through. If Windows grows a new
+        // allow form, this refuses it until somebody has looked.
+        assert_eq!(strangers("D:P(A;;FA;;;SY)(QQ;;FA;;;WD)"), vec!["WD"]);
+        assert_eq!(strangers("D:P(A;;FA;;;SY)(;;FA;;;WD)"), vec!["WD"]);
+    }
+
+    #[test]
+    fn what_a_directory_hands_down_is_a_narrower_question() {
+        // Ordinary accounts may reach the directory -- they have to walk
+        // into the readable corner -- but must inherit nothing from it,
+        // because what is created there later is the key.
+        let right = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a9;;;BU)";
+        assert!(
+            inheritably_granted_to_anyone_but(right, &MAY_HOLD_THE_KEY).is_empty(),
+            "read on the directory object alone hands nothing down"
+        );
+        // The first version's list, which is what put the key where
+        // anyone could read it.
+        let wrong = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+        assert_eq!(
+            inheritably_granted_to_anyone_but(wrong, &MAY_HOLD_THE_KEY),
+            vec!["BU"]
+        );
+        // Either inheritance flag alone is enough to reach a new file.
+        for flags in ["OI", "CI", "OICIIO", "CIOI"] {
+            let list = format!("D:P(A;OICI;FA;;;SY)(A;{flags};FA;;;WD)");
+            assert_eq!(
+                inheritably_granted_to_anyone_but(&list, &MAY_HOLD_THE_KEY),
+                vec!["WD"],
+                "{flags} propagates and was missed"
+            );
+        }
+        // And the same evasions must not work on this question either.
+        assert!(
+            !inheritably_granted_to_anyone_but("O:SYD:NO_ACCESS_CONTROL", &MAY_HOLD_THE_KEY)
+                .is_empty()
+        );
+        assert_eq!(
+            inheritably_granted_to_anyone_but(
+                "D:P(XA;;FA;;;BA;(@a==\"S:\"))(A;OICI;FA;;;WD)",
+                &MAY_HOLD_THE_KEY
+            ),
+            vec!["WD"]
         );
     }
 
     #[test]
     fn a_denial_grants_nobody_anything_and_a_system_list_is_not_a_grant() {
-        let with_a_denial = "D:PAI(D;;FA;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)";
-        assert!(granted_to_anyone_but(with_a_denial, &MAY_HOLD_THE_KEY).is_empty());
+        assert!(says_it_is_private(
+            "D:PAI(D;;FA;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
         // An integrity label lives in the system part and is not access.
-        let labelled = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NWNRNX;;;LW)";
-        assert!(granted_to_anyone_but(labelled, &MAY_HOLD_THE_KEY).is_empty());
-    }
-
-    #[test]
-    fn no_list_at_all_is_the_worst_answer_rather_than_a_clean_one() {
-        // A descriptor with no discretionary part grants everything to
-        // everybody. Counting offending entries would find none and call
-        // it safe, which is the direction a check must never fail in.
-        let none = "O:BAG:BA";
-        assert_eq!(granted_to_anyone_but(none, &MAY_HOLD_THE_KEY).len(), 1);
-        assert!(granted_to_anyone_but(none, &MAY_HOLD_THE_KEY)[0].contains("absent"));
+        assert!(says_it_is_private(
+            "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NWNRNX;;;LW)"
+        ));
+        // A system part that grants Everyone is still not access.
+        assert!(says_it_is_private("D:P(A;;FA;;;SY)S:(AU;SAFA;FA;;;WD)"));
     }
 
     #[test]

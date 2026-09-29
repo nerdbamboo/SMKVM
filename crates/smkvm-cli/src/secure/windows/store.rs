@@ -230,16 +230,37 @@ fn make_readable_corner(dir: &Path) -> Result<PathBuf> {
     Ok(corner)
 }
 
-/// Read a list back and say who is on it besides the two that may be.
+/// What reading a list back established.
+///
+/// Three answers, not two, and the third is the point. "Anyone can read
+/// the key" and "I could not tell whether anyone can read the key" are
+/// different facts and deserve different reactions, and conflating them
+/// is how a check meant to protect a machine takes it down instead.
+pub enum Verdict {
+    /// Nobody but the two that may.
+    Private,
+    /// These can reach it, and must not be able to.
+    Reachable(Vec<String>),
+    /// The list could not be read or could not be understood. Not
+    /// evidence of a fault; not evidence of its absence either.
+    Unproven(String),
+}
+
+/// Read a list back and say what it establishes.
 ///
 /// `/save` writes SDDL, which is the same on every machine whatever
 /// language it is in. `icacls`'s ordinary printing uses account names,
 /// which are translated -- and a check that silently fails to parse on a
 /// Korean machine is worse than no check, because it reports success.
-fn who_can_reach(path: &Path) -> Result<Vec<String>> {
+fn inspect(path: &Path, inheritable_only: bool) -> Verdict {
     let saved = std::env::temp_dir().join(format!("smkvm-acl-{}.sddl", std::process::id()));
+    let container = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    };
     let outcome = icacls(&[
-        path.parent().unwrap_or(path).as_os_str(),
+        container.as_os_str(),
         OsStr::new("/save"),
         saved.as_os_str(),
         OsStr::new("/c"),
@@ -253,11 +274,16 @@ fn who_can_reach(path: &Path) -> Result<Vec<String>> {
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        Ok(String::from_utf16_lossy(&wide))
+        Ok::<String, anyhow::Error>(String::from_utf16_lossy(&wide))
     });
     let _ = std::fs::remove_file(&saved);
-    let text = read?;
+    let text = match read {
+        Ok(text) => text,
+        Err(e) => return Verdict::Unproven(format!("{e:#}")),
+    };
 
+    // For a directory, `/save` names it by its own last component; for a
+    // file, by its name within the container.
     let wanted = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -267,36 +293,129 @@ fn who_can_reach(path: &Path) -> Result<Vec<String>> {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(&wanted) || name.ends_with(&wanted));
     let Some((_, sddl)) = found else {
-        // A list that could not be read is not a list that is correct.
-        // Failing closed is the whole point of doing this at all.
-        bail!(
-            "the access list on {} could not be read back, so it cannot be confirmed. \
-             `icacls \"{}\" /save` wrote nothing this build could parse",
-            path.display(),
-            path.parent().unwrap_or(path).display()
-        );
+        return Verdict::Unproven(format!(
+            "`icacls \"{}\" /save` wrote nothing this build could find {wanted} in",
+            container.display()
+        ));
     };
-    Ok(acl::granted_to_anyone_but(sddl, &acl::MAY_HOLD_THE_KEY))
+    let strangers = if inheritable_only {
+        acl::inheritably_granted_to_anyone_but(sddl, &acl::MAY_HOLD_THE_KEY)
+    } else {
+        acl::granted_to_anyone_but(sddl, &acl::MAY_HOLD_THE_KEY)
+    };
+    if strangers.is_empty() {
+        Verdict::Private
+    } else {
+        Verdict::Reachable(strangers)
+    }
 }
 
-/// Confirm that nobody but the system account and administrators can
-/// reach the key, and refuse if anyone can.
+/// Confirm the key is private, with a person standing there.
+///
+/// Both an unreadable list and a readable key stop the install, because
+/// somebody is watching and can act on either -- and because the install
+/// is the moment at which a machine can still be left alone.
 pub fn confirm_key_is_private(path: &Path) -> Result<()> {
-    let strangers = who_can_reach(path)?;
-    if !strangers.is_empty() {
-        bail!(
-            "{} can be reached by {}, which must not be so: it is this machine's private \
-             key, and anyone holding a copy can connect to the server as this machine and \
-             be handed the cursor, and the keystrokes that follow it. Check with `icacls \
-             \"{}\"`; the remedy is to delete {} and install again, and to pair this \
-             machine afresh, because a key that has been readable stays copied",
+    match inspect(path, false) {
+        Verdict::Private => Ok(()),
+        Verdict::Reachable(strangers) => bail!("{}", reachable_says(path, &strangers)),
+        Verdict::Unproven(why) => bail!(
+            "the access list on {} could not be confirmed, so this install stops rather \
+             than assuming it is right: {why}. Check by hand with `icacls \"{}\"`, and \
+             from an ordinary account that `type {}` is refused",
             path.display(),
-            strangers.join(", "),
             path.display(),
-            path.parent().unwrap_or(path).display()
-        );
+            path.display()
+        ),
     }
-    Ok(())
+}
+
+/// Confirm nothing the directory hands down reaches anyone it should not.
+///
+/// Asked *before* anything is written into it. The version of this that
+/// checked only the key, and only after copying it, found a hostile
+/// inherited entry by writing the key into a file that entry could read
+/// -- an honest report of an exposure that had already happened. There
+/// is no reason to learn it that way: the directory's list is knowable
+/// before the first byte goes in.
+pub fn confirm_directory_hands_nothing_down(dir: &Path) -> Result<()> {
+    match inspect(dir, true) {
+        Verdict::Private => Ok(()),
+        Verdict::Reachable(strangers) => bail!(
+            "{} hands down access to {}, so anything written into it -- including this \
+             machine's private key -- would be readable by them. Nothing has been \
+             written. Somebody may have created this directory before the installer did \
+             and kept an entry on it; remove {} and install again",
+            dir.display(),
+            strangers.join(", "),
+            dir.display()
+        ),
+        Verdict::Unproven(why) => bail!(
+            "what {} hands down could not be confirmed, so nothing has been written into \
+             it: {why}",
+            dir.display()
+        ),
+    }
+}
+
+/// Confirm the key is private, from inside the service.
+///
+/// The asymmetry with the install is deliberate and is the whole reason
+/// these are two functions. A key anyone can read is a refusal here too:
+/// carrying on means handshaking with a secret that is not one, and the
+/// machine is better off not running than running on a key somebody may
+/// already have copied.
+///
+/// A list that could not be *read* is only a warning. Failing to parse
+/// is not evidence of a fault, and this build's parser has been wrong
+/// before -- four ways, all of them found by somebody feeding it inputs
+/// rather than reading it. Refusing to start over the parser's own
+/// ignorance would take the machine down for a reason that may not
+/// exist, and that is the same shape as the outage this whole hardware
+/// round began with: a service that would not run because a check could
+/// not be completed, rather than because anything was wrong.
+///
+/// The two are written to be told apart in the log at a glance, because
+/// that log is what somebody will be reading on the machine.
+pub fn check_key_before_using_it(path: &Path) -> Result<()> {
+    match inspect(path, false) {
+        Verdict::Private => {
+            tracing::info!(
+                key = %path.display(),
+                "KEY PRIVATE: readable only by the system account and administrators"
+            );
+            Ok(())
+        }
+        Verdict::Reachable(strangers) => {
+            bail!("KEY READABLE: {}", reachable_says(path, &strangers))
+        }
+        Verdict::Unproven(why) => {
+            tracing::warn!(
+                key = %path.display(),
+                "KEY UNPROVEN: its access list could not be read, so this service cannot \
+                 say whether anyone else can reach the key. Starting anyway, because \
+                 failing to read a list is not evidence that it is wrong -- but check by \
+                 hand, from an ordinary account, that `type {}` is refused. The reason \
+                 was: {why}",
+                path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn reachable_says(path: &Path, strangers: &[String]) -> String {
+    format!(
+        "{} can be reached by {}, which must not be so: it is this machine's private \
+         key, and anyone holding a copy can connect to the server as this machine and \
+         be handed the cursor, and the keystrokes that follow it. Check with `icacls \
+         \"{}\"`; the remedy is to delete {} and install again, and to pair this \
+         machine afresh, because a key that has been readable stays copied",
+        path.display(),
+        strangers.join(", "),
+        path.display(),
+        path.parent().unwrap_or(path).display()
+    )
 }
 
 /// What happened, for the person watching.
@@ -325,6 +444,11 @@ pub fn prepare() -> Result<Carried> {
     }
     make_directory(&dir)?;
     make_readable_corner(&dir)?;
+    // Before a single byte goes in. Whatever the directory hands down is
+    // what the key will inherit the instant it exists, so this is the
+    // moment to find out -- not after the key has been written into a
+    // file somebody else can read.
+    confirm_directory_hands_nothing_down(&dir)?;
 
     // Out of this account's own places, whatever they are -- the person
     // running the install is the one whose machine this is paired as.
@@ -357,9 +481,11 @@ pub fn prepare() -> Result<Carried> {
         }
     }
 
-    // Read back, always, whatever was or was not done just now: a key
-    // left by an earlier version of this code, or put there by hand, is
-    // exactly as dangerous as one this run created.
+    // And the key itself, read back, whatever was or was not done just
+    // now: one left by an earlier version of this code, or put there by
+    // hand, is exactly as dangerous as one this run created. The
+    // directory check above is about what *will* be inherited; this is
+    // about what is actually on the file.
     let key = dir.join(paths::IDENTITY_NAME);
     if key.exists() {
         confirm_key_is_private(&key)?;

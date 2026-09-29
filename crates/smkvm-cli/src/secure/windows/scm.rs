@@ -483,15 +483,15 @@ fn serve() -> Result<()> {
     // A key that anyone can read is refused rather than warned about,
     // because carrying on means handshaking with a secret that is not
     // one. A list that cannot be *read* is only a warning: failing to
-    // parse is not evidence of a fault, and refusing to start over it
-    // would take the machine down for a reason that may not exist.
+    // parse is not evidence of a fault -- this build's parser has been
+    // wrong four separate ways -- and refusing to start over the
+    // parser's own ignorance is the same shape as the outage this
+    // hardware round began with. The log says `KEY PRIVATE`,
+    // `KEY READABLE` or `KEY UNPROVEN`, so which of the three it was is
+    // one glance rather than a reading.
     let key = smkvm_config::paths::identity_file();
     if key.exists() {
-        store::confirm_key_is_private(&key)?;
-        tracing::info!(
-            key = %key.display(),
-            "this machine's key is readable only by the system account and administrators"
-        );
+        store::check_key_before_using_it(&key)?;
     }
     token::enable_tcb_privilege()?;
     tracing::info!(
