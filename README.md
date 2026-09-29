@@ -110,6 +110,16 @@ is the same, `uninstall` removes whichever is registered, and the two are
 never both installed. If the service will not start, the daemon behaves
 exactly as the task's would.
 
+A service has no profile of its own worth reading, so it keeps this
+machine's configuration, identity and paired machines in
+`%ProgramData%\smkvm` instead, and its log with them. `install --system`
+copies your existing three files there, so a machine that is already paired
+stays paired; it says what it copied and what it found already there, and it
+never replaces an identity that is there, because that would mean pairing
+with every other machine again. Only the system account and administrators
+can read the identity file. `uninstall` leaves the copies where they are and
+says so.
+
 ## Where things live
 
 | | Linux | Windows |

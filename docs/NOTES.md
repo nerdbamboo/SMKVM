@@ -180,6 +180,14 @@ say what each one was. What remains:
   replacement and stale clears are recognised, so nothing is lost -- but a
   slow fetch still delays the next offer. The Windows side has the same shape
   inside `WM_RENDERFORMAT`.
+- **In service mode, a `transfer.directory` of `~/Downloads/SMKVM` lands in
+  the system profile.** The system account's home is not the person's, so
+  files pasted or dragged onto a machine running the service arrive
+  somewhere the person cannot see. Guessing whose Downloads a service meant
+  is the same bad question as guessing whose configuration to read, so the
+  answer is probably an explicit path in `smkvm.toml` rather than a
+  cleverer `~`. Not yet done, and not yet run into, because files have not
+  been tried in service mode at all.
 - **The GUI on a client shows only that client.** A client's status report
   carries no desk -- `monitor = []` even for its own screens -- so the desk
   view is complete only on the server. Either the server sends the desk to
@@ -283,7 +291,11 @@ whether it can set hooks there, or only inject; whether
 pipe's `O:SYD:P(A;;GA;;;SY)` is accepted by `CreateNamedPipeW`; whether
 the overlapped waits behave as intended; whether the input-desktop poll
 sees the switch promptly enough to be useful; whether the service now
-stops when asked; whether a failed start does produce the restart actions; whether a worker
+stops when asked; whether a failed start does produce the restart actions; whether `icacls`
+applies the two lists as written and whether `%ProgramData%\smkvm` ends up
+readable by `smkvm status` and unreadable to an ordinary account for
+`device.toml`; whether carrying the three files across leaves an
+already-paired machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
 to start rather than a loop;
 whether the quarter-second desktop comparison is in fact quick enough that
@@ -308,6 +320,74 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**What the first attempt on real hardware found.** It reached
+`service_main`, logged that it was running as a service, and exited one
+second later with `ERROR_SERVICE_SPECIFIC_ERROR` -- the daemon, running as
+LocalSystem, had looked for its configuration in
+`C:\WINDOWS\system32\config\systemprofile\AppData\Roaming\smkvm` and
+found none. Nothing to do with any Win32 call; the service simply had no
+idea whose files it was meant to read. Worth recording for two reasons.
+The diagnosis took one `sc query` and one log line, which is the exit-code
+fix from the round before earning itself back. And it is the shape of
+defect none of the reasoning rounds could have caught: everything about it
+was correct except an assumption about the environment, which only a
+machine has.
+
+The fix is `Scope` in `smkvm-config::paths`. Service mode reads and writes
+under `%ProgramData%\smkvm`; everything else is unchanged. The choosing is
+a pure function of the scope and the environment roots, so the case that
+failed -- LocalSystem's real `APPDATA`, which resolves perfectly well and
+is simply the wrong place -- is now a test on any machine.
+
+**Why the service does not read a person's profile instead.** It would be
+the smaller change and it is the wrong one. Which person? At boot, before
+anyone has logged in, there is nobody -- and that is precisely the case
+`--system` exists to cover. A service running as the system account
+reaching into `C:\Users\<somebody>\AppData` is also a thing to be uneasy
+about on its own account. So the files are carried across once, at install
+time, by the person installing, who is the one whose machine this is
+paired as.
+
+**What is carried, and what is deliberately not.** `smkvm.toml`,
+`device.toml` and `peers.toml` -- `paths::CARRIED_OVER`, named in one place
+so the copying cannot drift from the list. Not the status report, which is
+written by whichever daemon is running and would announce a daemon that is
+not there. A file already in the machine directory is left alone rather
+than overwritten, and the reason is `device.toml`: replacing it is not an
+update, it is becoming a different machine, because every other machine's
+paired list still names the old key. So a second `install --system` is
+safe, which is the thing somebody is most likely to try. `uninstall`
+leaves the copies and says where they are, for the same reason -- deleting
+an identity is the one irreversible act here.
+
+**Who may read what, and why it is spelled out.** `%ProgramData%` grants
+every authenticated user read access by inheritance, so a directory made
+there and left alone would put this machine's private key where any local
+account could read it. That key is what the server trusts this machine by:
+a copy of it is a machine that can connect as this one and be handed the
+cursor, and therefore the keystrokes that follow it. So the directory gets
+an explicit list -- system account and administrators everything, ordinary
+users read only -- and `device.toml` gets one of its own with no ordinary
+users at all. `peers.toml` needs the other half of the argument: its
+contents are public keys and are not secret, but a peer written into it is
+a machine this one will accept a session from, which is why ordinary users
+get read and not write.
+
+The status report stays readable on purpose. `smkvm status` and the window
+are run by the person at the desk, and would stop working the moment
+somebody chose `--system` otherwise; what it discloses is which machines
+are connected and where their screens are, to somebody already sitting at
+one of them. Readers look machine-wide first and in the profile second,
+because the writer and the reader need not be the same scope.
+
+The lists are applied with `icacls` naming the groups by their well-known
+identifiers rather than as "Administrators" and "Users", because those
+names are translated -- on the machines this is meant for they are
+something else entirely, and a rule that silently fails to apply is how a
+private key ends up readable while the install prints success. That lesson
+is in this file once already, about a service status parsed out of
+translated text.
 
 **What the first session on real hardware should look like.** In order:
 the service starts and logs `running as a service`; if nobody is logged in
@@ -428,6 +508,16 @@ one `stopping()` that replaced `ctrl_c()` everywhere the daemon waited on
 it. A `STOP_PENDING` report also has to carry `dwWaitHint` and a rising
 `dwCheckPoint`, or the manager has no reason to keep waiting and treats
 the service as hung.
+
+**The system account has a profile, and it is not a useful one.**
+LocalSystem's `APPDATA` and `LOCALAPPDATA` resolve to real directories
+under `C:\WINDOWS\system32\config\systemprofile`. Nothing fails, nothing
+is empty-stringed, nothing warns: paths built from them are perfectly
+well-formed and point at a place none of this machine's files are. A
+service written on the assumption that "the environment says where my
+files are" is therefore wrong in the one way that produces no error until
+the file is opened. Which files belong to a person and which to the
+machine is a decision, and it is `paths::Scope`.
 
 **"Which desktop has the input" and "which desktop am I on" are different
 questions, and the call that answers the first will hand you a name that
