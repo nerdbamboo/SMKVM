@@ -9,9 +9,11 @@
 //! of one installation have got out of step, which is answered by the
 //! handshake below rather than by a number every machine has to agree on.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use smkvm_layout::Monitor;
-use smkvm_proto::{Key, MouseButton, Scroll};
+use smkvm_proto::{ClipFormat, Key, MouseButton, Scroll};
 
 /// Bumped whenever anything in this file changes shape.
 ///
@@ -19,7 +21,7 @@ use smkvm_proto::{Key, MouseButton, Scroll};
 /// worker rather than guessing, because the alternative -- misreading a
 /// frame and injecting whatever the bytes happen to decode as -- is a
 /// program typing at random into a consent prompt.
-pub const WORKER_PROTOCOL: u32 = 1;
+pub const WORKER_PROTOCOL: u32 = 2;
 
 /// Longest frame either side will send or accept.
 ///
@@ -57,6 +59,38 @@ pub enum ToWorker {
     /// Let go and exit. Sent before the worker is replaced, so a worker
     /// leaving a desktop does not leave a key held down on it.
     Stop,
+
+    // ---- the clipboard, which is the person's and not session 0's ----
+    /// Take up, or put down, the person's clipboard.
+    ///
+    /// Only a worker on the ordinary desktop is asked. See
+    /// `watch::serves_the_clipboard` for why.
+    ServeClipboard(bool),
+    /// Read what is on it, for a machine that is pasting elsewhere.
+    ReadClipboard {
+        id: u64,
+        format: ClipFormat,
+    },
+    /// Put another machine's clipboard onto this one: announce these
+    /// formats and fetch the contents only if something pastes.
+    OfferClipboard {
+        formats: Vec<ClipFormat>,
+    },
+    /// Give the clipboard back to whatever had it.
+    ReleaseClipboard,
+    /// The contents the worker asked for with [`FromWorker::WantsPaste`],
+    /// having been fetched from the machine that copied them.
+    Pasted {
+        id: u64,
+        bytes: Result<Vec<u8>, String>,
+    },
+    /// The cursor is leaving with the button held: find out whether
+    /// something is being dragged, and what.
+    CatchDrag {
+        id: u64,
+    },
+    /// Files have arrived; let go of them where the pointer is.
+    DropFiles(Vec<PathBuf>),
 }
 
 /// What the worker says back.
@@ -86,6 +120,31 @@ pub enum FromWorker {
     /// An injection the system turned down, with whatever it said. The
     /// service treats this exactly as the daemon treats a local refusal.
     Refused(String),
+
+    // ---- the clipboard ----
+    /// Somebody copied something here.
+    ClipboardChanged(Vec<ClipFormat>),
+    /// The answer to [`ToWorker::ReadClipboard`].
+    ClipboardRead {
+        id: u64,
+        bytes: Result<Vec<u8>, String>,
+    },
+    /// Something on this machine is pasting what another machine copied,
+    /// so the contents are wanted now. The service fetches them over the
+    /// link and answers with [`ToWorker::Pasted`].
+    ///
+    /// This is the one exchange that runs the other way round, and it is
+    /// why the pipe needs request and answer in both directions.
+    WantsPaste {
+        id: u64,
+        format: ClipFormat,
+    },
+    /// The answer to [`ToWorker::CatchDrag`]: what was being dragged, if
+    /// anything.
+    DragCaught {
+        id: u64,
+        paths: Vec<PathBuf>,
+    },
 }
 
 /// The events the worker captures, mirrored here rather than shared.
@@ -254,6 +313,21 @@ mod tests {
         round_trip(ToWorker::Flush);
         round_trip(ToWorker::Swallow(true));
         round_trip(ToWorker::Stop);
+        round_trip(ToWorker::ServeClipboard(true));
+        round_trip(ToWorker::ReadClipboard {
+            id: 1,
+            format: ClipFormat::Text,
+        });
+        round_trip(ToWorker::OfferClipboard {
+            formats: vec![ClipFormat::Text],
+        });
+        round_trip(ToWorker::ReleaseClipboard);
+        round_trip(ToWorker::Pasted {
+            id: 2,
+            bytes: Ok(Vec::new()),
+        });
+        round_trip(ToWorker::CatchDrag { id: 3 });
+        round_trip(ToWorker::DropFiles(vec![PathBuf::from("/tmp/x")]));
     }
 
     #[test]
@@ -265,6 +339,23 @@ mod tests {
         round_trip(FromWorker::Saw(Saw::PointerBy { dx: 3, dy: -4 }));
         round_trip(FromWorker::Monitors(Vec::new()));
         round_trip(FromWorker::InputDesktop(Some("Winlogon".into())));
+        round_trip(FromWorker::ClipboardChanged(vec![ClipFormat::Text]));
+        round_trip(FromWorker::ClipboardRead {
+            id: 7,
+            bytes: Ok(vec![1, 2, 3]),
+        });
+        round_trip(FromWorker::ClipboardRead {
+            id: 8,
+            bytes: Err("the owning application would not hand it over".into()),
+        });
+        round_trip(FromWorker::WantsPaste {
+            id: 9,
+            format: ClipFormat::Text,
+        });
+        round_trip(FromWorker::DragCaught {
+            id: 10,
+            paths: vec![PathBuf::from(r"C:\a\b.txt")],
+        });
         round_trip(FromWorker::InputDesktop(None));
         round_trip(FromWorker::Refused("SendInput returned 0".into()));
     }

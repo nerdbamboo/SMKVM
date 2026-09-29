@@ -69,7 +69,8 @@ use windows::Win32::Security::{
     SE_TCB_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
     TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
-use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
     WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
@@ -223,6 +224,56 @@ pub fn system_token_in_session(session: u32) -> Result<Owned> {
         )
     })?;
     Ok(worker)
+}
+
+/// Where the person at the screen keeps their files.
+///
+/// Asked because a file pasted or dragged onto this machine lands under
+/// `transfer.directory`, whose default begins with `~` -- and expanded
+/// in a service that is the system profile, which is not a place to put
+/// something somebody just asked for.
+///
+/// This is a question with a good answer, unlike "whose configuration
+/// should a service read". There *is* a person at the screen; the
+/// system knows who; and their own environment says where their profile
+/// is, so nothing here guesses at `C:\Users\<name>` or assumes profiles
+/// are in the usual place.
+///
+/// The worker could be asked instead, being in the session -- but the
+/// worker is the system account too, so it would have to ask the same
+/// way, and the service already holds the privilege this needs. One
+/// round trip fewer for the same answer.
+pub fn home_in_session(session: u32) -> Result<std::path::PathBuf> {
+    let mut token = HANDLE::default();
+    // SAFETY: a place for the token; wrapped below before any return.
+    unsafe { WTSQueryUserToken(session, &mut token) }.with_context(|| {
+        format!("asking who is logged in at session {session}, to find out where they keep things")
+    })?;
+    let token = Owned(token);
+
+    let mut block = std::ptr::null_mut();
+    // SAFETY: a valid token and a place for the block, freed below.
+    unsafe { CreateEnvironmentBlock(&mut block, token.0, false) }
+        .context("reading that person's environment")?;
+    // SAFETY: the block is a run of null-terminated wide strings ended
+    // by a second null, which is what is walked to find its length.
+    let found = unsafe {
+        let mut len = 0usize;
+        // Two zeroes in a row end the block; one ends an entry.
+        while !(*block.cast::<u16>().add(len) == 0 && *block.cast::<u16>().add(len + 1) == 0) {
+            len += 1;
+            if len > 1 << 20 {
+                break;
+            }
+        }
+        let wide = std::slice::from_raw_parts(block.cast::<u16>(), len + 1);
+        smkvm_config::paths::profile_in_environment_block(wide)
+    };
+    // SAFETY: the block came from the call above and is not used after.
+    unsafe {
+        let _ = DestroyEnvironmentBlock(block);
+    }
+    found.context("that person's environment does not say where their profile is")
 }
 
 /// A process started in the interactive session, on a named desktop.

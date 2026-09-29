@@ -60,6 +60,29 @@ pub fn use_machine_scope() {
     SCOPE.store(MACHINE, Ordering::Release);
 }
 
+/// The person's home, when this process is not the person.
+///
+/// Set once by the service, which can find it out and whose own
+/// `USERPROFILE` is the system profile. `None` everywhere else, where
+/// the environment is already right.
+static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Say where the person at the screen keeps their things.
+///
+/// Files pasted or dragged onto this machine land under
+/// `transfer.directory`, whose default begins with `~`. Expanded in the
+/// service that is the system profile -- somewhere the person cannot
+/// see, which is not a place to put a file they just asked for.
+///
+/// Unlike the configuration, this is a question with a good answer now:
+/// there *is* a person at the screen, the service can ask the system
+/// who, and their profile is not a guess. That is the difference
+/// between this and reading a configuration out of somebody's profile,
+/// which stays refused.
+pub fn use_home(home: PathBuf) {
+    let _ = HOME.set(home);
+}
+
 pub fn scope() -> Scope {
     match SCOPE.load(Ordering::Acquire) {
         MACHINE => Scope::Machine,
@@ -387,17 +410,16 @@ pub fn default_name() -> String {
 /// Only the bare `~` and `~/` forms are recognised: `~user` is another
 /// person's home, which this has no business writing into.
 ///
-/// Note for service mode: the system account's home is the system profile,
-/// so a `transfer.directory` of `~/Downloads/SMKVM` resolves somewhere the
-/// person cannot see. That is a real gap and it is recorded in
-/// `docs/NOTES.md` rather than papered over here, because guessing which
-/// person's Downloads a service meant is the same bad question as guessing
-/// whose configuration to read.
+/// In the service, `~` is whatever [`use_home`] was told, because the
+/// system account's own home is the system profile and a file the person
+/// asked for must not land there.
 pub fn expand_home(path: &str) -> PathBuf {
     let home = || {
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
+        HOME.get().cloned().or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+        })
     };
     if path == "~" {
         return home().unwrap_or_else(|| PathBuf::from("."));
@@ -408,6 +430,38 @@ pub fn expand_home(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// The person's profile, out of an environment block.
+///
+/// `CreateEnvironmentBlock` hands back the environment a process started
+/// as somebody would have: a run of `NAME=VALUE` strings, each ended by
+/// a zero, the whole ended by a second zero. `USERPROFILE` is in there,
+/// and it is the exact answer to "where does this person keep things" --
+/// no guessing at `C:\Users\<name>`, no registry, no assumption that
+/// profiles are where they usually are.
+///
+/// Pure, and here rather than beside the call, because walking a
+/// double-terminated wide block by hand is the kind of thing that is
+/// wrong in a way nothing notices -- and because it is the one part of
+/// this that a machine without Windows can check.
+pub fn profile_in_environment_block(block: &[u16]) -> Option<PathBuf> {
+    for entry in block.split(|c| *c == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let entry = String::from_utf16_lossy(entry);
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        // Windows writes it upper case, but the block also carries
+        // entries beginning with `=` for per-drive current directories,
+        // and nothing says the case is guaranteed.
+        if name.eq_ignore_ascii_case("USERPROFILE") && !value.is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
 }
 
 /// Is `path` inside `root`? Used to say, in a message, whether a file the
@@ -697,5 +751,68 @@ mod home_tests {
             expand_home("rel/ative"),
             std::path::PathBuf::from("rel/ative")
         );
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::profile_in_environment_block;
+    use std::path::PathBuf;
+
+    fn block(entries: &[&str]) -> Vec<u16> {
+        let mut out = Vec::new();
+        for entry in entries {
+            out.extend(entry.encode_utf16());
+            out.push(0);
+        }
+        out.push(0);
+        out
+    }
+
+    #[test]
+    fn the_persons_profile_is_read_out_of_their_environment() {
+        let found = profile_in_environment_block(&block(&[
+            r"ALLUSERSPROFILE=C:\ProgramData",
+            r"APPDATA=C:\Users\someone\AppData\Roaming",
+            r"USERPROFILE=C:\Users\someone",
+            r"WINDIR=C:\WINDOWS",
+        ]));
+        assert_eq!(found, Some(PathBuf::from(r"C:\Users\someone")));
+    }
+
+    #[test]
+    fn a_profile_that_is_not_where_profiles_usually_are_is_still_found() {
+        // The reason for asking rather than building `C:\Users\<name>`:
+        // a profile can be anywhere, and on a machine where it is not in
+        // the usual place a guess would put the person's files somewhere
+        // they would never look.
+        let found = profile_in_environment_block(&block(&[r"USERPROFILE=D:\Profiles\someone"]));
+        assert_eq!(found, Some(PathBuf::from(r"D:\Profiles\someone")));
+    }
+
+    #[test]
+    fn the_odd_entries_windows_puts_in_a_block_are_stepped_over() {
+        // Per-drive current directories are written with an empty name,
+        // which a naive split would take as a variable called nothing.
+        let found = profile_in_environment_block(&block(&[
+            r"=C:=C:\WINDOWS\system32",
+            "=ExitCode=00000000",
+            r"UserProfile=C:\Users\someone",
+        ]));
+        assert_eq!(found, Some(PathBuf::from(r"C:\Users\someone")));
+    }
+
+    #[test]
+    fn a_block_with_no_profile_in_it_says_so_rather_than_guessing() {
+        assert_eq!(
+            profile_in_environment_block(&block(&[r"WINDIR=C:\WINDOWS"])),
+            None
+        );
+        assert_eq!(
+            profile_in_environment_block(&block(&["USERPROFILE="])),
+            None
+        );
+        assert_eq!(profile_in_environment_block(&[]), None);
+        assert_eq!(profile_in_environment_block(&[0, 0]), None);
     }
 }

@@ -83,6 +83,30 @@ pub enum Step {
 /// the input actually is.
 pub const ALWAYS_THERE: &str = "Default";
 
+/// Should a worker on this desktop take up the person's clipboard?
+///
+/// Only on the ordinary one, and the reason is not what it first looks
+/// like. The Windows clipboard is per *window station*, not per desktop,
+/// so a worker on `Winlogon` is on `WinSta0` and could probably reach
+/// it. It should not, for two better reasons.
+///
+/// Nothing is copied or pasted at a consent prompt; the person's
+/// applications are not even on that desktop. And owning a clipboard
+/// means owning a *window* that answers when something pastes -- a
+/// window on the desktop the worker is attached to, which is destroyed
+/// when that worker is replaced. A worker that took the clipboard onto
+/// `Winlogon` would therefore throw away the standing offer every time
+/// a prompt appeared, and the person would find that what another
+/// machine had copied had quietly stopped being available.
+///
+/// So the clipboard belongs to the `Default` worker. A switch to
+/// `Winlogon` suspends it rather than losing it: the exchange, and the
+/// offer it is holding, live in the service, which re-offers as soon as
+/// a worker is back on the ordinary desktop.
+pub fn serves_the_clipboard(desktop: &str) -> bool {
+    desktop.eq_ignore_ascii_case(ALWAYS_THERE)
+}
+
 /// The window station every interactive desktop lives on.
 ///
 /// There is exactly one that has a screen attached, and it is always called
@@ -515,6 +539,14 @@ mod tests {
             watch.worker_failed("Winlogon");
         }
         assert!(matches!(saw(&mut watch, "Winlogon"), Step::Move { .. }));
+    }
+
+    #[test]
+    fn the_clipboard_belongs_to_the_ordinary_desktop_and_no_other() {
+        assert!(serves_the_clipboard("Default"));
+        assert!(serves_the_clipboard("default"));
+        assert!(!serves_the_clipboard("Winlogon"));
+        assert!(!serves_the_clipboard("Screen-saver"));
     }
 
     #[test]

@@ -37,15 +37,19 @@
 //! answer is to have the reader thread mark the link dead the moment its
 //! read fails, so later writers fail at once instead of queueing.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use smkvm_clipboard::{Available, Fetch};
 use smkvm_input::{Inject, InputError, Monitors};
 use smkvm_layout::Monitor;
-use smkvm_proto::{Key, MouseButton, Scroll};
+use smkvm_proto::{ClipFormat, Key, MouseButton, Scroll};
 use tokio::sync::mpsc::Sender;
 
 use crate::secure::reach::Reach;
+use crate::secure::watch;
+use crate::secure::windows::clip::Waiting;
 use crate::secure::windows::pipe::{Pipe, WRITE_WITHIN};
 use crate::secure::wire::{frame, FromWorker, ToWorker};
 
@@ -61,8 +65,11 @@ struct Answers {
     monitors: Option<Vec<Monitor>>,
 }
 
+/// What is being announced on the person's clipboard, and where to get
+/// it when something pastes.
+type Announced = (Vec<ClipFormat>, Arc<Mutex<Box<dyn Fetch>>>);
+
 /// Shared between the daemon and the thread minding the worker.
-#[derive(Default)]
 pub struct Link {
     /// The write end, while a worker is connected.
     write: Mutex<Option<Pipe>>,
@@ -78,11 +85,46 @@ pub struct Link {
     /// Where the worker last said the input was. The service has no way
     /// of its own to find this out, so this is the only source.
     said_input_is_on: Mutex<Option<String>>,
+
+    /// Clipboard reads and drag catches waiting for a worker's answer.
+    clipboard_reads: Waiting<Result<Vec<u8>, String>>,
+    drags: Waiting<Vec<PathBuf>>,
+    /// Where noticed copies go, while anything is listening.
+    clipboard_changes: Mutex<Option<std::sync::mpsc::Sender<Available>>>,
+    /// What this machine is currently announcing on the person's
+    /// clipboard, and where to get it.
+    ///
+    /// Kept here rather than only in the worker because the worker is
+    /// replaced every time the input goes to a consent prompt and back,
+    /// and its clipboard window goes with it. Without this, a copy made
+    /// on another machine would stop being available because a prompt
+    /// had appeared on this one.
+    /// `Fetch` is `Send` and not `Sync` -- it is written to be handed
+    /// to one place and used there -- so it is behind a lock of its own
+    /// rather than shared directly. That also serialises pastes, which
+    /// is right: the thing it fetches through is one network link.
+    offer: Mutex<Option<Announced>>,
+    /// Whether the worker now attached is on a desktop that should hold
+    /// the person's clipboard at all.
+    clipboard_is_the_workers: Mutex<bool>,
 }
 
 impl Link {
     pub fn new() -> Arc<Link> {
-        Arc::new(Link::default())
+        Arc::new(Link {
+            write: Mutex::new(None),
+            answers: Mutex::new(Answers::default()),
+            answered: Condvar::new(),
+            capture: Mutex::new(None),
+            swallow: Mutex::new(false),
+            reach: Mutex::new(Reach::default()),
+            said_input_is_on: Mutex::new(None),
+            clipboard_reads: Waiting::new(),
+            drags: Waiting::new(),
+            clipboard_changes: Mutex::new(None),
+            offer: Mutex::new(None),
+            clipboard_is_the_workers: Mutex::new(false),
+        })
     }
 
     /// A worker has connected. Anything the old one was told that still
@@ -103,6 +145,49 @@ impl Link {
             .expect("not poisoned")
             .attached(Some(desktop));
         self.say(&ToWorker::Swallow(swallowing));
+
+        // The clipboard is the ordinary desktop's; see
+        // `watch::serves_the_clipboard`.
+        let theirs = watch::serves_the_clipboard(desktop);
+        *self.clipboard_is_the_workers.lock().expect("not poisoned") = theirs;
+        self.say(&ToWorker::ServeClipboard(theirs));
+        if theirs {
+            // Whatever was being announced before the last worker went
+            // is announced again. This is what makes a consent prompt
+            // suspend the clipboard rather than lose it.
+            let standing = self.offer.lock().expect("not poisoned").clone();
+            if let Some((formats, _)) = standing {
+                tracing::debug!(
+                    formats = formats.len(),
+                    "offering the far machine's clipboard again on the new worker"
+                );
+                self.say(&ToWorker::OfferClipboard { formats });
+            }
+        }
+    }
+
+    pub fn clipboard_reads(&self) -> &Waiting<Result<Vec<u8>, String>> {
+        &self.clipboard_reads
+    }
+
+    pub fn drags(&self) -> &Waiting<Vec<PathBuf>> {
+        &self.drags
+    }
+
+    /// Where to send copies the worker notices.
+    pub fn watch_clipboard(&self) -> std::sync::mpsc::Receiver<Available> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.clipboard_changes.lock().expect("not poisoned") = Some(tx);
+        rx
+    }
+
+    /// Remember what is being announced, so a new worker can be told.
+    pub fn hold_offer(&self, formats: Vec<ClipFormat>, source: Box<dyn Fetch>) {
+        *self.offer.lock().expect("not poisoned") = Some((formats, Arc::new(Mutex::new(source))));
+    }
+
+    pub fn drop_offer(&self) {
+        *self.offer.lock().expect("not poisoned") = None;
     }
 
     /// The worker has gone.
@@ -115,6 +200,14 @@ impl Link {
         // old answer, which would have the service believing a desktop
         // nothing is watching.
         *self.said_input_is_on.lock().expect("not poisoned") = None;
+        *self.clipboard_is_the_workers.lock().expect("not poisoned") = false;
+        // Everything asked of the worker that has not come back never
+        // will. Woken now rather than left to time out one by one,
+        // which would stall the exchange for seconds over a worker that
+        // is already gone. The standing offer is deliberately *not*
+        // dropped: it is what the next worker will be told.
+        self.clipboard_reads.nobody_is_answering();
+        self.drags.nobody_is_answering();
     }
 
     /// Where captured input should go. Set once, by the server glue.
@@ -198,7 +291,7 @@ impl Link {
     }
 
     /// Something the worker said. Called from the thread reading the pipe.
-    pub fn heard(&self, message: FromWorker) {
+    pub fn heard(self: &Arc<Self>, message: FromWorker) {
         match message {
             FromWorker::Saw(saw) => {
                 let held = self.capture.lock().expect("not poisoned");
@@ -230,7 +323,60 @@ impl Link {
                     .expect("not poisoned")
                     .refused(Instant::now());
             }
+            FromWorker::ClipboardChanged(formats) => {
+                let held = self.clipboard_changes.lock().expect("not poisoned");
+                if let Some(changes) = held.as_ref() {
+                    let _ = changes.send(Available { formats });
+                }
+            }
+            FromWorker::ClipboardRead { id, bytes } => {
+                self.clipboard_reads.answer(id, bytes);
+            }
+            FromWorker::DragCaught { id, paths } => {
+                self.drags.answer(id, paths);
+            }
+            FromWorker::WantsPaste { id, format } => self.someone_is_pasting(id, format),
             FromWorker::Ready { .. } => {}
+        }
+    }
+
+    /// Something on the person's desktop is pasting what another machine
+    /// copied, so the contents are wanted now.
+    ///
+    /// On its own thread, and that is the point rather than tidiness.
+    /// Fetching means a round trip to the machine that did the copying,
+    /// and this is called from the thread that reads the pipe -- the
+    /// same thread that notices the worker dying. Doing the fetch here
+    /// would stop that thread for the length of a network transfer, so
+    /// a slow paste would make the service blind to its own worker.
+    fn someone_is_pasting(self: &Arc<Self>, id: u64, format: ClipFormat) {
+        let standing = self.offer.lock().expect("not poisoned").clone();
+        let Some((_, source)) = standing else {
+            // Nothing is being announced, so there is nothing to fetch.
+            // Answered rather than ignored: the worker is inside a paste
+            // and something has to end it.
+            self.say(&ToWorker::Pasted {
+                id,
+                bytes: Err("this machine is not announcing anything to paste".into()),
+            });
+            return;
+        };
+        let link = self.clone();
+        let started = std::thread::Builder::new()
+            .name("smkvm-paste".into())
+            .spawn(move || {
+                let bytes = source
+                    .lock()
+                    .expect("not poisoned")
+                    .fetch(&format)
+                    .map_err(|e| format!("fetching what was copied: {e}"));
+                link.say(&ToWorker::Pasted { id, bytes });
+            });
+        if started.is_err() {
+            self.say(&ToWorker::Pasted {
+                id,
+                bytes: Err("this machine could not start a thread to fetch it".into()),
+            });
         }
     }
 

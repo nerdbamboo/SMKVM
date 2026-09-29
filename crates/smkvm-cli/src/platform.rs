@@ -185,6 +185,24 @@ pub fn injection_possible() -> bool {
 pub fn clipboard() -> Result<Backends> {
     #[cfg(windows)]
     {
+        // As the service, this process is in session 0, which has a
+        // clipboard of its own that nobody copies into. Opening it here
+        // worked perfectly and shared nothing, which is how copy and
+        // paste came to be broken on a machine where input was fine.
+        // The person's clipboard belongs to their session, so the
+        // worker holds it and this is a way of asking.
+        if let Some(link) = crate::secure::windows::link::worker() {
+            use crate::secure::windows::clip::{
+                ReadThroughWorker, WatchThroughWorker, WriteThroughWorker,
+            };
+            return Ok(Backends {
+                watch: Box::new(WatchThroughWorker {
+                    changes: link.watch_clipboard(),
+                }),
+                read: Box::new(ReadThroughWorker(link.clone())),
+                write: Box::new(WriteThroughWorker(link)),
+            });
+        }
         let clipboard = smkvm_clipboard::platform::windows::WindowsClipboard::start()
             .context("watching the clipboard")?;
         let handle = clipboard.handle();
@@ -224,6 +242,14 @@ pub fn clipboard() -> Result<Backends> {
 pub fn drop_catcher() -> Result<Box<dyn CatchDrag>> {
     #[cfg(windows)]
     {
+        // Same reason as the clipboard: the window that catches a drag
+        // has to be on the desktop the drag is happening on, and that
+        // is not this process's.
+        if let Some(link) = crate::secure::windows::link::worker() {
+            return Ok(Box::new(crate::secure::windows::clip::DragThroughWorker(
+                link,
+            )));
+        }
         let catcher = smkvm_clipboard::platform::windows_drag::DropCatcher::start()
             .context("making the window that catches drags")?;
         Ok(Box::new(catcher))
@@ -247,6 +273,12 @@ pub fn drop_catcher() -> Result<Box<dyn CatchDrag>> {
 pub fn native_drop(paths: Vec<PathBuf>) -> bool {
     #[cfg(windows)]
     {
+        if let Some(link) = crate::secure::windows::link::worker() {
+            // One way: the worker lets go where its own pointer is, and
+            // there is nothing to wait for. Whether a drop succeeded is
+            // not something this can find out today on either path.
+            return link.say(&crate::secure::wire::ToWorker::DropFiles(paths));
+        }
         match smkvm_clipboard::platform::windows_drag::drop_files(paths) {
             Ok(()) => true,
             Err(e) => {

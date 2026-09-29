@@ -499,6 +499,24 @@ fn serve() -> Result<()> {
          desktop has the input, so a UAC prompt and the lock screen are reachable"
     );
 
+    // Before the daemon starts, because `Sharing` resolves
+    // `transfer.directory` once when it is built. Not fatal if it
+    // cannot be found: files then land where they did before, which is
+    // somewhere unhelpful rather than somewhere wrong, and the line
+    // above says so.
+    match token::console_session().map(token::home_in_session) {
+        Some(Ok(home)) => {
+            tracing::info!(home = %home.display(), "files sent to this machine will land under the person's own profile");
+            smkvm_config::paths::use_home(home);
+        }
+        Some(Err(e)) => tracing::warn!(
+            "could not find out where the person at the screen keeps their files, so \
+             anything sent to this machine will land in the system profile where they \
+             cannot see it: {e:#}"
+        ),
+        None => {}
+    }
+
     let link = link::Link::new();
     link::use_worker(link.clone());
 

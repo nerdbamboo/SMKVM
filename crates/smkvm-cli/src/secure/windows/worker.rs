@@ -18,6 +18,8 @@
 
 #![allow(unsafe_code)]
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use smkvm_input::platform::windows::capture::{Capture, Captured};
 use smkvm_input::platform::windows::{desktop, WindowsInput};
@@ -27,6 +29,7 @@ use crate::secure::acl;
 use crate::secure::watch::LOOK_EVERY as WATCH_EVERY;
 
 use crate::secure::windows::pipe;
+use crate::secure::windows::serving::{Clipboard, Speak};
 use crate::secure::wire::{frame, read_frame, FromWorker, Saw, ToWorker, WORKER_PROTOCOL};
 
 /// Run as the worker until the pipe closes.
@@ -35,7 +38,7 @@ pub fn run(pipe_name: &str) -> Result<()> {
     // refuses rather than returning if any of them does not hold. Naming
     // them here rather than in a comment means removing one is a change
     // somebody has to make to code that is compiled.
-    let mut to_service = pipe::connect(pipe_name).with_context(|| {
+    let to_service = pipe::connect(pipe_name).with_context(|| {
         format!(
             "reaching the service. The pipe must satisfy all of {:?} before this process, \
              which runs as the system account and injects keystrokes, says anything to it",
@@ -43,6 +46,20 @@ pub fn run(pipe_name: &str) -> Result<()> {
         )
     })?;
     let mut from_service = to_service.share()?;
+
+    // One way of speaking to the service, shared by every thread that
+    // does. There are four now -- this loop, the capture pump, the
+    // desktop watch and a paste in progress on the clipboard's own
+    // thread -- and two of them writing at once is a frame torn in half,
+    // which the service cannot read and does not pretend to.
+    let speaking = Arc::new(Mutex::new(to_service.share()?));
+    let speak: Speak = {
+        let speaking = speaking.clone();
+        Arc::new(move |message: &FromWorker| {
+            let mut held = speaking.lock().expect("not poisoned");
+            say(&mut *held, message).is_ok()
+        })
+    };
 
     // Which desktop *this process* is on, asked rather than assumed. The
     // service decided some milliseconds ago and the input may have moved
@@ -72,13 +89,10 @@ pub fn run(pipe_name: &str) -> Result<()> {
          name against the desktop with the input, and a name that can never match makes \
          it replace this process on every look",
     )?;
-    say(
-        &mut to_service,
-        &FromWorker::Ready {
-            protocol: WORKER_PROTOCOL,
-            desktop: here.clone(),
-        },
-    )?;
+    speak(&FromWorker::Ready {
+        protocol: WORKER_PROTOCOL,
+        desktop: here.clone(),
+    });
     tracing::info!(desktop = %here, "the worker is on the desktop and connected");
 
     // Watching where the input has gone, which is a thing only
@@ -89,7 +103,7 @@ pub fn run(pipe_name: &str) -> Result<()> {
     // never started a single worker -- so this is where the watching
     // lives now, and the service acts on what it is told.
     {
-        let mut back = to_service.share()?;
+        let speak = speak.clone();
         std::thread::Builder::new()
             .name("smkvm-worker-desktops".into())
             .spawn(move || {
@@ -100,7 +114,7 @@ pub fn run(pipe_name: &str) -> Result<()> {
                     // when something happens rather than four a second
                     // when nothing does.
                     if last.as_ref() != Some(&now) {
-                        if say(&mut back, &FromWorker::InputDesktop(now.clone())).is_err() {
+                        if !speak(&FromWorker::InputDesktop(now.clone())) {
                             return;
                         }
                         last = Some(now);
@@ -116,12 +130,12 @@ pub fn run(pipe_name: &str) -> Result<()> {
     // which is the one the service attached us to -- the whole point.
     let capture = match Capture::start() {
         Ok((capture, seen)) => {
-            let mut back = to_service.share()?;
+            let speak = speak.clone();
             std::thread::Builder::new()
                 .name("smkvm-worker-capture".into())
                 .spawn(move || {
                     while let Ok(event) = seen.recv() {
-                        if say(&mut back, &FromWorker::Saw(mirror(event))).is_err() {
+                        if !speak(&FromWorker::Saw(mirror(event))) {
                             return;
                         }
                     }
@@ -139,6 +153,10 @@ pub fn run(pipe_name: &str) -> Result<()> {
     };
 
     let mut input = WindowsInput::new();
+    // The person's clipboard, which only something in their session can
+    // reach. Idle until the service says this worker is on the desktop
+    // that should hold it.
+    let clipboard = Clipboard::new();
     loop {
         let told: ToWorker = match read_frame(&mut from_service) {
             Ok(told) => told,
@@ -160,7 +178,7 @@ pub fn run(pipe_name: &str) -> Result<()> {
             ToWorker::ShowCursor => input.show_cursor(),
             ToWorker::TellMonitors => match input.monitors() {
                 Ok(monitors) => {
-                    say(&mut to_service, &FromWorker::Monitors(monitors))?;
+                    speak(&FromWorker::Monitors(monitors));
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -172,12 +190,21 @@ pub fn run(pipe_name: &str) -> Result<()> {
                 Ok(())
             }
             ToWorker::Stop => break,
+            told => {
+                // Everything about the clipboard, the drag catcher and
+                // dropping files, which is the rest of what only a
+                // process in the person's session can do.
+                clipboard.told(told, &speak, &mut input);
+                Ok(())
+            }
         };
         if let Err(e) = outcome {
             // Reported rather than fatal. The service already knows what to
             // do with a refused injection, and it is the same thing the
             // daemon does with one of its own.
-            say(&mut to_service, &FromWorker::Refused(e.to_string()))?;
+            if !speak(&FromWorker::Refused(e.to_string())) {
+                break;
+            }
         }
     }
 
