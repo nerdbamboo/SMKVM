@@ -294,9 +294,9 @@ sees the switch promptly enough to be useful; whether the service now
 stops when asked; whether a failed start does produce the restart actions; whether `icacls`
 applies the lists as written, whether `/setowner` succeeds on a directory
 somebody else made, and whether `icacls /save` produces SDDL this build
-parses -- the read-back refuses when it cannot, so a parsing mistake here
-fails the install rather than passing it, which is the right way round but
-is still a thing to see once; whether `%ProgramData%\smkvm\public` ends up
+parses -- the read-back refuses the install when it cannot, and the
+service warns and carries on, so a parsing mistake here is loud in one
+place and survivable in the other, but it is still a thing to see once; whether `%ProgramData%\smkvm\public` ends up
 readable by `smkvm status` while `device.toml` is refused to an ordinary
 account; whether carrying the three files across leaves an already-paired
 machine paired; whether a worker
@@ -431,17 +431,64 @@ the same shape as the silent refused injection this project began with.
 and has been known to exit zero doing it. So every list is read back with
 `icacls /save`, which emits SDDL -- machine-readable, and unlike the names
 in its ordinary printing not translated -- and checked by
-`acl::granted_to_anyone_but`, which is pure and tested. If anyone but the
-system account and administrators can reach the key, the install fails and
-the service is never registered. A list that cannot be *parsed* is also a
-refusal, because a check that fails open is worse than none.
+`acl::granted_to_anyone_but`.
 
-The service repeats the check at startup, before the key is used and
-before the link exists, and refuses to run if it fails -- because the
-install is not the only way a file gets into that directory. There the
-asymmetry is deliberate: a key anyone can read is a refusal, a list that
-cannot be read is a warning, since failing to parse is not evidence of a
-fault and taking the machine down over it would be a fault of its own.
+**The parser had to be rewritten, and how it was found is the point.** A
+reviewer extracted it and fed it adversarial input rather than reading it,
+and found four lists it blessed while the key was readable. Each is now a
+test, kept verbatim:
+
+| what was fed to it | what it said | what was true |
+|---|---|---|
+| `O:SYG:SYD:NO_ACCESS_CONTROL` | safe | no list at all: everyone, everything |
+| `D:P(A;;FA;;;SY)(XA;;FA;;;WD;(1==1))` | safe | conditional allow grants Everyone |
+| `D:P(XA;;FA;;;BA;(@a=="S:"))(A;;FA;;;WD)` | safe | the condition truncated the scan |
+| `D:P(XA;;FA;;;BU;(Member_of{SID(BA)}))` | safe | splitting on `(` shredded the entry |
+
+Four bugs, one attacker, all reachable in the scenario the check exists
+for -- somebody who owned the directory before the install and left an
+explicit entry that no `icacls` verb removes. Three rules came out of it,
+and they are the ones to keep if this is ever touched again:
+
+- **Entries are tokenised by balanced brackets before anything else.** A
+  condition may contain brackets, quotes and the text `S:`, and it is
+  attacker-written text sitting inside the thing being parsed. Nothing may
+  be located by searching through it -- not the end of the list, not the
+  start of one. Tokenising first is also what makes refusing a short entry
+  safe: before it, the scan produced short fragments of its own.
+- **The type test is inverted.** The harmless types are listed --
+  denials, audits, alarms, labels -- and everything else grants, including
+  a type this build has never heard of. Listing the granting types is what
+  hid `XA` and `ZA`, and would hide whatever Windows adds next.
+- **Every uncertainty resolves towards "somebody can read it."** An entry
+  that cannot be read is an offender, a list that says it does not exist
+  is the worst answer rather than an empty one.
+
+`NO_ACCESS_CONTROL` deserves its own sentence, because there was already a
+test for a null list and it did not catch it: the test covered a
+descriptor with no `D:` component, and this is the spelling the system
+actually emits. A test written for exactly the bug, missing it by guessing
+the wording.
+
+**The directory is checked before anything is written into it.** The
+earlier version checked only the key and only after copying it, so a
+hostile inherited entry was found by writing the key into a file that
+entry could read -- an honest report of an exposure that had already
+happened. What a directory *hands down* is a narrower question than who
+is on its list (ordinary accounts may reach the directory and must
+inherit nothing from it), so it is a second function,
+`acl::inheritably_granted_to_anyone_but`, with its own tests.
+
+**Install and service answer an unreadable list differently, on purpose.**
+Three verdicts, not two: private, readable, and could-not-tell. The
+install refuses all three but the first, because a person is standing
+there and can act. The service refuses a readable key -- carrying on
+means handshaking with a secret that is not one -- but only warns when
+the list could not be parsed, because failing to parse is not evidence of
+a fault, this parser has been wrong four times, and taking the machine
+down over the parser's own ignorance is the same shape as the outage this
+hardware round began with. The log says `KEY PRIVATE`, `KEY READABLE` or
+`KEY UNPROVEN`, so which of the three it was is one glance.
 
 The check somebody will actually run is `type
 %ProgramData%\smkvm\device.toml` from an ordinary account, which must be
@@ -647,6 +694,15 @@ input-desktop update. Log off while a worker is running and neither ran:
 no session on it, claiming input was landing, until the next injection
 timed out a second later. The wait now goes *after* the observing, and
 detaches before it waits.
+
+**A checker is only as good as the inputs it has met, and reading it is
+not meeting them.** The access-list parser was read carefully by its
+author, reviewed, and had six tests -- and still blessed four different
+lists that left the key readable. Every one was found by running inputs
+through it. Two lessons worth keeping: a test written for a bug can miss
+that bug by guessing how the system spells it, and a parser whose input
+includes attacker-written text (an SDDL condition) must be tokenised
+structurally before anything is searched for inside it.
 
 **A structure read back out of a `Vec<u8>` is unaligned, and that is
 undefined whatever the hardware tolerates.** `GetTokenInformation` and
