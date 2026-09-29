@@ -1581,6 +1581,46 @@ killed hard, its report goes stale after 15 s and the next start is allowed.
 cross-compiling from Linux, hence the `pure` feature. Anything else pulling in
 assembly will need the same treatment.
 
+**Ask the system what it is holding, and never with `GetClipboardData`
+from the owner.** The promise at the start of the delayed-rendering
+chain is `SetClipboardData(format, NULL)`, and its result was thrown
+away for the whole life of this code. Everything downstream -- the
+format missing, the format listed but empty, a paste answered with
+nothing -- looks like a fault somewhere else when the first link is
+unexamined. It is checked and logged now, along with
+`IsClipboardFormatAvailable` for the same format, so the log says what
+the system believes rather than what the code intended.
+
+The read-back stops there deliberately. `GetClipboardData` on a format
+this process has promised makes Windows send *this thread*
+`WM_RENDERFORMAT`, synchronously, from inside the handler still making
+the promise -- and a render that returns without calling
+`SetClipboardData` has answered the question with nothing, for good.
+Reading the promise that way destroys it. What `GetClipboardData`
+returns is the most valuable of the four values, and it can only be
+asked by a process that is pasting.
+
+**`smkvm status` prints the four values.** Who owns the clipboard,
+which formats it lists, whether anything is holding it open, and what
+a paste returns for each format with how long it took. Those four
+settle every argument this bug has produced, and before this they came
+from four different places and a guess. Running it performs a real
+paste, which the output says.
+
+**Everything that can write over a format announces itself.** There
+are exactly three: the promise in `take_clipboard`, the renewal that
+re-takes the clipboard through `WM_RENEW`, and `WM_RENDERALLFORMATS`,
+which turns every promise into real data at once. The last of these
+collected its outcomes into a list and then never said them -- the one
+message able to quietly replace a promise was also the only one that
+reported nothing.
+
+**Measure from inside the session.** Five faults in the clipboard path
+so far, and not one was found by reading the code or the log. Each was
+found by asking the running system a question from the session it was
+in. The pattern is consistent enough to be a rule: when a theory and a
+measurement are both available, take the measurement.
+
 ## Verifying a change
 
 ```

@@ -648,23 +648,19 @@ fn report_on_the_machine_key() {
 fn report_on_the_clipboard() {
     #[cfg(windows)]
     {
-        match smkvm_clipboard::platform::windows::who_is_holding_it_open() {
-            None => println!("clipboard       nothing is holding it open"),
-            Some((window, pid)) => {
-                let ours = pid == std::process::id();
-                println!(
-                    "clipboard       HELD OPEN by window {window:#x} of process {pid}{}.\n\
-                     \x20               Nothing on this machine can copy or paste while \
-                     that lasts. If that process\n\
-                     \x20               is an smkvm one, `smkvm service stop` (or ending \
-                     it) gives the clipboard back.",
-                    if ours {
-                        " -- which is this command"
-                    } else {
-                        ""
-                    }
-                );
-            }
+        // Printed from the session this command was run in, which is
+        // the only session whose answer means anything: the clipboard
+        // belongs to a window station, and a service asking from
+        // session 0 would be describing a different clipboard
+        // altogether.
+        println!("clipboard       what this session's clipboard holds, right now:");
+        println!(
+            "\x20               (reading it is a paste: an owner that promised its \
+             formats will be"
+        );
+        println!("\x20                asked to produce them, and this line is that request)");
+        for line in smkvm_clipboard::platform::windows::verdict() {
+            println!("\x20               {line}");
         }
     }
 }

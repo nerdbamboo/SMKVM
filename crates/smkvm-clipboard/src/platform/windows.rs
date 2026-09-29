@@ -27,9 +27,9 @@ use smkvm_proto::ClipFormat;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardOwner, GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
-    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+    GetClipboardData, GetClipboardOwner, GetOpenClipboardWindow, IsClipboardFormatAvailable,
+    OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -132,9 +132,13 @@ fn describe_win32(code: u32) -> String {
     }
 }
 
+/// The number the last failed call left behind.
+fn last_win32() -> u32 {
+    windows::core::Error::from_win32().code().0 as u32 & 0xFFFF
+}
+
 fn last_error(what: &str) -> ClipboardError {
-    let code = windows::core::Error::from_win32().code().0 as u32 & 0xFFFF;
-    ClipboardError::Display(format!("{what}: {}", describe_win32(code)))
+    ClipboardError::Display(format!("{what}: {}", describe_win32(last_win32())))
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -583,6 +587,14 @@ unsafe extern "system" fn window_proc(
                     }
                 }
             });
+            // Said out here, after the guard above has gone and the
+            // clipboard is closed again. Collecting these and then
+            // never saying them is how this handler stood until now:
+            // the one message that can quietly overwrite every promise
+            // with real data was also the one that reported nothing.
+            for line in said {
+                witness(&format!("WM_RENDERALLFORMATS {line}"));
+            }
             LRESULT(0)
         }
         WM_OFFER => {
@@ -623,12 +635,50 @@ fn take_clipboard(window: HWND) -> Result<()> {
     // SAFETY: the clipboard is open and owned by this window.
     unsafe { EmptyClipboard() }.map_err(|_| last_error("clearing the clipboard"))?;
 
+    // What the system says about each promise, gathered here and said
+    // after the close.
+    //
+    // The result of `SetClipboardData` used to be discarded. A promise
+    // nobody has ever inspected is not evidence of anything, and this
+    // one sits at the very start of the chain: if it fails, every
+    // symptom downstream -- the format missing, the format listed but
+    // empty, a paste answered with nothing -- looks like a fault
+    // somewhere else entirely.
+    let mut promises = Vec::new();
     for format in &offered {
         for id in native_ids(formats, format) {
             // A null handle is the promise: the data is produced only if
             // something pastes it.
             // SAFETY: promising a format takes no memory.
-            let _ = unsafe { SetClipboardData(id, HANDLE::default()) };
+            let set = unsafe { SetClipboardData(id, HANDLE::default()) };
+            let took = match set {
+                Ok(_) => "promised".to_string(),
+                Err(_) => format!("REFUSED ({})", describe_win32(last_win32())),
+            };
+            // Asked of the system rather than assumed. `IsClipboardFormatAvailable`
+            // is the only read that is safe from this side: it answers
+            // from the list of formats without touching the data.
+            //
+            // `GetClipboardData` is deliberately *not* called here,
+            // however much it would say. Asking for our own promised
+            // format makes Windows send this thread `WM_RENDERFORMAT`,
+            // synchronously, from inside the handler that is still
+            // making the promise -- and a render that returns without
+            // calling `SetClipboardData` has answered the question with
+            // nothing, permanently. Reading the promise that way would
+            // destroy it. What `GetClipboardData` returns is worth
+            // knowing, but it has to be asked from a process that is
+            // pasting, which is what `smkvm status` now does.
+            // SAFETY: asking whether a format is listed takes no pointers.
+            let listed = unsafe { IsClipboardFormatAvailable(id) }.is_ok();
+            promises.push(format!(
+                "{id}: {took}, {}",
+                if listed {
+                    "listed"
+                } else {
+                    "NOT LISTED -- nothing can paste it"
+                }
+            ));
         }
     }
     // Who the system thinks owns it, rather than who we asked it to.
@@ -666,6 +716,10 @@ fn take_clipboard(window: HWND) -> Result<()> {
         ));
     }
     witness(&format!(
+        "what the system says it now holds: [{}]",
+        promises.join("; ")
+    ));
+    witness(&format!(
         "promised {:?}; the owner is now window={:?}, and this window is {:?} ({})",
         offered,
         owner.unwrap_or(std::ptr::null_mut()),
@@ -695,6 +749,96 @@ pub fn who_is_holding_it_open() -> Option<(isize, u32)> {
         GetWindowThreadProcessId(HWND(window as *mut _), Some(&mut pid));
     }
     Some((window, pid))
+}
+
+/// The four values that settle an argument about the clipboard.
+///
+/// Who owns it, which formats it lists, whether anything is holding it
+/// open, and -- the one that matters most and was hardest to get --
+/// what a paste actually returns. Every round of this bug so far has
+/// been six commands and a guess, because those four had to be
+/// gathered from four different places, none of them this program.
+/// They are one command now.
+///
+/// This *performs a paste*. Asking a delayed-rendering owner for data
+/// makes it produce the data, so running this is not free of effect
+/// and the caller should say so. That is the point: the question is
+/// what a paste does, and nothing short of pasting answers it.
+pub fn verdict() -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // SAFETY: reading the owner takes no pointers.
+    let owner = unsafe { GetClipboardOwner() }.map(|o| o.0).ok();
+    match owner {
+        None => lines.push("owner           nobody owns it".to_string()),
+        Some(w) => {
+            let mut pid = 0u32;
+            // SAFETY: a window handle the system just gave us.
+            unsafe {
+                GetWindowThreadProcessId(HWND(w), Some(&mut pid));
+            }
+            lines.push(format!(
+                "owner           window {:#x} of process {pid}",
+                w as isize
+            ));
+        }
+    }
+
+    match who_is_holding_it_open() {
+        None => lines.push("held open       no -- nothing is holding it open".to_string()),
+        Some((window, pid)) => lines.push(format!(
+            "held open       YES, by window {window:#x} of process {pid}. Nothing in this \
+             session can copy or paste until that lets go"
+        )),
+    }
+
+    let Ok(_open) = Opened::take(HWND::default()) else {
+        lines.push("formats         could not be read: the clipboard would not open".to_string());
+        return lines;
+    };
+
+    let mut listed = Vec::new();
+    let mut next = 0u32;
+    loop {
+        // SAFETY: the clipboard is open, which is what this requires.
+        next = unsafe { EnumClipboardFormats(next) };
+        if next == 0 {
+            break;
+        }
+        listed.push(next);
+        if listed.len() > 64 {
+            break;
+        }
+    }
+    if listed.is_empty() {
+        lines.push("formats         none are listed".to_string());
+        return lines;
+    }
+    lines.push(format!("formats         {listed:?}"));
+
+    for id in listed {
+        // The whole question, asked the way a pasting application asks
+        // it. A delayed-render promise answers by rendering; a promise
+        // that has been overwritten, answered once with nothing, or
+        // whose owner cannot be reached answers with zero, instantly,
+        // and that difference is what the timing here is for.
+        let began = Instant::now();
+        // SAFETY: the clipboard is open.
+        let got = unsafe { GetClipboardData(id) };
+        let took = began.elapsed().as_millis();
+        let said = match got {
+            Ok(h) if !h.0.is_null() => {
+                // SAFETY: clipboard data is a memory object and stays
+                // valid while the clipboard is open.
+                let size = unsafe { GlobalSize(HGLOBAL(h.0)) };
+                format!("{size} bytes")
+            }
+            Ok(_) => "nothing (a null handle, and no error)".to_string(),
+            Err(_) => format!("nothing ({})", describe_win32(last_win32())),
+        };
+        lines.push(format!("  format {id:<6} {said}, after {took} ms"));
+    }
+    lines
 }
 
 /// A handle to the thread that owns the clipboard window.
