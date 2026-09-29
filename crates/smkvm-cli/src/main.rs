@@ -524,6 +524,7 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
     println!("log            {}", paths::log_file().display());
     println!("status         {}", paths::status_file().display());
     report_on_the_machine_key();
+    report_on_the_clipboard();
     println!();
 
     // Either scope may have written it: the service writes machine-wide
@@ -629,6 +630,42 @@ fn report_on_the_machine_key() {
             "machine key     {} -- could not be opened to find out ({e})",
             key.display()
         ),
+    }
+}
+
+/// Say whether anything is holding this machine's clipboard open.
+///
+/// Only one process in a session may have the clipboard open at a
+/// time, so a window left in there stops *everything* copying and
+/// pasting -- not only this program. That happened, held by this
+/// program's own worker, and from the outside it looked like the
+/// machine's clipboard had simply broken.
+///
+/// Reported here for the same reason the key is: a person whose copy
+/// and paste has stopped should be able to find out in one command
+/// whether we are the reason, without reading a log or knowing that
+/// this program has a worker at all.
+fn report_on_the_clipboard() {
+    #[cfg(windows)]
+    {
+        match smkvm_clipboard::platform::windows::who_is_holding_it_open() {
+            None => println!("clipboard       nothing is holding it open"),
+            Some((window, pid)) => {
+                let ours = pid == std::process::id();
+                println!(
+                    "clipboard       HELD OPEN by window {window:#x} of process {pid}{}.\n\
+                     \x20               Nothing on this machine can copy or paste while \
+                     that lasts. If that process\n\
+                     \x20               is an smkvm one, `smkvm service stop` (or ending \
+                     it) gives the clipboard back.",
+                    if ours {
+                        " -- which is this command"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
     }
 }
 

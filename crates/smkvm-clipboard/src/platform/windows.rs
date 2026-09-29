@@ -28,8 +28,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
-    RemoveClipboardFormatListener, SetClipboardData,
+    GetClipboardOwner, GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -39,10 +39,10 @@ use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, KillTimer, PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer,
-    TranslateMessage, HWND_MESSAGE, MSG, MSGFLT_ALLOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT,
-    WM_TIMER, WNDCLASSW,
+    GetMessageW, GetWindowThreadProcessId, KillTimer, PostMessageW, PostThreadMessageW,
+    RegisterClassW, SetTimer, TranslateMessage, HWND_MESSAGE, MSG, MSGFLT_ALLOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_QUIT, WM_RENDERALLFORMATS,
+    WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
 
 use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
@@ -188,6 +188,26 @@ impl Drop for Opened {
         unsafe {
             let _ = CloseClipboard();
         }
+    }
+}
+
+/// Is anybody holding the clipboard open right now?
+///
+/// Only one process may have it open at a time, so a window left in
+/// here does not merely stop this program working -- it stops
+/// *everything* in that session copying and pasting, for as long as it
+/// lasts. There is no timeout and no recovery but the holder letting
+/// go or dying.
+///
+/// That happened, held by this program's own window, and it is the
+/// reason the whole of this file is careful about what may run between
+/// an open and a close.
+pub fn held_open_by() -> Option<isize> {
+    // SAFETY: takes no pointers.
+    let window = unsafe { GetOpenClipboardWindow() };
+    match window {
+        Ok(w) if !w.0.is_null() => Some(w.0 as isize),
+        _ => None,
     }
 }
 
@@ -488,7 +508,13 @@ unsafe extern "system" fn window_proc(
                 slot.as_ref().map(|s| (s.formats, s.changes.clone()))
             });
             if let Some((formats, sender)) = report {
-                if Opened::take(HWND::default()).is_ok() {
+                // `if let`, not `if ... .is_ok()`. The condition of an
+                // `if` is a terminating scope, so a temporary created
+                // there is dropped *before* the block runs -- which
+                // closed the clipboard and left the body reading a
+                // clipboard it did not have open. Binding the guard is
+                // what keeps it alive for the block.
+                if let Ok(_open) = Opened::take(HWND::default()) {
                     let _ = sender.send(available_now(formats));
                 }
             }
@@ -531,6 +557,7 @@ unsafe extern "system" fn window_proc(
             witness("WM_RENDERALLFORMATS entered; everything promised is wanted now");
             // The process is going away; anything promised has to be made real
             // now or it vanishes with us.
+            let mut said = Vec::new();
             STATE.with(|cell| {
                 let offered = cell
                     .borrow()
@@ -539,14 +566,18 @@ unsafe extern "system" fn window_proc(
                     .unwrap_or_default();
                 let formats = cell.borrow().as_ref().map(|s| s.formats);
                 if let (Some(formats), false) = (formats, offered.is_empty()) {
-                    if Opened::take(window).is_ok() {
+                    // Bound, for the reason above: as
+                    // `if ... .is_ok()` this ran every `SetClipboardData`
+                    // with the clipboard already closed again, which is
+                    // where an earlier round's `ERROR_CLIPBOARD_NOT_OPEN`
+                    // came from.
+                    if let Ok(_open) = Opened::take(window) {
                         for format in &offered {
                             for id in native_ids(formats, format) {
-                                let outcome = render(id);
-                                witness(&format!(
-                                    "rendering everything: format {id}: {}",
-                                    outcome.said()
-                                ));
+                                // Not said here: this runs with the
+                                // clipboard open, and saying anything
+                                // can block. Collected and said after.
+                                said.push(format!("format {id}: {}", render(id).said()));
                             }
                         }
                     }
@@ -601,14 +632,41 @@ fn take_clipboard(window: HWND) -> Result<()> {
         }
     }
     // Who the system thinks owns it, rather than who we asked it to.
-    // If these ever differ, nothing inside the render matters and the
-    // question is which window holds the promise -- which is the first
-    // thing to establish and was, for three rounds, unestablished.
+    // Read here because it takes no pointers and cannot block; *said*
+    // further down, after the clipboard has been closed.
     // SAFETY: reading the owner takes no pointers.
     let owner = unsafe { GetClipboardOwner() }.map(|o| o.0).ok();
+    // Closed here, deliberately and by name, before anything is said.
+    //
+    // This is the whole lesson of the worst fault in this file. Saying
+    // something reaches `witness`, which in the worker relays down a
+    // pipe -- a blocking write, with no deadline, on a pipe that also
+    // carries every captured pointer movement. Called between the open
+    // above and the close below, one such write that did not return
+    // left this window holding the clipboard open *indefinitely*, and
+    // only one process in a session may have it open at a time. So the
+    // person's own copy and paste stopped working, not only ours, with
+    // `ERROR_ACCESS_DENIED` for everybody and no way out but killing
+    // the process.
+    //
+    // The rule that follows is short and has no exceptions: **between
+    // an open and a close, do nothing that can wait on anything.** Not
+    // a log line, not a lock, not a channel, not a pipe. Gather what is
+    // needed, close, then speak.
+    drop(_open);
+
+    if let Some(holder) = held_open_by() {
+        // Said loudly because of what it costs everybody else. If this
+        // ever appears, the session's clipboard is unusable until this
+        // process lets go.
+        witness(&format!(
+            "THE CLIPBOARD IS STILL OPEN, held by window {holder:#x}, after this \
+             process should have closed it. Nothing in this session can copy or paste \
+             while that is true"
+        ));
+    }
     witness(&format!(
-        "promised {:?}; the owner is now window={:?}, and this window is \
-         {:?} ({})",
+        "promised {:?}; the owner is now window={:?}, and this window is {:?} ({})",
         offered,
         owner.unwrap_or(std::ptr::null_mut()),
         window.0,
@@ -619,6 +677,24 @@ fn take_clipboard(window: HWND) -> Result<()> {
         }
     ));
     Ok(())
+}
+
+/// Who, if anybody, is holding the clipboard open, and what that
+/// process is called.
+///
+/// For `smkvm status`, so that somebody whose copy and paste has
+/// stopped can find out in one command whether this program is the
+/// reason. Only one process in a session may have the clipboard open,
+/// and a window left in there takes it away from everybody.
+pub fn who_is_holding_it_open() -> Option<(isize, u32)> {
+    let window = held_open_by()?;
+    let mut pid = 0u32;
+    // SAFETY: a window handle the system just gave us, and a place for
+    // the process id.
+    unsafe {
+        GetWindowThreadProcessId(HWND(window as *mut _), Some(&mut pid));
+    }
+    Some((window, pid))
 }
 
 /// A handle to the thread that owns the clipboard window.
