@@ -410,6 +410,42 @@ wrong with the worker's own logging. `WM_RENDERFORMAT entered` is
 written as the first statement of the handler, before it looks at
 anything.
 
+**UIPI was it, and the filter is the cure.** Under the service, with
+the filter asked for, the handler is entered:
+
+    clipboard: window is up: window=0x... thread=...
+      messages-from-less-privileged[773=allowed 774=allowed 775=allowed]
+    clipboard: WM_RENDERFORMAT entered for format 13
+
+`ready: ... integrity=system` confirmed the premise at its root and
+the owner comparison confirmed the promise is on our own window. Since
+`ChangeWindowMessageFilterEx` adjusts nothing but UIPI filtering, the
+message having arrived settles that UIPI was stopping it. Why a
+high-integrity owner needs no such call and a system one does remains
+unexplained; see the open question above, which stays open.
+
+**Then a self-collision the X11 side had already solved.** The worker
+owns the clipboard for the far machine's offer *and* watches the
+clipboard for local copies, and it was reporting its own offer as
+somebody else copying. What followed was a loop: the change is
+announced, the service asks the worker to read what was "copied", the
+worker asks the clipboard, the owner it is asking is itself mid-
+promise, the read fails, the render fails, the promise is renewed --
+and round again, for a whole run.
+
+The mechanism to prevent it existed and could not work. A flag was set
+when the clipboard was taken and cleared by the first notice that came
+back. The comment immediately beneath it said, and had always said,
+that *one copy arrives as several of these*: the first notice consumed
+the flag and every one after it was taken for a foreign copy. Each of
+those threw away `state.offer` **and `state.cache`** -- which is also
+why the second paste was never instant, and why the cache promised in
+the round before never helped once.
+
+The fix is what X11 has always done: ask who owns the clipboard rather
+than remember that it should be us. `GetClipboardOwner` against our own
+window does not care how many notices one copy produces.
+
 **The control was run, and it narrows this to one variable.** Same
 machine, same binary, still under the scheduled task, the user's
 clipboard never interrupted:
@@ -431,18 +467,23 @@ it was available for two rounds before anybody ran it.
 
 So the next run has two readings and not three:
 
-- `clipboard: WM_RENDERFORMAT entered` appears -> UIPI was blocking
-  the message and `ChangeWindowMessageFilterEx` is the cure, because
-  that call does nothing else. Why a high-integrity owner never needed
-  it stays open; see above.
-- It does not appear -> UIPI was not the mechanism, and the question
-  becomes what else about running as the system account keeps the
-  message away. The line after taking the clipboard is the next thing
-  to read, since it reports `GetClipboardOwner` against our own window
-  handle.
+Both of those have now happened: the control showed the handler works
+when reached, and the service run showed the filter is what lets it be
+reached. What the next run has to answer instead is where a paste's
+time goes, and it is instrumented to say so rather than to be guessed
+at:
 
-There is no third reading left, because the control has already shown
-the handler works when it is reached.
+- `clipboard: WM_RENDERFORMAT entered`, then `a paste waited on the
+  service waited_ms=...`, then `the far machine answered a paste
+  took_ms=...`. Those three bracket the whole cost, and the difference
+  between the outer two is what the pipe and this code add to it.
+- `pasting what arrived too late for the last attempt` on a second
+  paste is the cache doing what was promised. Its absence means the
+  cache is still being cleared underneath, which the self-collision
+  was doing.
+
+Do not raise a budget without those numbers. A number raised to
+accommodate a loop is a number that hides it.
 
 Grep for `clipboard:` and it finds these lines on either arrangement.
 The prefix is put on at the source for that reason; under the task
@@ -1155,6 +1196,15 @@ no session on it, claiming input was landing, until the next injection
 timed out a second later. The wait now goes *after* the observing, and
 detaches before it waits.
 
+**A guard that remembers cannot count, and one copy is several
+notices.** The self-change guard was a boolean set on taking the
+clipboard and cleared by the next notice. Windows sends several
+notices for one copy -- the code's own comment said so, two lines
+below the guard -- so every notice after the first was read as a
+foreign copy. Where the question is "did I cause this", ask the system
+who did it rather than remembering that you meant to; the answer does
+not depend on how many times you are asked.
+
 **A checker is only as good as the inputs it has met, and reading it is
 not meeting them.** The access-list parser was read carefully by its
 author, reviewed, and had six tests -- and still blessed four different
@@ -1376,6 +1426,28 @@ that stops the daemon and immediately moves the new binary over the old one
 fails, and `Move-Item` says so in a way that scrolls past; the task then
 restarts the *old* binary and everything looks deployed. Wait for the process
 to be gone and retry the move, and check the hash afterwards.
+
+**Switching the arrangement does not stop the daemon the old one
+started.** `install --system` removed the login task and the task's
+daemon carried on running, so a machine briefly had the old daemon,
+the new service and its worker -- two daemons over one clipboard,
+which is the thing the trap below is about and which `secure::plan`
+was written to make impossible.
+
+It was defeated by looking in the wrong profile. `running_pid` reads
+the status report, a daemon writes that report into the profile of
+whoever runs it, and an install happens over ssh as an administrator
+who is not that person. The report was not in any place the installer
+could look, so it found nothing and stopped nothing. Same root as the
+configuration and the transfer directory: *the installing account is
+not the account the machine belongs to*, and anything that reads a
+per-user place during an install is asking the wrong person.
+
+The process list needs nobody's profile, so the switch now asks it.
+What counts as a daemon is `plan::is_a_daemon`, which is pure and
+tested -- and it has to be, because the installer is itself an
+`smkvm.exe` and stopping everything by name would have it stop itself
+halfway through.
 
 **Two daemons on one machine.** Before the guard in `smkvm serve`/`connect`,
 starting a second `smkvm connect` left the first attached and forgotten,
