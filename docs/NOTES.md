@@ -434,6 +434,27 @@ write is blocking with no deadline on a pipe that also carries every
 captured pointer movement. One write that did not return left the
 clipboard open for ever.
 
+That rule was written and obeyed, and the same blocking write came
+back one round later in a form the rule did not cover. Closing the
+clipboard first stops the damage spreading to the whole session, but
+the relay could still stop the thread that was emitting the line --
+and with it every statement after that line in the same function.
+`witness` logs first and relays second, so a wedged relay leaves a
+distinctive fingerprint: the line appears once in the local log,
+never with the `worker:` prefix, and nothing that should have
+followed it appears at all. That was exactly the state of the one
+instrument built to diagnose this bug.
+
+**A diagnostic that can stop the code it is diagnosing is not a
+diagnostic.** The clipboard's witness now hands each line to a
+bounded queue and returns; one thread drains it in order, and when
+the queue is full the line is dropped and counted rather than made to
+wait. Losing a line is a nuisance. Losing the rest of the function
+reads like a different bug entirely, and cost a round on that basis.
+The worker's other writes to the service are still unbounded; only
+the diagnostic path is protected, which is the one that must never be
+the reason something did not happen.
+
 So the rule, which is short and has no exceptions: **between an open
 and a close, do nothing that can wait on anything.** Not a log line,
 not a lock, not a channel, not a pipe. Gather what is needed, close,

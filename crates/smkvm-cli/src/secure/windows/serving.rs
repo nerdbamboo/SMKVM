@@ -13,6 +13,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -21,6 +22,18 @@ use smkvm_proto::{ClipFormat, MouseButton};
 
 use crate::secure::windows::clip::{Waiting, PASTE_WITHIN};
 use crate::secure::wire::{FromWorker, Level, ToWorker};
+
+/// How many relayed clipboard lines may be waiting before the rest are
+/// dropped.
+///
+/// Generous, because these lines are rare -- a copy, a promise, a
+/// render -- and a burst of them is exactly the moment somebody is
+/// trying to find out what went wrong. Small enough that a relay that
+/// has stopped moving cannot grow without bound.
+const WITNESS_BACKLOG: usize = 256;
+
+/// Whether the relay above has already been put in place.
+static RELAY_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// The worker's end of the clipboard, while it holds one.
 pub struct Serving {
@@ -169,18 +182,85 @@ impl Serving {
     /// to tell "the render did not run" from "the render ran and said
     /// nothing", so the render now says it through the channel that is
     /// known to survive.
-    fn speak_for_the_clipboard(speak: &Speak) {
+    /// Point the clipboard's witness at the pipe, through a queue it
+    /// can never wait on.
+    ///
+    /// This used to call `speak` directly, and `speak` takes the lock
+    /// on the one writer every thread shares and then writes to the
+    /// pipe with no deadline. So a diagnostic line could stop the
+    /// thread that was emitting it -- and not just that line: every
+    /// statement after it in the same function, for as long as the
+    /// pipe stayed full or another thread held the lock.
+    ///
+    /// That is how the one instrument built for this round came to be
+    /// the one instrument not reporting. `witness` writes to the log
+    /// first and relays second, so a wedged relay leaves exactly the
+    /// fingerprint that was seen: the line appears once locally, never
+    /// with the `worker:` prefix, and nothing that should have
+    /// followed it appears at all.
+    ///
+    /// A diagnostic that can stop the code it is diagnosing is not a
+    /// diagnostic. So the relay hands the line to a bounded queue and
+    /// returns immediately; one thread drains it in order. When the
+    /// queue is full the line is dropped and counted, and the count is
+    /// said with the next line that gets through. Losing a line is a
+    /// nuisance; losing the rest of the function is a fault that reads
+    /// like a different bug entirely.
+    fn speak_for_the_clipboard(speak: &Speak) -> Result<()> {
+        // Once per process, and said so here rather than left to
+        // `witness_through` quietly ignoring the second call.
+        //
+        // The clipboard is taken and given back repeatedly in one
+        // worker's life -- every `ServeClipboard` does it -- so this
+        // runs more than once. `witness_through` keeps the first
+        // relay it is given and discards the rest silently, which was
+        // survivable only by accident: the first relay happens to
+        // stay valid because there is one pipe for the life of the
+        // process. Saying no explicitly is the same behaviour without
+        // the accident, and without a thread left behind each time.
+        if RELAY_INSTALLED.set(()).is_err() {
+            return Ok(());
+        }
         let speak = speak.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel::<String>(WITNESS_BACKLOG);
+        std::thread::Builder::new()
+            .name("smkvm-worker-witness".into())
+            .spawn(move || {
+                while let Ok(text) = receive.recv() {
+                    // Relayed as given. The `clipboard:` prefix is
+                    // already on it, put there at the source so that
+                    // the same search finds these lines on both
+                    // arrangements; adding another here would make it
+                    // `worker: clipboard: clipboard: ...`.
+                    if !speak(&FromWorker::Said {
+                        level: Level::Info,
+                        text,
+                    }) {
+                        return;
+                    }
+                }
+            })
+            .context("starting the worker's relay for clipboard lines")?;
+        let dropped = Arc::new(AtomicUsize::new(0));
         smkvm_clipboard::witness_through(Box::new(move |text| {
-            // Relayed as given. The `clipboard:` prefix is already on
-            // it, put there at the source so that the same search
-            // finds these lines on both arrangements; adding another
-            // here would make it `worker: clipboard: clipboard: ...`.
-            speak(&FromWorker::Said {
-                level: Level::Info,
-                text: text.to_string(),
-            });
+            let missed = dropped.load(Ordering::Relaxed);
+            if missed > 0
+                && send
+                    .try_send(format!(
+                        "clipboard: {missed} line(s) were dropped rather than made to \
+                         wait for the pipe"
+                    ))
+                    .is_ok()
+            {
+                dropped.fetch_sub(missed, Ordering::Relaxed);
+            }
+            // `try_send`, which never waits. That is the whole point of
+            // this function.
+            if send.try_send(text.to_string()).is_err() {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }));
+        Ok(())
     }
 
     fn from_parts(
@@ -189,7 +269,7 @@ impl Serving {
         write: Box<dyn Write + Send>,
         speak: Speak,
     ) -> Result<Serving> {
-        Self::speak_for_the_clipboard(&speak);
+        Self::speak_for_the_clipboard(&speak)?;
         let pastes = Arc::new(Waiting::new());
         let asked: Arc<Mutex<HashMap<u64, ClipFormat>>> = Arc::new(Mutex::new(HashMap::new()));
         let ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
