@@ -1696,6 +1696,38 @@ collected its outcomes into a list and then never said them -- the one
 message able to quietly replace a promise was also the only one that
 reported nothing.
 
+**The offer travels in two halves.** `WindowsHandle::offer` puts the
+formats and the place to fetch them on a channel, and posts a thread
+message telling the window thread to look. Neither half is any use
+without the other, they are sent from a different thread than the one
+that reads them, and the state they land in is a thread-local
+reachable only from the window's own thread. That is the only place
+in the Windows clipboard where one act is split across two
+mechanisms, and it is the first thing to suspect when the clipboard
+promises something nothing can supply.
+
+So both ends say what they saw, with contents: handing over, taking
+it up (naming what it replaced), taking the clipboard to promise it,
+and being asked to produce a format with nothing recorded to fetch.
+The two places that ever let an offer go -- somebody else copying,
+and giving the clipboard back -- each name what they let go of.
+`announced` and `nothing is on offer` were two statements about the
+same value that never once appeared together with that value in
+them, which is why three rounds of this were guesswork.
+
+**A count that can outlive what it counts will be applied to
+something else.** The renewal count sat in `State` beside the offer,
+and was reset only by a render that succeeded. Once a promise had
+been given up on, the count stayed above its limit for the life of
+the window, so the *next* offer would be released after its first
+unsuccessful render -- one clipboard that could not be served
+poisoning every clipboard after it. It lives inside `Offer` now.
+Letting the offer go takes the count with it, and a new offer starts
+from zero because it is a new value; there is no longer a way to
+write the bug. (This was found while adding the lines above, and is
+not the fault those lines were added to find: `NothingOffered` does
+not renew, so this path was not the one firing.)
+
 **A line that must exist is said by a drop, not by a statement.**
 `WM_RENDERFORMAT for format N returned after ... ms` is the most
 important line in the Windows clipboard, and across several rounds it
@@ -1706,7 +1738,7 @@ is emitted from `Returning`'s `Drop` now, which also covers unwinding
 and says plainly that the handler did not come back when no outcome
 was recorded. A statement can be skipped; a drop cannot.
 
-**Measure from inside the session.** Eight faults in the clipboard
+**Measure from inside the session.** Nine faults in the clipboard
 path so far. All but one were found by asking the running system a
 question from the session it was in, rather than by reading the code
 or the log. The exception is instructive in the same direction: it

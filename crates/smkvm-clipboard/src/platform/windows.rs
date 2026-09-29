@@ -331,11 +331,30 @@ struct State {
     formats: Formats,
     changes: Sender<Available>,
     /// What is currently being offered, and where to get it.
-    offer: Option<(Vec<ClipFormat>, Box<dyn Fetch>)>,
+    offer: Option<Offer>,
     /// Anything already fetched, so a second paste does not fetch again.
     cache: HashMap<ClipFormat, Vec<u8>>,
-    /// How many times running the promise has been renewed without a
-    /// paste ever being served.
+}
+
+/// What the far machine has copied, and how many chances are left to
+/// hand it over.
+///
+/// The count lives here rather than beside the offer, and that is the
+/// whole reason this is a struct. It used to sit in `State`, reset
+/// only by a render that succeeded -- so once a promise had been
+/// given up on, the counter stayed above its limit for the life of
+/// the window, and the *next* offer was released after its first
+/// unsuccessful render. One clipboard that could not be served
+/// poisoned every clipboard after it, and from outside that reads
+/// exactly like the worker announcing something it does not hold.
+///
+/// A count that can outlive what it counts will eventually be applied
+/// to something else. Keeping it inside the offer makes that
+/// impossible: letting the offer go takes the count with it, and a
+/// new offer starts from zero because it is a new value.
+struct Offer {
+    formats: Vec<ClipFormat>,
+    source: Box<dyn Fetch>,
     renewals: u32,
 }
 
@@ -359,10 +378,19 @@ fn render(format_id: u32) -> Rendered {
             return Rendered::NoState;
         };
         let formats = state.formats;
-        let Some((offered, source)) = state.offer.as_ref() else {
+        let Some(offer) = state.offer.as_ref() else {
+            // The one outcome that is about this program's own state
+            // rather than about Windows, so it says what that state
+            // was. Reaching here means the promise outlived the thing
+            // it was a promise for.
+            witness(&format!(
+                "asked to produce format {format_id}, but nothing is recorded to fetch \
+                 (nothing has been announced to this window, or it has been let go)"
+            ));
             return Rendered::NothingOffered;
         };
-        let wanted = offered
+        let wanted = offer
+            .formats
             .iter()
             .find(|f| native_ids(formats, f).contains(&format_id));
         let Some(wanted) = wanted.cloned() else {
@@ -372,7 +400,7 @@ fn render(format_id: u32) -> Rendered {
         let asked_at = Instant::now();
         let bytes = match state.cache.get(&wanted) {
             Some(cached) => cached.clone(),
-            None => match source.fetch(&wanted) {
+            None => match offer.source.fetch(&wanted) {
                 Ok(bytes) => {
                     state.cache.insert(wanted.clone(), bytes.clone());
                     bytes
@@ -391,7 +419,9 @@ fn render(format_id: u32) -> Rendered {
 
         match write_native(formats, &wanted, format_id, &bytes) {
             Ok(()) => {
-                state.renewals = 0;
+                if let Some(offer) = state.offer.as_mut() {
+                    offer.renewals = 0;
+                }
                 Rendered::Served(bytes.len())
             }
             Err(e) => Rendered::CouldNotHandOver(e.to_string()),
@@ -407,8 +437,14 @@ fn after_a_render_that_kept_nothing(window: HWND, format_id: u32) {
         let Some(state) = slot.as_mut() else {
             return true;
         };
-        state.renewals += 1;
-        state.renewals > RENEWALS_BEFORE_GIVING_UP
+        // No offer means there is nothing to renew *and* nothing
+        // worth holding the clipboard for, so give it back at once
+        // rather than promising emptiness three more times.
+        let Some(offer) = state.offer.as_mut() else {
+            return true;
+        };
+        offer.renewals += 1;
+        offer.renewals > RENEWALS_BEFORE_GIVING_UP
     });
     if give_up {
         witness(&format!(
@@ -495,6 +531,10 @@ unsafe extern "system" fn window_proc(
                 // send the far machine's clipboard straight back to it.
                 return LRESULT(0);
             }
+            // Somebody else's copy replaces ours, which is correct --
+            // and it is also one of only two places the offer is ever
+            // discarded, so it says so with what it discarded.
+            let was = on_offer_now();
             STATE.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 let Some(state) = slot.as_mut() else {
@@ -503,6 +543,12 @@ unsafe extern "system" fn window_proc(
                 state.offer = None;
                 state.cache.clear();
             });
+            witness(&format!(
+                "somebody else copied something (owner is {:?}, this window is {:?}), so the \
+                 far machine's offer of {was} was let go",
+                owner.unwrap_or(std::ptr::null_mut()),
+                window.0
+            ));
             // One copy arrives as several of these: an application that sets
             // the clipboard through OLE empties it and fills it in more than
             // one step, and each step is a notice, a few milliseconds apart.
@@ -587,7 +633,7 @@ unsafe extern "system" fn window_proc(
                 let offered = cell
                     .borrow()
                     .as_ref()
-                    .and_then(|s| s.offer.as_ref().map(|(f, _)| f.clone()))
+                    .and_then(|s| s.offer.as_ref().map(|o| o.formats.clone()))
                     .unwrap_or_default();
                 let formats = cell.borrow().as_ref().map(|s| s.formats);
                 if let (Some(formats), false) = (formats, offered.is_empty()) {
@@ -623,17 +669,43 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RELEASE => {
+            // The other of the two places the offer is let go.
+            let was = on_offer_now();
             STATE.with(|cell| {
                 if let Some(state) = cell.borrow_mut().as_mut() {
                     state.offer = None;
                     state.cache.clear();
                 }
             });
+            witness(&format!("giving the clipboard back; {was} was on offer"));
             LRESULT(0)
         }
         // SAFETY: handing anything else along is what the API requires.
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
     }
+}
+
+/// What is on offer right now, in a form fit to put in a log line.
+///
+/// The offer is the one piece of ordinary program state in this file,
+/// and it is held in a thread-local reachable only from the window's
+/// own thread while being *set* from another thread through a
+/// channel. Two halves of one act, arriving separately. So every
+/// place that sets it, clears it or finds it missing says what it saw
+/// -- "announced" and "nothing is on offer" were two statements about
+/// the same thing that never once appeared together with their
+/// contents.
+fn on_offer_now() -> String {
+    STATE.with(|cell| match cell.borrow().as_ref() {
+        None => "no state at all on this thread".to_string(),
+        Some(state) => match state.offer.as_ref() {
+            None => "nothing".to_string(),
+            Some(offer) => format!(
+                "{:?} (renewed {} of {RENEWALS_BEFORE_GIVING_UP} times)",
+                offer.formats, offer.renewals
+            ),
+        },
+    })
 }
 
 /// Says how a render ended, when it ends, however it ends.
@@ -686,13 +758,22 @@ fn take_clipboard(window: HWND) -> Result<()> {
         (
             state.map(|s| s.formats),
             state
-                .and_then(|s| s.offer.as_ref().map(|(f, _)| f.clone()))
+                .and_then(|s| s.offer.as_ref().map(|o| o.formats.clone()))
                 .unwrap_or_default(),
         )
     });
     let (Some(formats), false) = (formats, offered.is_empty()) else {
+        // Said, rather than returned from in silence. A promise that
+        // is never made looks identical from outside to one that is
+        // made and then lost, and telling those apart is the whole of
+        // the current question.
+        witness(&format!(
+            "asked to take the clipboard, but on offer is {}, so nothing was promised",
+            on_offer_now()
+        ));
         return Ok(());
     };
+    witness(&format!("taking the clipboard to promise {offered:?}"));
 
     let _open = Opened::take(window)?;
     // SAFETY: the clipboard is open and owned by this window.
@@ -1058,14 +1139,40 @@ pub struct WindowsHandle {
 }
 
 impl WindowsHandle {
+    /// Hand an offer to the window thread.
+    ///
+    /// In two parts, and that is worth saying out loud because it is
+    /// the only place in this file where one act is split across two
+    /// mechanisms. The formats and where to fetch them go down a
+    /// channel; a thread message tells the window thread to look.
+    /// Neither half is any use without the other, and they are sent
+    /// from a different thread than the one that will read them, so
+    /// both ends say what they saw.
     pub fn offer(&self, formats: &[ClipFormat], source: Box<dyn Fetch>) -> Result<()> {
+        // SAFETY: takes no pointers.
+        let from = unsafe { GetCurrentThreadId() };
+        witness(&format!(
+            "handing {formats:?} to the clipboard thread {} from thread {from}",
+            self.thread_id
+        ));
         self.offers
             .send((formats.to_vec(), source))
             .map_err(|_| ClipboardError::Display("the clipboard thread has stopped".into()))?;
-        self.post(WM_OFFER)
+        let posted = self.post(WM_OFFER);
+        if let Err(e) = &posted {
+            // The channel now holds an offer nobody will collect, and
+            // the next message to arrive would take *this* one. Said
+            // loudly for that reason.
+            witness(&format!(
+                "the offer is on the channel but the clipboard thread could not be told \
+                 to look ({e}); it will be picked up by whatever is announced next"
+            ));
+        }
+        posted
     }
 
     pub fn release(&self) -> Result<()> {
+        witness("asking the clipboard thread to give the clipboard back");
         self.post(WM_RELEASE)
     }
 
@@ -1166,7 +1273,6 @@ fn clipboard_thread(
 
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(State {
-            renewals: 0,
             formats,
             changes,
             offer: None,
@@ -1243,13 +1349,39 @@ fn clipboard_thread(
         // An offer posted from another thread arrives as a message with the
         // data waiting on the channel.
         if message.message == WM_OFFER {
-            if let Ok(offer) = offers.try_recv() {
-                STATE.with(|cell| {
-                    if let Some(state) = cell.borrow_mut().as_mut() {
-                        state.offer = Some(offer);
-                        state.cache.clear();
-                    }
-                });
+            // The announcement and the thing announced travel
+            // separately: the formats and where to fetch them come
+            // down this channel, the nudge to look comes as a
+            // message. Two halves of one act, and if they ever come
+            // apart the clipboard promises something nothing can
+            // supply. So both halves are said here, including the
+            // case where the message arrives with no offer behind it.
+            match offers.try_recv() {
+                Ok((formats, source)) => {
+                    let replacing = on_offer_now();
+                    let announced = formats.clone();
+                    STATE.with(|cell| {
+                        if let Some(state) = cell.borrow_mut().as_mut() {
+                            // A new value, so the renewal count is
+                            // new too. That is the point of it living
+                            // in here.
+                            state.offer = Some(Offer {
+                                formats,
+                                source,
+                                renewals: 0,
+                            });
+                            state.cache.clear();
+                        }
+                    });
+                    witness(&format!(
+                        "announcing {announced:?} from the far machine, replacing {replacing}"
+                    ));
+                }
+                Err(e) => witness(&format!(
+                    "asked to announce an offer, but none came with the message ({e}); \
+                     on offer is still {}",
+                    on_offer_now()
+                )),
             }
             // Thread messages have no window, so the procedure is called here.
             // SAFETY: the window is this thread's own.
