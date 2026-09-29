@@ -451,9 +451,40 @@ bounded queue and returns; one thread drains it in order, and when
 the queue is full the line is dropped and counted rather than made to
 wait. Losing a line is a nuisance. Losing the rest of the function
 reads like a different bug entirely, and cost a round on that basis.
-The worker's other writes to the service are still unbounded; only
-the diagnostic path is protected, which is the one that must never be
-the reason something did not happen.
+The render path got the same treatment one round later, and for a
+sharper reason. `WM_RENDERFORMAT` runs on the clipboard window's
+thread with the pasting application stopped and a promise
+outstanding, and it asked the service for the contents through the
+same shared writer. A handler that does not come back has not merely
+been slow: returning without setting data answers the question with
+nothing, permanently, and Windows never asks again. So one contended
+write left the person's clipboard empty until something restarted --
+and it presented as "the render is never entered", because after the
+first failure there were no more renders to enter.
+
+**`secure::outbox`.** One place where a thread that must not wait
+puts something for the service: `post` uses `try_send`, so it either
+takes the message or refuses and counts the refusal, and a named
+thread does the waiting where waiting is allowed. Refusals are
+admitted in the log rather than silently swallowed, and if the
+admission itself cannot be posted it is owed again. The tests are the
+invariant: a full outbox refuses promptly, an undrained one says so
+rather than hanging, order is preserved, and the count is handed over
+once.
+
+A caller that is refused takes the path that renews the promise, not
+the path that answers nothing -- which is the difference between one
+paste that does nothing and a clipboard that is empty for ever.
+
+`AskTheService` deliberately holds no `Speak` any more. The surest
+way to say that nothing reachable from a render may wait on another
+thread is to not hand it the thing that can, and the compiler keeps
+it that way: putting the field back makes it dead code, which is how
+this was confirmed rather than assumed.
+
+The worker's remaining writes -- the capture pump and the main loop
+-- are still direct. Those threads may wait without answering a
+promise on the way out.
 
 So the rule, which is short and has no exceptions: **between an open
 and a close, do nothing that can wait on anything.** Not a log line,
@@ -1665,11 +1696,25 @@ collected its outcomes into a list and then never said them -- the one
 message able to quietly replace a promise was also the only one that
 reported nothing.
 
-**Measure from inside the session.** Six faults in the clipboard path
-so far, and not one was found by reading the code or the log. Each was
-found by asking the running system a question from the session it was
-in. The pattern is consistent enough to be a rule: when a theory and a
-measurement are both available, take the measurement.
+**A line that must exist is said by a drop, not by a statement.**
+`WM_RENDERFORMAT for format N returned after ... ms` is the most
+important line in the Windows clipboard, and across several rounds it
+never once appeared. The reason was different every time -- a
+filtered message, a wedged relay, a blocking write -- and identical
+in shape: the statement that would have said it was never reached. It
+is emitted from `Returning`'s `Drop` now, which also covers unwinding
+and says plainly that the handler did not come back when no outcome
+was recorded. A statement can be skipped; a drop cannot.
+
+**Measure from inside the session.** Eight faults in the clipboard
+path so far. All but one were found by asking the running system a
+question from the session it was in, rather than by reading the code
+or the log. The exception is instructive in the same direction: it
+was a diagnostic line that could only ever say "failed", believed
+because it was the only thing speaking. The pattern is consistent
+enough to be a rule: when a theory and a measurement are both
+available, take the measurement -- and give the measurement two ways
+to disagree with itself.
 
 ## Verifying a change
 

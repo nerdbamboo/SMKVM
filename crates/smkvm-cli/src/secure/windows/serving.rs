@@ -13,27 +13,71 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use smkvm_clipboard::{CatchDrag, Drive, Fetch, Read, Watch, Write};
 use smkvm_proto::{ClipFormat, MouseButton};
 
+use crate::secure::outbox::{Outbox, Posted};
 use crate::secure::windows::clip::{Waiting, PASTE_WITHIN};
 use crate::secure::wire::{FromWorker, Level, ToWorker};
 
-/// How many relayed clipboard lines may be waiting before the rest are
-/// dropped.
+/// How many messages may be waiting to go to the service before the
+/// rest are refused.
 ///
-/// Generous, because these lines are rare -- a copy, a promise, a
-/// render -- and a burst of them is exactly the moment somebody is
-/// trying to find out what went wrong. Small enough that a relay that
-/// has stopped moving cannot grow without bound.
-const WITNESS_BACKLOG: usize = 256;
+/// Generous, because a burst is exactly the moment the messages
+/// matter, and bounded, because a queue nobody drains must not grow
+/// without limit.
+const OUTBOX_ROOM: usize = 256;
 
-/// Whether the relay above has already been put in place.
+/// The one place a thread that must not wait puts something for the
+/// service.
+///
+/// Process-wide, because there is one pipe for the life of the
+/// worker, and because the threads that need it -- the clipboard
+/// window's and whichever one a render arrives on -- are not the ones
+/// that built it.
+static OUTBOX: std::sync::OnceLock<Outbox<FromWorker>> = std::sync::OnceLock::new();
+
+/// Whether the outbox above has already been put in place.
 static RELAY_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Say something to the service from a thread that is not allowed to
+/// wait, admitting anything lost on the way.
+///
+/// The return value says whether it got as far as the queue, which is
+/// not the same as reaching the service -- and for a diagnostic line
+/// that distinction does not matter enough to wait for.
+fn say_without_waiting(text: String) -> bool {
+    let Some(outbox) = OUTBOX.get() else {
+        // Nothing has been set up yet, which on this path means the
+        // worker is not serving a clipboard. The local log still has
+        // the line; `witness` wrote it there before calling this.
+        return false;
+    };
+    let missed = outbox.missed();
+    if missed > 0 {
+        // Put back if it cannot be said, so the admission is not
+        // itself lost.
+        let note = FromWorker::Said {
+            level: Level::Warn,
+            text: format!(
+                "clipboard: {missed} line(s) were dropped rather than made to wait \
+                 for the pipe"
+            ),
+        };
+        if !outbox.post(note).arrived() {
+            outbox.put_back(missed);
+        }
+    }
+    outbox
+        .post(FromWorker::Said {
+            level: Level::Info,
+            text,
+        })
+        .arrived()
+}
 
 /// The worker's end of the clipboard, while it holds one.
 pub struct Serving {
@@ -93,8 +137,14 @@ pub fn tell(speak: &Speak, level: Level, text: impl Into<String>) {
 /// it is now bounded, so an application stalls for at most
 /// [`PASTE_WITHIN`] rather than for as long as the far machine stays
 /// quiet.
+/// Deliberately holds no `Speak`.
+///
+/// It used to, and that was the fault: everything reachable from a
+/// render has to be incapable of waiting on another thread, and the
+/// surest way to say so is to not hand it the thing that can. What
+/// goes out from here goes through the outbox. The compiler enforces
+/// it now -- put the field back and it is dead code.
 struct AskTheService {
-    speak: Speak,
     pastes: Arc<Waiting<Result<Vec<u8>, String>>>,
     asked: Arc<Mutex<HashMap<u64, ClipFormat>>>,
     ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>>,
@@ -117,19 +167,47 @@ impl Fetch for AskTheService {
             .expect("not poisoned")
             .insert(id, format.clone());
         tracing::debug!("something here is pasting {format:?}; asking the service for it");
-        (self.speak)(&FromWorker::Said {
-            level: Level::Info,
-            text: format!("something on this desktop is pasting {format:?}"),
+        // Through the outbox, not `speak`, and this is the line that
+        // matters most in the file.
+        //
+        // This runs on the clipboard window's thread, inside
+        // `WM_RENDERFORMAT`, with the pasting application stopped and
+        // a promise outstanding. `speak` takes the lock on the writer
+        // every thread shares and then writes to the pipe with no
+        // deadline, so calling it here hands the window thread to
+        // whoever happens to hold that lock. And a render that does
+        // not return has not merely been slow: a handler that returns
+        // without setting data has answered the question with
+        // nothing, permanently, and Windows never asks again. One
+        // contended write and the person's clipboard is empty until
+        // something restarts.
+        //
+        // So the request is posted, never waited on. If the queue is
+        // full this gives up at once and says so, which reaches the
+        // render as a failure to fetch -- and a failure to fetch is
+        // the outcome that renews the promise rather than the one
+        // that answers nothing.
+        say_without_waiting(format!("something on this desktop is pasting {format:?}"));
+        let posted = OUTBOX.get().map(|o| {
+            o.post(FromWorker::WantsPaste {
+                id,
+                format: format.clone(),
+            })
         });
-        if !(self.speak)(&FromWorker::WantsPaste {
-            id,
-            format: format.clone(),
-        }) {
+        if !posted.map(Posted::arrived).unwrap_or(false) {
             self.pastes.forget(id);
             self.asked.lock().expect("not poisoned").remove(&id);
-            return Err(smkvm_clipboard::ClipboardError::Display(
-                "the service is not there to fetch what was copied".into(),
-            ));
+            return Err(smkvm_clipboard::ClipboardError::Display(format!(
+                "could not even ask the service for what was copied ({}), so this \
+                 paste produced nothing. The promise is renewed; pasting again \
+                 should work",
+                match posted {
+                    Some(Posted::NoRoom(n)) =>
+                        format!("{n} message(s) refused in a row; the pipe is not moving"),
+                    Some(Posted::Gone) => "the service is not there".to_string(),
+                    _ => "the clipboard is not being served".to_string(),
+                }
+            )));
         }
         let asked_at = std::time::Instant::now();
         let outcome = answer.recv_timeout(PASTE_WITHIN);
@@ -174,14 +252,6 @@ impl Serving {
         )
     }
 
-    /// Point the clipboard crate's most important lines at the pipe.
-    ///
-    /// Its own `tracing` output has been unreliable in this process in
-    /// a way nobody has pinned down, and the pipe demonstrably is not:
-    /// it carries every keystroke. Three rounds have been spent unable
-    /// to tell "the render did not run" from "the render ran and said
-    /// nothing", so the render now says it through the channel that is
-    /// known to survive.
     /// Point the clipboard's witness at the pipe, through a queue it
     /// can never wait on.
     ///
@@ -222,43 +292,28 @@ impl Serving {
             return Ok(());
         }
         let speak = speak.clone();
-        let (send, receive) = std::sync::mpsc::sync_channel::<String>(WITNESS_BACKLOG);
+        let (outbox, receive) = Outbox::with_room_for(OUTBOX_ROOM);
         std::thread::Builder::new()
-            .name("smkvm-worker-witness".into())
+            .name("smkvm-worker-outbox".into())
             .spawn(move || {
-                while let Ok(text) = receive.recv() {
-                    // Relayed as given. The `clipboard:` prefix is
-                    // already on it, put there at the source so that
-                    // the same search finds these lines on both
-                    // arrangements; adding another here would make it
-                    // `worker: clipboard: clipboard: ...`.
-                    if !speak(&FromWorker::Said {
-                        level: Level::Info,
-                        text,
-                    }) {
+                // The one thread allowed to wait on the writer. Every
+                // frame still goes out under the shared lock and in
+                // order, so nothing is torn in half; what changed is
+                // only *who* waits for it.
+                while let Ok(message) = receive.recv() {
+                    if !speak(&message) {
                         return;
                     }
                 }
             })
-            .context("starting the worker's relay for clipboard lines")?;
-        let dropped = Arc::new(AtomicUsize::new(0));
+            .context("starting the worker's outbox")?;
+        let _ = OUTBOX.set(outbox);
         smkvm_clipboard::witness_through(Box::new(move |text| {
-            let missed = dropped.load(Ordering::Relaxed);
-            if missed > 0
-                && send
-                    .try_send(format!(
-                        "clipboard: {missed} line(s) were dropped rather than made to \
-                         wait for the pipe"
-                    ))
-                    .is_ok()
-            {
-                dropped.fetch_sub(missed, Ordering::Relaxed);
-            }
-            // `try_send`, which never waits. That is the whole point of
-            // this function.
-            if send.try_send(text.to_string()).is_err() {
-                dropped.fetch_add(1, Ordering::Relaxed);
-            }
+            // Relayed as given. The `clipboard:` prefix is already on
+            // it, put there at the source so that the same search
+            // finds these lines on both arrangements; adding another
+            // here would make it `worker: clipboard: clipboard: ...`.
+            say_without_waiting(text.to_string());
         }));
         Ok(())
     }
@@ -306,12 +361,11 @@ impl Serving {
         self.read.read(format).map_err(|e| e.to_string())
     }
 
-    pub fn offer(&mut self, formats: &[ClipFormat], speak: Speak) -> Result<(), String> {
+    pub fn offer(&mut self, formats: &[ClipFormat]) -> Result<(), String> {
         // A new offer is a new set of contents; whatever was kept from
         // the last one is not what this announces.
         self.ready.lock().expect("not poisoned").clear();
         let source = AskTheService {
-            speak,
             pastes: self.pastes.clone(),
             asked: self.asked.clone(),
             ready: self.ready.clone(),
@@ -454,7 +508,7 @@ impl Clipboard {
                 speak(&FromWorker::ClipboardRead { id, bytes });
             }
             ToWorker::OfferClipboard { formats } => match held.as_mut() {
-                Some(serving) => match serving.offer(&formats, speak.clone()) {
+                Some(serving) => match serving.offer(&formats) {
                     Ok(()) => tell(
                         speak,
                         Level::Info,

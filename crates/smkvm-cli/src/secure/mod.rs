@@ -77,6 +77,7 @@
 pub mod acl;
 pub mod budget;
 pub mod carry;
+pub mod outbox;
 pub mod plan;
 pub mod reach;
 pub mod watch;

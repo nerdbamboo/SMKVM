@@ -1,0 +1,190 @@
+//! A way to say something from a thread that must not wait.
+//!
+//! Two threads in the worker are not allowed to stop: the one pumping
+//! the clipboard window's messages, and the one capturing input. Both
+//! had reasons to write to the service, and both did it the direct
+//! way -- take the lock on the shared writer, write to the pipe, no
+//! deadline. Each time that turned out to be the fault, it presented
+//! as something else entirely: once as a clipboard held open for the
+//! whole session, once as a diagnostic that printed one line and then
+//! nothing, and once as a render that Windows never asked for again.
+//!
+//! The last of those is the reason this exists as its own thing. A
+//! `WM_RENDERFORMAT` handler that returns without setting data has not
+//! deferred the question, it has answered it with nothing, and Windows
+//! never asks again. So a render that *blocks* is not merely slow --
+//! whatever the blocking was, the person's clipboard is empty
+//! afterwards and stays empty. A window-thread handler must therefore
+//! never wait on anything another thread owns, and "never" has to be a
+//! property of the code rather than a habit.
+//!
+//! This is that property, in one place. Posting cannot block: it
+//! either takes the message, or refuses it and counts the refusal. A
+//! caller that gets [`Posted::NoRoom`] knows immediately and can take
+//! the path that renews the promise rather than the path that answers
+//! nothing. Somebody draining the other end does the waiting, on a
+//! thread where waiting is allowed.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+
+/// What became of a message handed to an [`Outbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posted {
+    /// Taken, and it is the drain's problem now.
+    Sent,
+    /// Refused because the queue is full, having refused this many in
+    /// a row including this one.
+    NoRoom(usize),
+    /// Nobody is draining any more; there is no point posting again.
+    Gone,
+}
+
+impl Posted {
+    /// Did the message get anywhere?
+    pub fn arrived(self) -> bool {
+        matches!(self, Posted::Sent)
+    }
+}
+
+/// Somewhere to put a message without waiting to see it delivered.
+pub struct Outbox<T> {
+    send: SyncSender<T>,
+    dropped: AtomicUsize,
+}
+
+impl<T> Outbox<T> {
+    /// A new outbox and the receiving end somebody has to drain.
+    ///
+    /// `room` is how many messages may be waiting. It wants to be
+    /// generous, because a burst is exactly the moment the messages
+    /// matter, and bounded, because an outbox nobody drains must not
+    /// grow without limit.
+    pub fn with_room_for(room: usize) -> (Outbox<T>, Receiver<T>) {
+        let (send, receive) = sync_channel(room);
+        (
+            Outbox {
+                send,
+                dropped: AtomicUsize::new(0),
+            },
+            receive,
+        )
+    }
+
+    /// Hand over a message. Never waits, whatever the drain is doing.
+    ///
+    /// `try_send` rather than `send`, and that single word is the
+    /// whole purpose of this type.
+    pub fn post(&self, message: T) -> Posted {
+        match self.send.try_send(message) {
+            Ok(()) => Posted::Sent,
+            Err(TrySendError::Full(_)) => {
+                Posted::NoRoom(self.dropped.fetch_add(1, Ordering::Relaxed) + 1)
+            }
+            Err(TrySendError::Disconnected(_)) => Posted::Gone,
+        }
+    }
+
+    /// How many have been refused since this was last asked, clearing
+    /// the count.
+    ///
+    /// Asked by whoever is about to post something that *did* get
+    /// through, so a gap in the record is admitted rather than hidden.
+    /// A log that silently loses lines is worse than one that says it
+    /// lost them, because the missing line is read as the event not
+    /// having happened -- which has already cost a round here.
+    pub fn missed(&self) -> usize {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+
+    /// Put refusals back on the count.
+    ///
+    /// For the case where the admission itself could not be posted.
+    /// Taking the count and then losing the sentence that reports it
+    /// would turn a queue that says it lost things into one that
+    /// quietly does not.
+    pub fn put_back(&self, n: usize) {
+        self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_full_outbox_refuses_rather_than_waits() {
+        // The invariant this type exists for. If this test ever hangs
+        // rather than fails, the property is gone.
+        let (out, _keep) = Outbox::with_room_for(2);
+        assert_eq!(out.post(1), Posted::Sent);
+        assert_eq!(out.post(2), Posted::Sent);
+        let began = Instant::now();
+        assert_eq!(out.post(3), Posted::NoRoom(1));
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "posting to a full outbox waited {:?}",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn refusals_are_counted_and_handed_over_once() {
+        let (out, _keep) = Outbox::with_room_for(1);
+        assert_eq!(out.post(1), Posted::Sent);
+        assert_eq!(out.post(2), Posted::NoRoom(1));
+        assert_eq!(out.post(3), Posted::NoRoom(2));
+        assert_eq!(out.missed(), 2);
+        // Handed over once, not for ever.
+        assert_eq!(out.missed(), 0);
+    }
+
+    #[test]
+    fn an_outbox_nobody_is_draining_says_so_instead_of_waiting() {
+        let (out, receive) = Outbox::with_room_for(4);
+        drop(receive);
+        let began = Instant::now();
+        assert_eq!(out.post(1), Posted::Gone);
+        assert!(began.elapsed() < Duration::from_millis(100));
+        // And `Gone` is not counted as a refusal: there is nothing to
+        // catch up on later, so saying "1 line was dropped" next time
+        // would be a lie about a queue that no longer exists.
+        assert_eq!(out.missed(), 0);
+    }
+
+    #[test]
+    fn an_admission_that_cannot_be_said_is_not_forgotten() {
+        let (out, _keep) = Outbox::with_room_for(1);
+        assert!(out.post(1).arrived());
+        assert!(!out.post(2).arrived());
+        let missed = out.missed();
+        assert_eq!(missed, 1);
+        // The report of it could not go out either, so it is owed
+        // again rather than written off.
+        out.put_back(missed);
+        assert_eq!(out.missed(), 1);
+    }
+
+    #[test]
+    fn what_was_posted_comes_out_in_the_order_it_went_in() {
+        // One drain, in order. Two writers interleaving frames is what
+        // the shared lock was protecting against, and an outbox keeps
+        // that guarantee while giving up the waiting.
+        let (out, receive) = Outbox::with_room_for(8);
+        for i in 0..5 {
+            assert!(out.post(i).arrived());
+        }
+        let seen: Vec<i32> = (0..5).map(|_| receive.recv().unwrap()).collect();
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn room_frees_up_again_once_the_drain_moves() {
+        let (out, receive) = Outbox::with_room_for(1);
+        assert!(out.post(1).arrived());
+        assert!(!out.post(2).arrived());
+        assert_eq!(receive.recv().unwrap(), 1);
+        assert!(out.post(3).arrived());
+    }
+}

@@ -553,13 +553,19 @@ unsafe extern "system" fn window_proc(
             // between them, whichever way it went.
             let format_id = wparam.0 as u32;
             witness(&format!("WM_RENDERFORMAT entered for format {format_id}"));
-            let began = Instant::now();
+            // Said by a guard rather than by a statement after the
+            // call, so that it is said whatever happens in between.
+            //
+            // This is the single most important line in the file and
+            // it had never once appeared. Every reason it went
+            // missing was a different one -- a filtered message, a
+            // wedged relay, a blocking write -- and in each case the
+            // statement that would have reported it was simply never
+            // reached. A statement can be skipped; a drop cannot.
+            let mut done = Returning::from(format_id);
             let outcome = render(format_id);
-            witness(&format!(
-                "WM_RENDERFORMAT for format {format_id} returned after {} ms: {}",
-                began.elapsed().as_millis(),
-                outcome.said()
-            ));
+            done.was(&outcome);
+            drop(done);
             if outcome.needs_renewing() {
                 after_a_render_that_kept_nothing(window, format_id);
             }
@@ -627,6 +633,48 @@ unsafe extern "system" fn window_proc(
         }
         // SAFETY: handing anything else along is what the API requires.
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+}
+
+/// Says how a render ended, when it ends, however it ends.
+///
+/// Held across the render and dropped afterwards. If the render
+/// returns normally the outcome is recorded first and reported; if it
+/// unwinds, or if anything is ever added between the call and the
+/// report that can leave early, the line still goes out -- saying
+/// that the render did not come back, which is precisely the fact
+/// that took several rounds to establish by other means.
+struct Returning {
+    format_id: u32,
+    began: Instant,
+    outcome: Option<String>,
+}
+
+impl Returning {
+    fn from(format_id: u32) -> Returning {
+        Returning {
+            format_id,
+            began: Instant::now(),
+            outcome: None,
+        }
+    }
+
+    fn was(&mut self, outcome: &Rendered) {
+        self.outcome = Some(outcome.said());
+    }
+}
+
+impl Drop for Returning {
+    fn drop(&mut self) {
+        let said = self.outcome.as_deref().unwrap_or(
+            "DID NOT COME BACK -- the handler was left before it could say how it went, \
+             so the promise has been answered with nothing and Windows will not ask again",
+        );
+        witness(&format!(
+            "WM_RENDERFORMAT for format {} returned after {} ms: {said}",
+            self.format_id,
+            self.began.elapsed().as_millis()
+        ));
     }
 }
 
