@@ -293,11 +293,12 @@ readable by `smkvm status` while `device.toml` is refused to an ordinary
 account; whether carrying the three files across leaves an already-paired
 machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
-to start rather than a loop; whether a paste now
-lands inside the budget, and if not whether the promise is renewed and
-the second paste is instant as designed -- the offer, the ownership and
-the fetch are all proven on the machine, and what remains untested is
-the renewal and the timing; whether a copy made while a consent prompt is up behaves as
+to start rather than a loop; whether the message
+filter is what was stopping the render, which the next run settles
+either way; then whether a paste lands inside the budget, and if not
+whether the promise is renewed and the second paste is instant as
+designed -- the offer, the ownership and the fetch are all proven on
+the machine, and what remains untested is everything after the ask; whether a copy made while a consent prompt is up behaves as
 described; whether `WTSQueryUserToken` plus `CreateEnvironmentBlock`
 answers with the person's profile;
 whether the quarter-second desktop comparison is in fact quick enough that
@@ -322,6 +323,63 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**The paste that never asked, and the oldest rule in this program.**
+Three builds in a row failed to paste in service mode, each for a
+different reason, and the third produced a log with no render line of
+any kind for any attempt -- while the clipboard listed the right
+formats and named the worker as its owner. Two possibilities: the
+handler is not being reached, or it is being reached and its words do
+not survive. They had to be separated before anything else was
+changed, and separating them is most of this entry.
+
+The control is what settles it. **The server runs the same clipboard
+code, with the same message-only window and the same delayed
+rendering, under the scheduled task -- and it pastes correctly.** So
+nothing about the window, the message loop or the render logic is
+wrong in itself. What differs is only who the worker is: the system
+account, at system integrity, rather than the person at medium.
+
+And that is the oldest rule in this program, met from the other side.
+UIPI refuses *input* injected into a window of higher integrity, which
+is the fault this whole branch began with -- `SendInput` returning
+zero, Windows saying nothing. It equally refuses *messages sent to* a
+window of higher integrity. Delayed rendering works by the system
+sending `WM_RENDERFORMAT` to the clipboard's owner on behalf of
+whoever is pasting; from a medium-integrity application to a
+system-integrity window, that send is exactly what UIPI exists to
+stop. The clipboard then lists the formats, names us as owner, and
+yields nothing, with no handler ever entered -- which is what the
+machine showed, precisely.
+
+`ChangeWindowMessageFilterEx` is the documented way to say a window
+will accept a particular message from less privileged senders, and the
+window now asks for the three a clipboard owner must receive:
+`WM_RENDERFORMAT`, `WM_RENDERALLFORMATS`, `WM_DESTROYCLIPBOARD`. By
+name rather than wholesale, because nothing else needs to reach a
+window running as the system account.
+
+**This is a hypothesis with a control, not a certainty, so the run that
+tests it also proves which half was wrong.** Independently of the fix,
+the clipboard crate now says its handful of decisive lines through a
+second channel: `witness_through`, which the worker points at the
+pipe. The pipe is the one thing known to work in that process -- it
+carries every keystroke -- so a line sent that way arrives whatever is
+wrong with the worker's own logging. `WM_RENDERFORMAT entered` is
+written as the first statement of the handler, before it looks at
+anything.
+
+So the next run distinguishes them without ambiguity:
+
+- `clipboard: WM_RENDERFORMAT entered` appears and the paste works ->
+  UIPI was the cause and the filter is the cure.
+- It appears and the paste still fails -> the handler runs, the
+  message filter was not the problem, and the fault is inside the
+  render after all, where the rest of the lines will say so.
+- It does not appear -> the handler is still not reached, UIPI was not
+  it either, and the question is which window holds the promise --
+  which the new line after taking the clipboard answers outright, by
+  reporting `GetClipboardOwner` against our own window handle.
 
 **Returning from a render without supplying data does not defer the
 question -- it answers it, with nothing.** This is the single most
@@ -1089,6 +1147,27 @@ worker's desktop and the last polled input desktop and reports no reach
 when they differ, and `mind_workers` tells it what it saw on every look
 rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
+
+**UIPI is a rule about messages, not only about input.** It was met
+first as injected keystrokes being refused, and it is the same rule
+that stops a lower-privileged application's paste reaching a
+higher-privileged clipboard owner. Anything the system does *on behalf
+of* another process by sending a window a message is subject to it:
+rendering a clipboard format, drag and drop, and more. Running as the
+system account buys reach in one direction and costs it in the other,
+and the cost is as silent as the original was. Where a window must
+hear from ordinary applications, say so with
+`ChangeWindowMessageFilterEx` and name the messages.
+
+**Two processes, one log, and the question of who said what.** The
+worker writes to the same file as the service and also relays through
+the pipe with a `worker:` prefix. A line without that prefix is the
+worker's own logging, a line with it came down the pipe, and which of
+the two appears is itself evidence -- in one round the relayed lines
+arrived and the local ones did not. When a component that is not the
+worker needs to be heard from, give it the pipe too rather than
+trusting the file; `smkvm_clipboard::witness_through` is that, and it
+exists because the file could not be trusted.
 
 **Giving up faster is not automatically safer.** Bounding the render
 was correct and made things worse, because the thing being bounded had
