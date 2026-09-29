@@ -133,6 +133,10 @@ pub enum Unacceptable {
     },
     TooMany(usize),
     /// A name that would land outside the directory it was meant for.
+    ///
+    /// Only the dangerous kind now. A name that is merely awkward --
+    /// a line break in it, a character Windows reserves -- is cleaned
+    /// and the file arrives; see `usable_parts`.
     BadPath(String),
 }
 
@@ -145,7 +149,10 @@ impl std::fmt::Display for Unacceptable {
                 "it is {bytes} bytes and the limit is {limit}; raise transfer.max_bytes"
             ),
             Unacceptable::TooMany(n) => write!(f, "it names {n} files, more than can be taken"),
-            Unacceptable::BadPath(p) => write!(f, "{p:?} is not a name a file may arrive under"),
+            Unacceptable::BadPath(p) => write!(
+                f,
+                "{p:?} could land outside the directory it was meant for, so none of these                  files were taken"
+            ),
         }
     }
 }
@@ -159,6 +166,11 @@ pub struct Landing {
     /// The paths the pasting application is handed: one per entry the
     /// application named, which is each top-level file or folder.
     pub top_level: Vec<PathBuf>,
+    /// Names that could not be written as they were sent, as they were
+    /// and as they will be. Said once per file by whoever lands them,
+    /// so that a person can tell why what they pasted is not called
+    /// quite what it was.
+    pub renamed: Vec<(String, String)>,
 }
 
 /// Decide where each file in `offer` lands under `directory`.
@@ -191,15 +203,24 @@ pub fn plan_landing(
     let mut placed: HashMap<String, PathBuf> = HashMap::new();
     let mut top_level = Vec::new();
     let mut paths = Vec::with_capacity(offer.files.len());
+    let mut renamed = Vec::new();
     for entry in &offer.files {
-        let parts =
-            safe_parts(&entry.path).ok_or_else(|| Unacceptable::BadPath(entry.path.clone()))?;
-        let (first, rest) = parts.split_first().expect("safe_parts never returns empty");
-        let base = match placed.get(*first) {
+        let named =
+            usable_parts(&entry.path).ok_or_else(|| Unacceptable::BadPath(entry.path.clone()))?;
+        for change in named.changed {
+            if !renamed.contains(&change) {
+                renamed.push(change);
+            }
+        }
+        let (first, rest) = named
+            .parts
+            .split_first()
+            .expect("usable_parts never returns empty");
+        let base = match placed.get(first) {
             Some(base) => base.clone(),
             None => {
                 let base = unclaimed(directory, first);
-                placed.insert((*first).to_owned(), base.clone());
+                placed.insert(first.clone(), base.clone());
                 top_level.push(base.clone());
                 base
             }
@@ -210,41 +231,174 @@ pub fn plan_landing(
         }
         paths.push(path);
     }
-    Ok(Landing { paths, top_level })
+    Ok(Landing {
+        paths,
+        top_level,
+        renamed,
+    })
 }
 
-/// The components of a relative name, or `None` if it is not one this will
-/// write. Empty and `.` components are skipped; `..`, roots, prefixes and
-/// characters no filesystem here accepts are refused outright.
-fn safe_parts(name: &str) -> Option<Vec<&str>> {
-    if name.contains('\0') || name.contains('\\') || name.starts_with('/') {
+/// The longest one component of a name may be.
+///
+/// Windows allows 255 units per component; two hundred leaves room for
+/// the ` (2)` a clash adds and for the directory in front of it, and is
+/// still far longer than anything a person types.
+const LONGEST_PART: usize = 200;
+
+/// What is used when cleaning leaves nothing at all -- a name that was
+/// only dots, or only spaces.
+const UNNAMED: &str = "unnamed";
+
+/// Device names Windows will not let a file have, whatever the
+/// extension after them.
+const RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// A name, and what had to be done to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    /// The components to write under, cleaned where they had to be.
+    pub parts: Vec<String>,
+    /// Every part that is not what was sent, as it was and as it will
+    /// be. One line in the log per file, so a person can tell why the
+    /// thing they pasted is not called quite what it was.
+    pub changed: Vec<(String, String)>,
+}
+
+/// The components of a relative name, refusing what is dangerous and
+/// cleaning what is merely unwritable.
+///
+/// These two were the same thing once, and treating them the same is a
+/// fault that cost a person a week of file transfers. A paper
+/// downloaded from a journal came with a line break inside its
+/// filename -- which happens constantly -- and every attempt to copy it
+/// was abandoned, with the only trace a warning in the log of the
+/// machine doing the *sending*, which is the one place nobody looks.
+/// Losing a newline out of a filename is not a loss worth refusing a
+/// file for.
+///
+/// So the two kinds are separated by what is at stake.
+///
+/// **Refused**, because nothing about the name can be trusted and
+/// writing it might not write where it was meant to: `..`, a leading
+/// `/`, a backslash, a NUL, a drive letter, anything `Path::components`
+/// does not make exactly one ordinary component of. These are the ways
+/// a name escapes the directory it was given, and a name that might
+/// escape is not a name to be tidied up and used anyway.
+///
+/// **Cleaned**, because the file is fine and only its label is
+/// awkward: control characters, the characters Windows reserves,
+/// trailing dots and spaces, the reserved device names, and anything
+/// too long. The file arrives, under a name that is as close as can be
+/// written, and the change is reported.
+pub fn usable_parts(name: &str) -> Option<Named> {
+    // Refusals first, on the whole name, before any part of it is
+    // looked at as something to salvage.
+    // A colon is refused rather than cleaned, and that distinction is
+    // the whole rule doing its job. It is not an awkward character: on
+    // Windows it means a drive (`C:\x`) or an alternate data stream
+    // (`notes.txt:hidden`), both of which are "this names something
+    // other than a file here". Cleaning it to `_` would turn `C:` into
+    // the perfectly ordinary-looking `C_` -- which is exactly the way
+    // this change could have made things worse rather than better, and
+    // is how the existing escape test caught it.
+    if name.contains('\0') || name.contains('\\') || name.starts_with('/') || name.contains(':') {
         return None;
     }
     let mut parts = Vec::new();
+    let mut changed = Vec::new();
     for part in name.split('/') {
         if part.is_empty() || part == "." {
             continue;
         }
-        if part == ".." || part.ends_with('.') || part.ends_with(' ') {
+        if part == ".." {
             return None;
         }
-        if part
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-        {
-            return None;
-        }
-        // Belt and braces: what std makes of it must be one plain name.
+        // What std makes of the part as given must be one plain name.
+        // Checked before cleaning, so that cleaning can never turn
+        // something that was a root or a prefix into something that
+        // looks ordinary.
         let mut components = Path::new(part).components();
         match (components.next(), components.next()) {
             (Some(Component::Normal(_)), None) => {}
             _ => return None,
         }
-        parts.push(part);
+        let cleaned = clean_part(part);
+        if cleaned != part {
+            changed.push((part.to_string(), cleaned.clone()));
+        }
+        parts.push(cleaned);
     }
-    (!parts.is_empty()).then_some(parts)
+    (!parts.is_empty()).then_some(Named { parts, changed })
 }
 
+/// One component, made into something this platform will accept.
+///
+/// Nothing here may produce an empty string, a `.`, a `..`, or anything
+/// with a separator in it -- the refusals above are what keep a name
+/// inside its directory, and cleaning must not undo them.
+fn clean_part(part: &str) -> String {
+    // A control character becomes a space rather than nothing, because
+    // it is almost always standing where a space belonged: a filename
+    // that was wrapped across two lines reads correctly again.
+    let mut out: String = part
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                ' '
+            } else if matches!(c, '<' | '>' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // Runs of spaces left by the above read as a mistake; one space is
+    // what the name meant.
+    while out.contains("  ") {
+        out = out.replace("  ", " ");
+    }
+    // Windows silently drops trailing dots and spaces, so a name ending
+    // in one is a name that would not round-trip.
+    let trimmed = out.trim().trim_end_matches(['.', ' ']).trim();
+    let mut out = trimmed.to_string();
+
+    if out.chars().count() > LONGEST_PART {
+        // Keep the extension, because it is what decides whether the
+        // file opens.
+        let (stem, ext) = match out.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 10 => {
+                (stem.to_string(), Some(ext.to_string()))
+            }
+            _ => (out.clone(), None),
+        };
+        let room = match &ext {
+            Some(ext) => LONGEST_PART.saturating_sub(ext.chars().count() + 1),
+            None => LONGEST_PART,
+        };
+        let stem: String = stem.chars().take(room).collect();
+        let stem = stem.trim_end().to_string();
+        out = match ext {
+            Some(ext) => format!("{stem}.{ext}"),
+            None => stem,
+        };
+    }
+
+    // A device name is not a name a file may have, whatever follows the
+    // dot. Prefixed rather than replaced, so the name is still legible.
+    let stem = out.split('.').next().unwrap_or_default();
+    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        out = format!("_{out}");
+    }
+
+    if out.is_empty() || out == "." || out == ".." {
+        out = UNNAMED.to_string();
+    }
+    out
+}
 /// `name`, or `name (2)`, `name (3)`... -- the first not already present.
 fn unclaimed(directory: &Path, name: &str) -> PathBuf {
     let first = directory.join(name);
@@ -409,15 +563,20 @@ mod tests {
     #[test]
     fn names_that_would_escape_are_refused_before_anything_is_written() {
         let dir = scratch("escape");
+        // Refused: every one of these could put a file somewhere other
+        // than the directory it was meant for, and no amount of
+        // tidying makes that safe. A colon is here rather than with
+        // the awkward names because it is a drive or an alternate data
+        // stream, not a character somebody typed by accident.
         for bad in [
             "../etc/passwd",
             "a/../../b",
             "/etc/passwd",
             "C:/Windows/x",
+            "C:",
+            "notes.txt:hidden",
             "a\\b",
             "nul\0byte",
-            "trailing.",
-            "what?",
             "",
         ] {
             let offer = offer_of(&[(bad, 1, false)]);
@@ -430,11 +589,31 @@ mod tests {
                 "{bad:?} was accepted: {result:?}"
             );
         }
-        // Harmless oddities are tidied rather than refused.
+        // Cleaned, and the file arrives. These used to be refused
+        // alongside the ones above, which is what made a journal PDF
+        // with a line break in its name impossible to copy for a week.
+        for (awkward, expected) in [
+            ("trailing.", "trailing"),
+            ("what?", "what_"),
+            ("wrapped\nname.pdf", "wrapped name.pdf"),
+            ("CON.txt", "_CON.txt"),
+        ] {
+            let offer = offer_of(&[(awkward, 1, false)]);
+            let landing = plan_landing(&offer, &dir, 1 << 30)
+                .unwrap_or_else(|e| panic!("{awkward:?} was refused: {e}"));
+            assert_eq!(landing.paths, vec![dir.join(expected)]);
+            assert_eq!(
+                landing.renamed,
+                vec![(awkward.to_string(), expected.to_string())],
+                "{awkward:?} arrived without saying its name had changed"
+            );
+        }
+        // Harmless oddities are tidied and worth no remark at all.
         let offer = offer_of(&[("./a//b.txt", 1, false)]);
         let landing = plan_landing(&offer, &dir, 1 << 30).unwrap();
         assert_eq!(landing.paths, vec![dir.join("a").join("b.txt")]);
         assert_eq!(landing.top_level, vec![dir.join("a")]);
+        assert!(landing.renamed.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -493,5 +672,173 @@ mod tests {
         arriving.finish().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"hello");
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::{usable_parts, LONGEST_PART, UNNAMED};
+
+    fn parts(name: &str) -> Vec<String> {
+        usable_parts(name).expect("this name is usable").parts
+    }
+
+    fn only(name: &str) -> String {
+        let named = usable_parts(name).expect("this name is usable");
+        assert_eq!(named.parts.len(), 1, "{name:?} was split");
+        named.parts.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn the_paper_that_cost_a_week_arrives() {
+        // A real filename, from a real machine, refused every time it
+        // was copied for a week -- a journal PDF whose name was wrapped
+        // across two lines when it was downloaded. Losing a newline out
+        // of a filename is not a loss worth refusing a file for.
+        let given = "Oracle-Guided Reinforcement Learning for\nDegradation-Aware \
+                     Zero-Overpotential Battery Charging.pdf";
+        let named = usable_parts(given).expect("this file should arrive");
+        assert_eq!(
+            named.parts,
+            vec![
+                "Oracle-Guided Reinforcement Learning for Degradation-Aware \
+                 Zero-Overpotential Battery Charging.pdf"
+            ]
+        );
+        // And the change is reported, so the person can see why what
+        // they pasted is not called quite what it was.
+        assert_eq!(named.changed.len(), 1);
+        assert_eq!(named.changed[0].0, given);
+        assert!(named.changed[0].1.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn every_control_character_becomes_the_space_it_was_standing_for() {
+        assert_eq!(only("a\tb.txt"), "a b.txt");
+        assert_eq!(only("a\r\nb.txt"), "a b.txt");
+        assert_eq!(only("a\u{7}b.txt"), "a b.txt");
+        // A name that is nothing but control characters still has to be
+        // something.
+        assert_eq!(only("\n\r\t"), UNNAMED);
+    }
+
+    #[test]
+    fn a_name_that_is_only_dots_becomes_a_name() {
+        // Not an escape -- `...` is an ordinary component -- but
+        // Windows drops trailing dots, so it would not round-trip.
+        assert_eq!(only("..."), UNNAMED);
+        assert_eq!(only("....."), UNNAMED);
+        assert_eq!(only("report..."), "report");
+        assert_eq!(only("report. . ."), "report");
+        // A dot in the middle is an extension and must survive.
+        assert_eq!(only("report.v2.pdf"), "report.v2.pdf");
+        // A leading dot is a perfectly ordinary hidden file.
+        assert_eq!(only(".bashrc"), ".bashrc");
+    }
+
+    #[test]
+    fn a_reserved_device_name_is_made_into_something_writable() {
+        assert_eq!(only("CON"), "_CON");
+        assert_eq!(only("con.txt"), "_con.txt");
+        assert_eq!(only("COM1.pdf"), "_COM1.pdf");
+        assert_eq!(only("LPT9"), "_LPT9");
+        assert_eq!(only("nul"), "_nul");
+        // Not reserved, and must not be touched.
+        assert_eq!(only("CONTENTS.txt"), "CONTENTS.txt");
+        assert_eq!(only("COM10.txt"), "COM10.txt");
+        assert_eq!(only("console.log"), "console.log");
+    }
+
+    #[test]
+    fn a_name_too_long_is_shortened_and_keeps_what_opens_it() {
+        let long = format!("{}.pdf", "x".repeat(400));
+        let used = only(&long);
+        assert!(used.chars().count() <= LONGEST_PART, "{}", used.len());
+        assert!(
+            used.ends_with(".pdf"),
+            "the extension decides whether it opens"
+        );
+        // Exactly at the limit, nothing is touched.
+        let exact: String = "y".repeat(LONGEST_PART);
+        assert_eq!(only(&exact), exact);
+        assert!(usable_parts(&exact).unwrap().changed.is_empty());
+    }
+
+    #[test]
+    fn the_characters_windows_reserves_are_replaced_rather_than_refused() {
+        assert_eq!(only("a<b>c\"d|e?f*g.txt"), "a_b_c_d_e_f_g.txt");
+        assert_eq!(
+            parts("2026-09-29/notes.txt"),
+            vec!["2026-09-29", "notes.txt"]
+        );
+    }
+
+    #[test]
+    fn nothing_that_could_escape_is_ever_cleaned_into_something_usable() {
+        // The whole point of separating the two kinds. These are not
+        // awkward names, they are names that might not land where they
+        // were meant to, and no amount of tidying makes them safe.
+        for escape in [
+            "../secrets",
+            "a/../../b",
+            "..",
+            "/etc/passwd",
+            "C:\\Windows\\System32\\x",
+            "a\\b",
+            "a\0b",
+            "..\\..\\x",
+            // A colon is not an awkward character to be tidied up: it
+            // means a drive or an alternate data stream. Cleaning it
+            // would make `C:` into `C_` and let it through.
+            "C:/Windows/x",
+            "C:",
+            "notes.txt:hidden",
+        ] {
+            assert!(
+                usable_parts(escape).is_none(),
+                "{escape:?} was accepted, and it must never be"
+            );
+        }
+    }
+
+    #[test]
+    fn cleaning_can_never_produce_a_separator_or_a_dot_component() {
+        // A cleaned part that came out as `..` or with a `/` in it
+        // would turn a safe name into an escape, which is the one way
+        // this change could make things worse rather than better.
+        for awkward in [
+            "..\u{7}", "a\nb", "...", "  ", "\u{0}x", ". .", "<>", "?", "*", "CON",
+        ] {
+            let Some(named) = usable_parts(awkward) else {
+                continue;
+            };
+            for part in &named.parts {
+                assert!(!part.is_empty(), "{awkward:?} produced an empty part");
+                assert!(part != "." && part != "..", "{awkward:?} produced {part:?}");
+                assert!(!part.contains('/'), "{awkward:?} produced {part:?}");
+                assert!(!part.contains('\\'), "{awkward:?} produced {part:?}");
+                assert!(!part.contains('\0'), "{awkward:?} produced {part:?}");
+                assert!(
+                    !part.ends_with('.') && !part.ends_with(' '),
+                    "{awkward:?} produced {part:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_that_needs_nothing_doing_to_it_is_reported_as_unchanged() {
+        let named = usable_parts("folder/paper.pdf").expect("usable");
+        assert_eq!(named.parts, vec!["folder", "paper.pdf"]);
+        assert!(named.changed.is_empty());
+        assert_eq!(parts("a/b/c.txt"), vec!["a", "b", "c.txt"]);
+    }
+
+    #[test]
+    fn a_change_deep_in_a_path_is_still_reported() {
+        let named = usable_parts("papers/Oracle\nGuided.pdf").expect("usable");
+        assert_eq!(named.parts, vec!["papers", "Oracle Guided.pdf"]);
+        assert_eq!(named.changed.len(), 1);
+        assert_eq!(named.changed[0].1, "Oracle Guided.pdf");
     }
 }

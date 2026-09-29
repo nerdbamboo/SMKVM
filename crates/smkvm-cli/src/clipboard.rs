@@ -783,10 +783,31 @@ impl Sharing {
         {
             Ok(landing) => landing,
             Err(why) => {
+                // Loud here as well as in the reply. The reply goes to
+                // the machine that sent the files, whose log is the one
+                // place the person will not look; without this, a
+                // refused paste is a paste where nothing happened and
+                // nothing anywhere says why.
+                warn!(
+                    files = offer.files.len(),
+                    "files sent to this machine were refused: {why}"
+                );
                 refuse(delivery, format!("refusing the files: {why}"));
                 return Vec::new();
             }
         };
+        for (given, used) in &landing.renamed {
+            // One line per file whose name had to change, so that a
+            // person can tell why what they pasted is not called quite
+            // what it was. This is the difference between a name that
+            // is awkward and a name that is dangerous: awkward names
+            // are cleaned and the file arrives.
+            info!(
+                given = %given,
+                used = %used,
+                "this name cannot be written here as it stands, so the file arrives renamed"
+            );
+        }
         info!(
             files = offer.files.len(),
             bytes = offer.total_bytes,
