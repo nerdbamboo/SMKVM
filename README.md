@@ -113,12 +113,18 @@ exactly as the task's would.
 A service has no profile of its own worth reading, so it keeps this
 machine's configuration, identity and paired machines in
 `%ProgramData%\smkvm` instead, and its log with them. `install --system`
-copies your existing three files there, so a machine that is already paired
-stays paired; it says what it copied and what it found already there, and it
+copies the three files there, so a machine that is already paired stays
+paired; it says what it copied and what it found already there, and it
 never replaces an identity that is there, because that would mean pairing
 with every other machine again. Only the system account and administrators
 can read the identity file. `uninstall` leaves the copies where they are and
 says so.
+
+The files come from whoever is logged in at the screen, which is usually
+not the account running the install -- these machines are often
+administered from elsewhere. `--user <name>` says whose to take when that
+guess is wrong. To make a service say more, put one line such as `debug`
+in `%ProgramData%\smkvm\log-level` and restart it.
 
 ## Where things live
 

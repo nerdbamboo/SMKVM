@@ -325,6 +325,49 @@ means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
 
+**What the second attempt on real hardware found, and the thing it
+settled.** Three things worked that had never been run before: the
+service starts, runs as the system account in session 0, and reads
+`C:\ProgramData\smkvm\smkvm.toml` rather than a profile; the key's
+access list read back as `KEY PRIVATE`, and `type` on it from a
+de-elevated token was refused, with the inherited list on the file being
+`(A;ID;FA;;;BA)(A;ID;FA;;;SY)` and nothing else; and the service
+connected to the server. The access-list work is done and proven, and
+the parser that had never seen real `icacls /save` output parsed it.
+
+**And no worker was ever started.** Not a worker that failed to start --
+no attempt, no line, no process. What was wrong is one assumption that
+both the author and the review accepted: that a service running as the
+system account could ask which desktop has the input.
+
+It cannot. `OpenInputDesktop` is per *window station*, and a service
+lives in session 0 on `Service-0x0-3e7$`, which is not the station the
+screens are on. Asked from there it answers about session 0 or not at
+all -- never about session 1. The reply was `OutOfReach`, which the loop
+read as `Unreadable`, which it treated as "no news, leave the worker
+where it is"; there being no worker at all, that meant leaving none.
+`Step::Stay`, four times a second, in silence, for ever.
+
+The elimination is worth keeping because it is how the log was read:
+every other branch of that poll ends in `Step::Move`, which ends in
+`start_worker`, which logs whether it succeeds or fails. No such line
+existed, so no other branch had been taken.
+
+**So the watching is inverted.** The service cannot see the input
+desktop, and no amount of privilege changes that -- it is the wrong
+station, not insufficient rights. Something inside the session has to
+look. So a worker goes in first, on `Default`, which an interactive
+session always has; the worker polls `desktop::input_name()` from
+`WinSta0` where the question has an answer, and reports changes over the
+pipe; and the service acts on what it is told. `watch::Seen::Unreadable`
+now means two different things depending on whether a worker exists --
+with one it is still no news, and without one it is the reason to start
+the first, which is the bootstrap that was missing.
+
+This is the shape Synergy uses, and now for the reason rather than by
+imitation: the only process that can answer the question is one that is
+already in the session.
+
 **What the first attempt on real hardware found.** It reached
 `service_main`, logged that it was running as a service, and exited one
 second later with `ERROR_SERVICE_SPECIFIC_ERROR` -- the daemon, running as
@@ -541,6 +584,17 @@ rule that silently fails to apply is how a private key ends up readable
 while the install prints success. That lesson is in this file once already,
 about a service status parsed out of translated text.
 
+**Installing over ssh is not installing as the person at the desk.**
+These machines are administered from elsewhere, by an administrator
+account that is not the one the machine is paired as. `install --system`
+carried the three files out of the *installing* account's profile, found
+nothing, and said so correctly -- which meant `--system` could not be
+installed remotely at all, and the files had to be copied by hand. It
+now takes them from whoever is logged in at the screen
+(`Win32_ComputerSystem.UserName`), or from `--user <name>` when told,
+resolving the profile through the same profile list the login task's
+principal is looked up in. It says whose files it carried.
+
 **Check the key before anything else.** From an *ordinary* account, not
 an administrator one:
 
@@ -553,9 +607,10 @@ for the first time. The install refuses by itself if the list is wrong, and
 so does the service at startup, but neither is a substitute for looking.
 
 **What the first session on real hardware should look like.** In order:
-the service starts and logs `running as a service`; if nobody is logged in
-yet it says so once and waits, which is not a failure; a worker appears on
-`Default`; raising a consent prompt produces a second `a worker is on the
+the service starts and logs `running as a service`; if nobody is logged
+in yet it says so once and waits, which is not a failure; it says once
+that nothing has told it where the input is, and then a worker appears
+on `Default` and `a worker is reporting where the input is` follows; raising a consent prompt produces a second `a worker is on the
 input desktop` saying `Winlogon`, and between the two the client should
 log that it handed the cursor back because the worker had not moved yet.
 Then `smkvm service stop` and confirm it stops rather than timing out.
@@ -601,6 +656,18 @@ test was gone. This is what made the phantom above so persistent.
 **`scp` fails while the binary is running.** Windows locks it. Stop the daemon
 first, and check the hash on both ends afterwards — a stale binary produces
 behaviour that matches no source you can read.
+
+**`Environment` under a service's registry key must be `REG_MULTI_SZ`.**
+That is the documented way to give a service an environment variable,
+and it is real -- but written as `REG_SZ`, which is what
+`New-ItemProperty` gives by default, the service control manager ignores
+it and says nothing. An attempt to raise the log level that way on a
+real machine produced no debug lines and no error, which is an hour lost
+at the worst moment. There is now a file as well: one line in
+`%ProgramData%\smkvm\log-level` saying `debug`, read at startup, with
+nothing to get right but the contents. The order is environment, then
+file, then `--verbose`, then `info`, and it is a pure function with
+tests.
 
 **`sc.exe`'s printing is translated, so parsing it fails exactly where it
 is deployed.** `describe()` used to look for lines beginning `STATE` and
@@ -796,6 +863,33 @@ worker's desktop and the last polled input desktop and reports no reach
 when they differ, and `mind_workers` tells it what it saw on every look
 rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
+
+**A window station is not a privilege, and the system account does not
+get you across one.** Every desktop and window-station call is scoped to
+the station the calling process is on. A service is on
+`Service-0x0-3e7$` in session 0; the screens are on `WinSta0` in session
+1. `OpenInputDesktop` from the service is not refused for want of rights
+-- it answers a different question, about a station with no screen on
+it. Running as the system account is what lets a process *start*
+something in the other session; it is not what lets it see into one. The
+two got conflated, by the author and by a reviewer, and cost a hardware
+round. If a call takes no session or station argument, ask which station
+it is implicitly about before assuming SYSTEM covers it.
+
+**A loop that decides to do nothing must say so, once.** The minding
+thread took the same silent branch four times a second for the life of
+the service. Everything in it was at debug, the service ran at info, and
+the result was a log that looked like a healthy service and a machine
+that did nothing. Both the no-session wait and the nobody-is-watching
+case now say so once, latched, at info. This is the silent refused
+injection again, in a third costume.
+
+**A panicking thread is silent in a service.** A panic prints to stderr
+and unwinds that thread; a service has no stderr anybody reads, so the
+thread simply stops and nothing mentions it -- and "the minding thread
+died" looks exactly like "the minding thread decided to do nothing",
+which is precisely the pair that could not be told apart on the machine.
+There is a panic hook now that logs before the default one runs.
 
 **Asking "can input reach the screen" from a service asks about the wrong
 screen.** `platform::injection_blocked` and `injection_possible` answer by
