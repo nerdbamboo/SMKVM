@@ -398,6 +398,18 @@ impl Link {
                     .fetch(&format)
                     .map_err(|e| format!("fetching what was copied: {e}"));
                 let took = asked_at.elapsed();
+                // Said on the way through, not only when it is late.
+                // The question "where does the time go" cannot be
+                // answered by a line that appears only once the answer
+                // is already bad, and raising a budget without knowing
+                // is how a number comes to hide a loop.
+                tracing::info!(
+                    ?format,
+                    took_ms = took.as_millis() as u64,
+                    budget_ms = SERVICE_FETCH_WITHIN.as_millis() as u64,
+                    bytes = bytes.as_ref().map(Vec::len).unwrap_or(0),
+                    "the far machine answered a paste"
+                );
                 if took > SERVICE_FETCH_WITHIN {
                     // Said, because it is the one number that decides
                     // whether a paste works first time. The share of

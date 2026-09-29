@@ -295,9 +295,6 @@ struct State {
     offer: Option<(Vec<ClipFormat>, Box<dyn Fetch>)>,
     /// Anything already fetched, so a second paste does not fetch again.
     cache: HashMap<ClipFormat, Vec<u8>>,
-    /// Set while this process is the one putting data on the clipboard, so its
-    /// own change notification is not mistaken for someone else copying.
-    ours: bool,
     /// How many times running the promise has been renewed without a
     /// paste ever being served.
     renewals: u32,
@@ -463,17 +460,38 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_CLIPBOARDUPDATE => {
+            // Whose change is this? Asked of the system rather than
+            // remembered, and that distinction is the whole of this
+            // fix.
+            //
+            // It used to be a flag set when we took the clipboard and
+            // cleared by the first notice that arrived afterwards. The
+            // comment immediately below says why that could not work,
+            // and has said so the whole time: one copy arrives as
+            // *several* of these. The first consumed the flag and every
+            // one after it was taken for somebody else copying -- which
+            // threw away our own offer and our own cache, told the far
+            // machine that this machine had copied something, and left
+            // the worker being asked to read a clipboard it was itself
+            // in the middle of promising. The log went round that loop
+            // for an entire run.
+            //
+            // The X11 side has always compared against its own owner
+            // window rather than remembering; this is the same thing,
+            // and it does not care how many notices one copy produces.
+            // SAFETY: reading the owner takes no pointers.
+            let owner = unsafe { GetClipboardOwner() }.map(|o| o.0).ok();
+            let ours = owner == Some(window.0);
+            if ours {
+                // Our own offer coming back round. Announcing it would
+                // send the far machine's clipboard straight back to it.
+                return LRESULT(0);
+            }
             STATE.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 let Some(state) = slot.as_mut() else {
                     return;
                 };
-                if state.ours {
-                    // Our own offer coming back round; announcing it would send
-                    // the far machine's clipboard straight back to it.
-                    state.ours = false;
-                    return;
-                }
                 state.offer = None;
                 state.cache.clear();
             });
@@ -584,11 +602,6 @@ fn take_clipboard(window: HWND) -> Result<()> {
     // SAFETY: the clipboard is open and owned by this window.
     unsafe { EmptyClipboard() }.map_err(|_| last_error("clearing the clipboard"))?;
 
-    STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            state.ours = true;
-        }
-    });
     for format in &offered {
         for id in native_ids(formats, format) {
             // A null handle is the promise: the data is produced only if
@@ -806,7 +819,6 @@ fn clipboard_thread(
             changes,
             offer: None,
             cache: HashMap::new(),
-            ours: false,
         });
     });
 

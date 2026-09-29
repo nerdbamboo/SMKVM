@@ -118,7 +118,15 @@ impl Fetch for AskTheService {
                 "the service is not there to fetch what was copied".into(),
             ));
         }
-        match answer.recv_timeout(PASTE_WITHIN) {
+        let asked_at = std::time::Instant::now();
+        let outcome = answer.recv_timeout(PASTE_WITHIN);
+        tracing::info!(
+            ?format,
+            waited_ms = asked_at.elapsed().as_millis() as u64,
+            budget_ms = PASTE_WITHIN.as_millis() as u64,
+            "a paste waited on the service"
+        );
+        match outcome {
             Ok(Ok(bytes)) => {
                 self.asked.lock().expect("not poisoned").remove(&id);
                 Ok(bytes)

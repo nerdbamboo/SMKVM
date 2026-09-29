@@ -306,6 +306,64 @@ mod windows {
         .unwrap_or(false)
     }
 
+    /// Stop every daemon of this program except this process.
+    ///
+    /// Called when the arrangement is switched, because removing a
+    /// task does not necessarily stop the daemon it started, and
+    /// because the usual way of finding that daemon cannot work here.
+    /// `running_pid` reads the status report, which a daemon writes
+    /// into the profile of whoever is running it -- and an install
+    /// happens over ssh as an administrator who is not that person, so
+    /// the report is not in any place this process can look. It found
+    /// nothing, nothing was stopped, and for one whole test a machine
+    /// had the old daemon, the new service and its worker: two daemons
+    /// fighting over one clipboard, which `plan` exists to make
+    /// impossible.
+    ///
+    /// The process list needs nobody's profile. What counts as a
+    /// daemon is `plan::is_a_daemon`, which is tested, and matters
+    /// because this installer is itself an `smkvm.exe` -- stopping
+    /// everything by name would have it stop itself halfway through.
+    fn stop_every_other_daemon() -> Result<()> {
+        let ours = std::process::id();
+        let script = format!(
+            r#"$ErrorActionPreference = 'SilentlyContinue'
+Get-CimInstance Win32_Process -Filter "Name='smkvm.exe'" |
+  Where-Object {{ $_.ProcessId -ne {ours} }} |
+  ForEach-Object {{ "{{0}}`t{{1}}" -f $_.ProcessId, $_.CommandLine }}
+"#
+        );
+        let said = powershell(&script).unwrap_or_default();
+        let mut stopped = Vec::new();
+        for line in said.lines() {
+            let Some((pid, command)) = line.split_once('\t') else {
+                continue;
+            };
+            let Ok(pid) = pid.trim().parse::<u32>() else {
+                continue;
+            };
+            if !plan::is_a_daemon(command) {
+                continue;
+            }
+            match powershell(&format!("Stop-Process -Id {pid} -Force -ErrorAction Stop")) {
+                Ok(_) => stopped.push(pid),
+                Err(e) => println!("could not stop the daemon already running as pid {pid}: {e}"),
+            }
+        }
+        if !stopped.is_empty() {
+            println!(
+                "stopped {} daemon(s) the old arrangement had left running: {}",
+                stopped.len(),
+                stopped
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(())
+    }
+
     fn present() -> plan::Present {
         plan::Present {
             task: task_registered(),
@@ -335,10 +393,15 @@ mod windows {
                 plan::Step::RemoveTask => {
                     println!("removing the login task, so only one of the two starts a daemon.");
                     uninstall_task()?;
+                    // Registering the other arrangement is not enough:
+                    // the daemon this one had already started is still
+                    // there, and two of them fight over the clipboard.
+                    stop_every_other_daemon()?;
                 }
                 plan::Step::RemoveService => {
                     println!("removing the service, so only one of the two starts a daemon.");
                     scm::uninstall()?;
+                    stop_every_other_daemon()?;
                 }
                 plan::Step::RegisterTask => register_task(exe, user.clone(), limited)?,
                 plan::Step::RegisterService => {
@@ -538,9 +601,13 @@ $found
         }
         for step in plan::uninstall(there) {
             match step {
-                plan::Step::RemoveTask => uninstall_task()?,
+                plan::Step::RemoveTask => {
+                    uninstall_task()?;
+                    stop_every_other_daemon()?;
+                }
                 plan::Step::RemoveService => {
                     scm::uninstall()?;
+                    stop_every_other_daemon()?;
                     // The report goes even though the identity stays. A
                     // dead one left machine-wide is preferred by every
                     // reader over the live one a hand-started daemon

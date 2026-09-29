@@ -81,6 +81,78 @@ pub fn uninstall(present: Present) -> Vec<Step> {
     steps
 }
 
+/// Is this command line one of this program's daemons?
+///
+/// Asked of every `smkvm.exe` on the machine when the arrangement is
+/// switched, because switching has to leave exactly one daemon running
+/// and reading a status report is not enough to find the other.
+///
+/// The report is written into the profile of whoever is running the
+/// daemon, and an install happens over ssh as an administrator who is
+/// not that person -- so the report simply is not among the places the
+/// installer can look, `running_pid` finds nothing, and the daemon the
+/// task was running carries on. That happened: for one whole test a
+/// machine had the old daemon, the new service and its worker, two
+/// daemons fighting over one clipboard. `plan` exists to make that
+/// impossible and it was defeated by looking in the wrong profile.
+///
+/// So the question is asked of the process list instead, where nobody
+/// needs permission to somebody else's profile to get an answer. A
+/// command line rather than just a name, because `smkvm status` and
+/// `smkvm service install` are the same executable and must not be
+/// killed.
+pub fn is_a_daemon(command_line: &str) -> bool {
+    // The three ways a daemon is started, plus the worker, which is a
+    // daemon's arm and dies with it.
+    const DAEMONS: [&str; 5] = ["run", "serve", "connect", "service-main", "desktop-worker"];
+    // Everything else this program can be asked to do. Listed rather
+    // than assumed, so that a word which is neither -- a flag, or the
+    // value of one -- is stepped over instead of being taken for a
+    // command.
+    const ENDS_BY_ITSELF: [&str; 8] = [
+        "service", "status", "init", "pair", "devices", "forget", "monitors", "import",
+    ];
+    // Global flags that take a value, whose value must not be read as
+    // the command. `--log-file x.log run` is a daemon; without this it
+    // looked like whatever `x.log` was.
+    const TAKES_A_VALUE: [&str; 2] = ["--config", "--log-file"];
+
+    let mut skip_next = false;
+    for word in after_the_program(command_line).split_whitespace() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if TAKES_A_VALUE.contains(&word) {
+            skip_next = true;
+            continue;
+        }
+        if DAEMONS.contains(&word) {
+            return true;
+        }
+        if ENDS_BY_ITSELF.contains(&word) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Everything after the program's own path, which may be quoted and
+/// may contain spaces.
+fn after_the_program(command_line: &str) -> &str {
+    let line = command_line.trim();
+    if let Some(rest) = line.strip_prefix('"') {
+        return match rest.split_once('"') {
+            Some((_, rest)) => rest,
+            None => "",
+        };
+    }
+    match line.split_once(char::is_whitespace) {
+        Some((_, rest)) => rest,
+        None => "",
+    }
+}
+
 /// What to print when there is nothing registered at all.
 pub fn nothing_was_registered(present: Present) -> bool {
     !present.task && !present.service
@@ -173,6 +245,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_daemon_is_told_apart_from_a_command_that_ends_by_itself() {
+        // The switch has to stop the other arrangement's daemon, and
+        // the installer is itself an `smkvm.exe`. Killing by name alone
+        // would have it stop itself partway through an install.
+        for daemon in [
+            r"C:\smkvm\smkvm.exe run --unattended",
+            r"C:\smkvm\smkvm.exe serve",
+            r"C:\smkvm\smkvm.exe connect 10.0.0.2",
+            r"C:\smkvm\smkvm.exe service-main",
+            r"C:\smkvm\smkvm.exe desktop-worker --unattended --pipe smkvm-worker-abc",
+            r"smkvm.exe run",
+            r"smkvm run --unattended --verbose",
+        ] {
+            assert!(is_a_daemon(daemon), "{daemon:?} is a daemon and was missed");
+        }
+        for passing in [
+            r"C:\smkvm\smkvm.exe service install --system",
+            r"C:\smkvm\smkvm.exe service uninstall",
+            r"C:\smkvm\smkvm.exe service start",
+            r"C:\smkvm\smkvm.exe service stop",
+            r"C:\smkvm\smkvm.exe status",
+            r"C:\smkvm\smkvm.exe monitors",
+            r"C:\smkvm\smkvm.exe pair 10.0.0.2",
+            r"C:\smkvm\smkvm.exe init --role client --server x",
+            r"C:\smkvm\smkvm.exe",
+        ] {
+            assert!(
+                !is_a_daemon(passing),
+                "{passing:?} ends by itself and would have been killed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_path_with_spaces_in_it_does_not_look_like_an_argument() {
+        // The path is quoted by the scheduler and by the service
+        // manager, and `Program Files` would otherwise make `Files`
+        // the first word.
+        assert!(is_a_daemon(
+            r#""C:\Program Files\smkvm\smkvm.exe" run --unattended"#
+        ));
+        assert!(!is_a_daemon(r#""C:\Program Files\smkvm\smkvm.exe" status"#));
+        // And an unquoted one with no arguments at all.
+        assert!(!is_a_daemon(r#""C:\Program Files\smkvm\smkvm.exe""#));
+        assert!(!is_a_daemon(""));
+    }
+
+    #[test]
+    fn flags_before_the_command_do_not_hide_it() {
+        // Global flags may come first, and a daemon behind one is still
+        // a daemon.
+        assert!(is_a_daemon("smkvm.exe --unattended run"));
+        assert!(is_a_daemon("smkvm.exe --log-file x.log run"));
+        assert!(!is_a_daemon("smkvm.exe --verbose status"));
     }
 
     #[test]
