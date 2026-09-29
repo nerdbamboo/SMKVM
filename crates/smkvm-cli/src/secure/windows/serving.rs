@@ -164,9 +164,13 @@ impl Serving {
     fn speak_for_the_clipboard(speak: &Speak) {
         let speak = speak.clone();
         smkvm_clipboard::witness_through(Box::new(move |text| {
+            // Relayed as given. The `clipboard:` prefix is already on
+            // it, put there at the source so that the same search
+            // finds these lines on both arrangements; adding another
+            // here would make it `worker: clipboard: clipboard: ...`.
             speak(&FromWorker::Said {
                 level: Level::Info,
-                text: format!("clipboard: {text}"),
+                text: text.to_string(),
             });
         }));
     }

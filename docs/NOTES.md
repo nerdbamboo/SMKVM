@@ -394,6 +394,12 @@ the lesson of the round before:
   a call that quietly succeeded and a call that was never made look
   identical afterwards.
 
+And one lesson about the instrumentation itself, found by using it:
+a prefix added by whoever *relays* a line is a prefix that is missing
+on the path with no relay. Somebody reading a log at a machine with a
+consent prompt in the way should not have to know which arrangement
+produced it in order to search for the thing they need.
+
 **This is a hypothesis with a control, not a certainty, so the run that
 tests it also proves which half was wrong.** Independently of the fix,
 the clipboard crate now says its handful of decisive lines through a
@@ -404,27 +410,45 @@ wrong with the worker's own logging. `WM_RENDERFORMAT entered` is
 written as the first statement of the handler, before it looks at
 anything.
 
-So the next run distinguishes them without ambiguity:
+**The control was run, and it narrows this to one variable.** Same
+machine, same binary, still under the scheduled task, the user's
+clipboard never interrupted:
 
-- `clipboard: WM_RENDERFORMAT entered` appears and the paste works ->
-  UIPI was blocking the message and the filter is the cure. Why the
-  server never needed it stays open; see above.
-- It appears and the paste still fails -> the handler runs, the
-  message filter was not the problem, and the fault is inside the
-  render after all, where the rest of the lines will say so.
-- It does not appear -> the handler is still not reached, UIPI was not
-  it either, and the question is which window holds the promise --
-  which the new line after taking the clipboard answers outright, by
-  reporting `GetClipboardOwner` against our own window handle.
+    PASTE UNDER THE TASK: [MARKER-121830-CTRL]
+    INFO clipboard: WM_RENDERFORMAT entered for format 13
 
-And run the same marker test on the **server**, which is the control
-and costs nothing: it runs the same binary under the task, so
-`WM_RENDERFORMAT entered` should appear in its log too. If it appears
-there and not on the client, the difference is real and located
-exactly where this says. If it appears in neither, the witness channel
-itself is not arriving and nothing below it can be read. Reaching for
-that control before reaching for code is the thing two rounds were
-lost to not doing.
+Three things stop being assumptions. The witness channel arrives. The
+render handler runs and serves correctly, so nothing in the window,
+the message loop, the promise or the render logic is wrong. And the
+only variable left between working and not working is the arrangement
+itself: the same code, on the same machine, in the same session, with
+the same window -- as the person at high integrity under a task it
+pastes, as the system account under a service the message never
+arrives.
+
+That is worth more than any of the three fixes that preceded it, and
+it was available for two rounds before anybody ran it.
+
+So the next run has two readings and not three:
+
+- `clipboard: WM_RENDERFORMAT entered` appears -> UIPI was blocking
+  the message and `ChangeWindowMessageFilterEx` is the cure, because
+  that call does nothing else. Why a high-integrity owner never needed
+  it stays open; see above.
+- It does not appear -> UIPI was not the mechanism, and the question
+  becomes what else about running as the system account keeps the
+  message away. The line after taking the clipboard is the next thing
+  to read, since it reports `GetClipboardOwner` against our own window
+  handle.
+
+There is no third reading left, because the control has already shown
+the handler works when it is reached.
+
+Grep for `clipboard:` and it finds these lines on either arrangement.
+The prefix is put on at the source for that reason; under the task
+they arrive straight from `tracing`, and under the service they come
+again through the pipe as `worker: clipboard: ...`, so the presence of
+`worker:` additionally says which path carried it.
 
 **Returning from a render without supplying data does not defer the
 question -- it answers it, with nothing.** This is the single most

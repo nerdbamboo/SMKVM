@@ -76,9 +76,19 @@ pub fn witness_through(say: Saying) {
 // none of this arises.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn witness(text: &str) {
-    tracing::info!("{text}");
+    // Prefixed here rather than by whoever relays it, so that one
+    // search finds these lines whichever way they arrived. Under the
+    // scheduled task there is no worker and no relay and they reach
+    // the log straight from here; under the service they arrive again
+    // through the pipe, where the worker's own prefix makes them
+    // `worker: clipboard: ...`. Somebody reading a log at a machine
+    // with a consent prompt in the way should not have to know which
+    // arrangement produced it in order to grep for the thing they
+    // need.
+    let said = format!("clipboard: {text}");
+    tracing::info!("{said}");
     if let Some(say) = WITNESS.get() {
-        say(text);
+        say(&said);
     }
 }
 

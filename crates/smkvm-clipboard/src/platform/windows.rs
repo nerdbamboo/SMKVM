@@ -517,7 +517,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RENEW => {
-            witness("promising the far machine's clipboard again");
+            witness("promising the far machine's formats again");
             if let Err(e) = take_clipboard(window) {
                 tracing::warn!("could not promise the far machine's clipboard again: {e}");
             }
@@ -604,7 +604,7 @@ fn take_clipboard(window: HWND) -> Result<()> {
     // SAFETY: reading the owner takes no pointers.
     let owner = unsafe { GetClipboardOwner() }.map(|o| o.0).ok();
     witness(&format!(
-        "promised {:?}; the clipboard's owner is now window={:?}, and this window is \
+        "promised {:?}; the owner is now window={:?}, and this window is \
          {:?} ({})",
         offered,
         owner.unwrap_or(std::ptr::null_mut()),
@@ -866,7 +866,7 @@ fn clipboard_thread(
     }
 
     witness(&format!(
-        "the clipboard window is up: window={:?} thread={thread_id} \
+        "window is up: window={:?} thread={thread_id} \
          messages-from-less-privileged[{}]",
         window.0,
         allowed.join(" ")
