@@ -293,11 +293,10 @@ readable by `smkvm status` while `device.toml` is refused to an ordinary
 account; whether carrying the three files across leaves an already-paired
 machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
-to start rather than a loop; whether the clipboard works through the
-pipe at all, in either direction, and what a paste feels like with the
-extra hop -- on its first deployment the offer reached the worker and
-nothing reached the person's clipboard, and the worker said nothing
-about either, which is what the relayed logging is for; whether a copy made while a consent prompt is up behaves as
+to start rather than a loop; whether a paste now
+lands inside the budget, and if not whether the second paste is
+instant as designed -- the offer and the fetch are both proven, and
+what remains untested is only the timing; whether a copy made while a consent prompt is up behaves as
 described; whether `WTSQueryUserToken` plus `CreateEnvironmentBlock`
 answers with the person's profile;
 whether the quarter-second desktop comparison is in fact quick enough that
@@ -322,6 +321,64 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**The paste that took sixty seconds and then produced nothing.** With
+the worker's voice in place this was one deployment to isolate, with a
+control: a marker string held on another machine's clipboard, read
+inside the logged-in session on each Windows machine through a
+throwaway scheduled task running as that account. The server, on the
+scheduled task, returned the marker. The client, on the service,
+returned nothing. So the announcement, the network fetch and the far
+machine's supply were all fine and the break was inside the worker's
+paste path alone.
+
+The log then said it exactly: `something on this desktop is pasting
+Text` at 02:41:17, and at 02:42:17 `could not put the data on the
+clipboard: ... <clipboard not open>`. Sixty seconds, then a *successful*
+fetch handed to a clipboard that had been closed for most of a minute.
+
+It was not a deadlock, which was the obvious guess and was checked
+first: the clipboard's message loop and the pipe reader are genuinely
+separate threads in the worker, and the lock around the served
+clipboard is not held across a render. It was arithmetic. The worker
+waited thirty seconds and the service's own patience was also thirty,
+so when a fetch was slow the worker gave up at the exact moment the
+answer might arrive; the answer was discarded as belonging to nobody;
+`WM_RENDERALLFORMATS` asked again; that second attempt queued behind
+the first fetch, which still held the fetch lock, for another thirty
+seconds; and what it finally got was written into a clipboard that had
+long since closed.
+
+Three rules came out of it, and they are in `secure::budget` with
+tests that run on any machine, which matters because the code they
+govern runs on exactly one:
+
+- **Every inner wait expires before the wait outside it**, with
+  headroom. The moment an inner deadline outlives an outer one, an
+  answer arrives for a question nobody is waiting on and the next
+  attempt queues behind work already abandoned. The ladder is now
+  1.8 s for the far machine, 2.5 s for the worker, 4 s for the render.
+- **A deadline that cannot be met is not made longer.** A fetch too
+  slow for a paste is given up on, and what it returns is *kept* for
+  the next paste. The worst case is one paste that does nothing and a
+  second that is instant, which a person can understand and work with.
+- **A late answer is never written.** The render checks the clock
+  before handing anything over, so data that arrived after the
+  clipboard closed is cached rather than pushed into
+  `ERROR_CLIPBOARD_NOT_OPEN`.
+
+And nothing queues: a second paste arriving while one is in flight is
+refused at once rather than waiting out the first.
+
+**System error messages must carry their number, and be decoded as
+wide text.** The error above reached the log as
+`?ㅻ젅?쒖뿉 ?대젮 ?덈뒗 ?대┰蹂대뱶媛 ?놁뒿?덈떎` -- the machine's ANSI code page
+written into a UTF-8 file. These machines are Korean, so *every* system
+message this program surfaces has this problem, and mojibake is both
+unreadable and unsearchable. `FormatMessageW` is now called explicitly
+rather than left to anything that might reach for the ANSI form, and
+the numeric code is always appended, because a number can be looked up
+whatever happened to the text.
 
 **A file with a line break in its name was refused for a week, and that
 was most of "copy and paste does not work".** A journal PDF downloaded
@@ -986,6 +1043,19 @@ worker's desktop and the last polled input desktop and reports no reach
 when they differ, and `mind_workers` tells it what it saw on every look
 rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
+
+**Nested deadlines must shrink inwards, and equal is as bad as
+inverted.** Two hops each given thirty seconds is not "thirty seconds
+of patience", it is sixty and a discarded answer in the middle. Where
+one wait contains another, the inner must expire first with room to
+spare, and the arithmetic deserves a test of its own -- especially
+where, as here, the code cannot be run on the machine that writes it.
+
+**A slow answer is worth keeping even when it is too late to use.**
+Throwing away a fetch that missed its render means the next paste pays
+the same cost and misses again. Keeping it turns a permanent failure
+into a single retry, and that is the difference between a feature that
+looks broken and one that looks slow the first time.
 
 **Refusing is not the safe default; it is a different risk.** A check
 that refuses everything doubtful looks conservative and reads as
