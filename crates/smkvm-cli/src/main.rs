@@ -472,6 +472,7 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
     println!("configuration  {}", config_path.display());
     println!("log            {}", paths::log_file().display());
     println!("status         {}", paths::status_file().display());
+    report_on_the_machine_key();
     println!();
 
     // Either scope may have written it: the service writes machine-wide
@@ -528,6 +529,56 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Say, every time somebody asks how things are, whether this account can
+/// read the machine-wide key.
+///
+/// The service checks its key at startup and logs `KEY PRIVATE`,
+/// `KEY READABLE` or `KEY UNPROVEN`. That is one line, weeks ago, in a
+/// file nobody re-reads -- so a key that could not be proven private
+/// would quietly stay unproven for as long as the machine ran.
+///
+/// This does not echo that verdict; it measures again, and by the most
+/// direct means there is. `type %ProgramData%\smkvm\device.toml` from an
+/// ordinary account is the check that settles the question on a real
+/// machine, and it needs no access list to be parsed and no agreement
+/// with `icacls` about anything. So that is what this does: it opens the
+/// file. Whether the open succeeds is not an opinion.
+///
+/// The one thing it cannot know is whether the account asking is an
+/// administrator, who may legitimately read it. So it reports what it
+/// found and who it would be a fault for, rather than pronouncing.
+fn report_on_the_machine_key() {
+    if !cfg!(windows) {
+        return;
+    }
+    let key = paths::machine_state_dir().join(paths::IDENTITY_NAME);
+    if !key.exists() {
+        return;
+    }
+    match std::fs::File::open(&key) {
+        Ok(_) => println!(
+            "machine key     {} -- READABLE BY THIS ACCOUNT.\n\
+             \x20               If you are not running as an administrator this is a \
+             fault: that key is what the\n\
+             \x20               other machines trust this one by, and anyone holding a \
+             copy can be handed\n\
+             \x20               the cursor and the keystrokes that follow it. Reinstall \
+             with `smkvm service\n\
+             \x20               install --system` from an administrator prompt, and pair \
+             this machine afresh.",
+            key.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => println!(
+            "machine key     {} -- not readable by this account, which is right",
+            key.display()
+        ),
+        Err(e) => println!(
+            "machine key     {} -- could not be opened to find out ({e})",
+            key.display()
+        ),
+    }
 }
 
 fn load_identity() -> Result<Identity> {

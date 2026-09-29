@@ -259,10 +259,20 @@ fn inspect(path: &Path, inheritable_only: bool) -> Verdict {
     } else {
         path.parent().unwrap_or(path).to_path_buf()
     };
+    // `/T` matters. `/save` without it is documented as storing the
+    // lists for the files and subdirectories of the named directory, and
+    // is often observed to store the named directory itself instead --
+    // and this one call has to answer both shapes of question: the
+    // directory's own list, and the list on `device.toml` inside it.
+    // Whichever one a given Windows gives back, the other lookup finds
+    // nothing and the answer is `Unproven`, which at install time is a
+    // refusal. Fail-closed and loud, so not dangerous, but an entirely
+    // avoidable way to spend a deployment.
     let outcome = icacls(&[
         container.as_os_str(),
         OsStr::new("/save"),
         saved.as_os_str(),
+        OsStr::new("/T"),
         OsStr::new("/c"),
     ]);
     let read = outcome.and_then(|_| {
@@ -279,7 +289,14 @@ fn inspect(path: &Path, inheritable_only: bool) -> Verdict {
     let _ = std::fs::remove_file(&saved);
     let text = match read {
         Ok(text) => text,
-        Err(e) => return Verdict::Unproven(format!("{e:#}")),
+        // The first of the three shapes: the tool would not run, or what
+        // it wrote could not be read back at all. Nothing is known about
+        // the list, and nothing is claimed.
+        Err(e) => {
+            return Verdict::Unproven(format!(
+                "icacls itself would not answer, so no list was examined: {e:#}"
+            ))
+        }
     };
 
     // For a directory, `/save` names it by its own last component; for a
@@ -293,8 +310,22 @@ fn inspect(path: &Path, inheritable_only: bool) -> Verdict {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(&wanted) || name.ends_with(&wanted));
     let Some((_, sddl)) = found else {
+        // The second shape: the tool ran and wrote something, and this
+        // build could not find the thing it was asked about in it. That
+        // is a disagreement about the format, not a fault in any access
+        // list -- so it says so in those words, and lists what it did
+        // find, because on a machine the difference between "I cannot
+        // see it" and "it is wrong" is the difference between an
+        // afternoon and a minute.
+        let names: Vec<&str> = descriptors.iter().map(|(name, _)| name.as_str()).collect();
         return Verdict::Unproven(format!(
-            "`icacls \"{}\" /save` wrote nothing this build could find {wanted} in",
+            "icacls answered, but this build found no entry for {wanted} in what it \
+             wrote. This is a disagreement about the format of `icacls /save`, not a \
+             fault in any access list. It saved {} entr{}: [{}]. Check by hand with \
+             `icacls \"{}\"`",
+            names.len(),
+            if names.len() == 1 { "y" } else { "ies" },
+            names.join(", "),
             container.display()
         ));
     };
@@ -320,10 +351,10 @@ pub fn confirm_key_is_private(path: &Path) -> Result<()> {
         Verdict::Private => Ok(()),
         Verdict::Reachable(strangers) => bail!("{}", reachable_says(path, &strangers)),
         Verdict::Unproven(why) => bail!(
-            "the access list on {} could not be confirmed, so this install stops rather \
-             than assuming it is right: {why}. Check by hand with `icacls \"{}\"`, and \
-             from an ordinary account that `type {}` is refused",
-            path.display(),
+            "the access list on {} could NOT BE CONFIRMED -- which is not the same as \
+             being wrong. This install stops rather than assume it is right. {why}. \
+             Nothing about the key itself is known to be at fault; confirm by hand, from \
+             an ordinary account, that `type {}` is refused",
             path.display(),
             path.display()
         ),
@@ -406,7 +437,7 @@ pub fn check_key_before_using_it(path: &Path) -> Result<()> {
 
 fn reachable_says(path: &Path, strangers: &[String]) -> String {
     format!(
-        "{} can be reached by {}, which must not be so: it is this machine's private \
+        "the access list is wrong: {} can be reached by {}, which must not be so: it is this machine's private \
          key, and anyone holding a copy can connect to the server as this machine and \
          be handed the cursor, and the keystrokes that follow it. Check with `icacls \
          \"{}\"`; the remedy is to delete {} and install again, and to pair this \

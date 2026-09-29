@@ -148,6 +148,18 @@ const NEVER_GRANTS: [&str; 14] = [
 /// What is said when the list grants everything to everybody.
 const NO_LIST: &str = "everyone (the list is absent, which grants all access)";
 
+/// What is said when the descriptor carries two of them.
+///
+/// The system function that produces this text serialises exactly one
+/// discretionary list, so this should not be reachable. It is refused
+/// rather than reasoned about because the alternative -- taking the
+/// first and discarding the rest -- is the same shape as every other
+/// bypass found in this file: a way for something later in the string to
+/// go unexamined.
+const TWO_LISTS: &str =
+    "everyone (the descriptor carries two discretionary lists, so which one applies \
+     cannot be told from here)";
+
 /// One entry, as much as is needed of it.
 struct Entry<'a> {
     kind: String,
@@ -178,8 +190,9 @@ struct Entry<'a> {
 /// other way is a private key anyone on the machine can copy, which no
 /// rollback undoes.
 pub fn granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<String> {
-    let Some(entries) = read_list(sddl) else {
-        return vec![NO_LIST.into()];
+    let entries = match read_list(sddl) {
+        Ok(entries) => entries,
+        Err(why) => return vec![why.into()],
     };
     let mut found = Vec::new();
     for entry in entries {
@@ -217,8 +230,9 @@ pub fn granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<String> {
 /// asks a narrower question than [`granted_to_anyone_but`]: not "who is
 /// on this list" but "who does this list hand down".
 pub fn inheritably_granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<String> {
-    let Some(entries) = read_list(sddl) else {
-        return vec![NO_LIST.into()];
+    let entries = match read_list(sddl) {
+        Ok(entries) => entries,
+        Err(why) => return vec![why.into()],
     };
     let mut found = Vec::new();
     for entry in entries {
@@ -250,9 +264,9 @@ pub fn inheritably_granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<St
     found
 }
 
-/// The entries of the discretionary list, or `None` when there is no
-/// list at all and therefore no restriction on anybody.
-fn read_list(sddl: &str) -> Option<Vec<Entry<'_>>> {
+/// The entries of the discretionary list, or the reason there is no
+/// single list to read -- which is always a reason to assume the worst.
+fn read_list(sddl: &str) -> Result<Vec<Entry<'_>>, &'static str> {
     let dacl = discretionary_part(sddl)?;
     let (flags, raws) = flags_and_entries(dacl);
     // The spelling Windows actually emits for a null list. The first
@@ -260,28 +274,27 @@ fn read_list(sddl: &str) -> Option<Vec<Entry<'_>>> {
     // covered it -- a test written for precisely this bug that missed it
     // by guessing how the system would say it.
     if flags.to_ascii_uppercase().contains("NO_ACCESS_CONTROL") {
-        return None;
+        return Err(NO_LIST);
     }
-    Some(
-        raws.into_iter()
-            .map(|raw| {
-                let fields: Vec<&str> = raw.split(';').collect();
-                Entry {
-                    kind: fields
-                        .first()
-                        .map(|k| k.trim().to_ascii_uppercase())
-                        .unwrap_or_default(),
-                    flags: fields
-                        .get(1)
-                        .map(|f| f.trim().to_ascii_uppercase())
-                        .unwrap_or_default(),
-                    trustee: fields.get(5).map(|t| t.trim()).unwrap_or_default(),
-                    raw,
-                    whole: fields.len() >= 6,
-                }
-            })
-            .collect(),
-    )
+    Ok(raws
+        .into_iter()
+        .map(|raw| {
+            let fields: Vec<&str> = raw.split(';').collect();
+            Entry {
+                kind: fields
+                    .first()
+                    .map(|k| k.trim().to_ascii_uppercase())
+                    .unwrap_or_default(),
+                flags: fields
+                    .get(1)
+                    .map(|f| f.trim().to_ascii_uppercase())
+                    .unwrap_or_default(),
+                trustee: fields.get(5).map(|t| t.trim()).unwrap_or_default(),
+                raw,
+                whole: fields.len() >= 6,
+            }
+        })
+        .collect())
 }
 
 /// The text of the discretionary part, if there is one.
@@ -295,7 +308,7 @@ fn read_list(sddl: &str) -> Option<Vec<Entry<'_>>> {
 /// read back clean. A condition is attacker-written text sitting inside
 /// the thing being parsed, so nothing may be located by searching
 /// through it.
-fn discretionary_part(sddl: &str) -> Option<&str> {
+fn discretionary_part(sddl: &str) -> Result<&str, &'static str> {
     let bytes = sddl.as_bytes();
     let mut depth = 0usize;
     let mut start: Option<usize> = None;
@@ -320,8 +333,13 @@ fn discretionary_part(sddl: &str) -> Option<&str> {
             && matches!(bytes[i].to_ascii_uppercase(), b'O' | b'G' | b'D' | b'S');
         if marker {
             if let Some(from) = start {
-                // A later component ends the discretionary one.
-                return Some(&sddl[from..i]);
+                // A second discretionary part is refused rather than
+                // resolved; see `TWO_LISTS`.
+                if bytes[i].eq_ignore_ascii_case(&b'D') {
+                    return Err(TWO_LISTS);
+                }
+                // Any other later component ends the discretionary one.
+                return Ok(&sddl[from..i]);
             }
             if bytes[i].eq_ignore_ascii_case(&b'D') {
                 start = Some(i + 2);
@@ -331,7 +349,7 @@ fn discretionary_part(sddl: &str) -> Option<&str> {
         }
         i += 1;
     }
-    start.map(|from| &sddl[from..])
+    start.map(|from| &sddl[from..]).ok_or(NO_LIST)
 }
 
 /// The flags before the first entry, and each entry's text without its
@@ -661,6 +679,19 @@ mod tests {
             ),
             vec!["WD"]
         );
+    }
+
+    #[test]
+    fn two_discretionary_lists_are_refused_rather_than_resolved() {
+        // Not reachable through the system function that writes this
+        // text, which serialises exactly one. Refused anyway, because
+        // taking the first and discarding the rest is the same shape as
+        // every other bypass in this file.
+        let doubled = "D:P(A;;FA;;;SY)D:P(A;;FA;;;WD)";
+        assert!(!says_it_is_private(doubled));
+        assert!(strangers(doubled)[0].contains("two discretionary lists"));
+        // One list followed by a system part is still perfectly ordinary.
+        assert!(says_it_is_private("D:P(A;;FA;;;SY)S:(ML;;NW;;;LW)"));
     }
 
     #[test]
