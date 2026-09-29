@@ -46,7 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
-use crate::{witness, RENDER_BUDGET};
+use crate::{witness, Rendered, RENDER_BUDGET};
 
 /// How long to keep trying to open the clipboard.
 ///
@@ -305,38 +305,30 @@ thread_local! {
 }
 
 /// Produce one promised format, now that something has asked for it.
-fn render(window: HWND, format_id: u32) {
-    // Every way out of this says why, including the ones that cannot
-    // happen. A render that gives up in silence is indistinguishable
-    // from a render that was never asked for, and telling those two
-    // apart has now cost this project three separate rounds.
-    let mut renew = false;
+/// Supply one promised format, and say how it went.
+///
+/// Returns the outcome rather than acting on it: whether to promise
+/// again is `Rendered::needs_renewing`, which lives beside the
+/// outcomes and is tested. The shape before this threaded a `bool`
+/// through the body, and nothing at all stopped the success path
+/// setting it -- which would re-take the clipboard, emptying it, and
+/// throw away the data handed over a moment earlier.
+fn render(format_id: u32) -> Rendered {
     STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(state) = slot.as_mut() else {
-            tracing::warn!(
-                format_id,
-                "asked to render, but this thread holds no clipboard state at all"
-            );
-            return;
+            return Rendered::NoState;
         };
         let formats = state.formats;
         let Some((offered, source)) = state.offer.as_ref() else {
-            tracing::debug!(format_id, "asked to render, but nothing is on offer");
-            return;
+            return Rendered::NothingOffered;
         };
         let wanted = offered
             .iter()
             .find(|f| native_ids(formats, f).contains(&format_id));
         let Some(wanted) = wanted.cloned() else {
-            tracing::debug!(
-                format_id,
-                ?offered,
-                "asked to render a form that was not offered"
-            );
-            return;
+            return Rendered::NotOurFormat;
         };
-        tracing::debug!(format_id, ?wanted, "something here is pasting");
 
         let asked_at = Instant::now();
         let bytes = match state.cache.get(&wanted) {
@@ -346,11 +338,7 @@ fn render(window: HWND, format_id: u32) {
                     state.cache.insert(wanted.clone(), bytes.clone());
                     bytes
                 }
-                Err(e) => {
-                    tracing::warn!(?wanted, "could not supply the clipboard: {e}");
-                    renew = true;
-                    return;
-                }
+                Err(e) => return Rendered::CouldNotFetch(e.to_string()),
             },
         };
 
@@ -359,36 +347,22 @@ fn render(window: HWND, format_id: u32) {
         // its render is not wasted, only mistimed.
         let took = asked_at.elapsed();
         if took > RENDER_BUDGET {
-            tracing::warn!(
-                ?wanted,
-                took_ms = took.as_millis() as u64,
-                "the contents arrived too late to hand over -- the clipboard closed while \
-                 they were being fetched, so this paste produced nothing. They are kept, \
-                 so pasting again will be immediate"
-            );
-            renew = true;
-            return;
+            return Rendered::TooLate(took.as_millis() as u64);
         }
 
         match write_native(formats, &wanted, format_id, &bytes) {
             Ok(()) => {
                 state.renewals = 0;
-                tracing::debug!(format_id, ?wanted, bytes = bytes.len(), "handed over");
+                Rendered::Served(bytes.len())
             }
-            Err(e) => {
-                tracing::warn!(?wanted, "could not put the data on the clipboard: {e}");
-                renew = true;
-            }
+            Err(e) => Rendered::CouldNotHandOver(e.to_string()),
         }
-    });
+    })
+}
 
-    if !renew {
-        return;
-    }
-    // Nothing was handed over, so Windows now holds empty data for this
-    // format and will not ask again. The promise has to be made afresh
-    // or the clipboard stays permanently empty -- which is the fault
-    // this whole branch exists to fix.
+/// Promise again, or give the clipboard back, after a render that kept
+/// nothing.
+fn after_a_render_that_kept_nothing(window: HWND, format_id: u32) {
     let give_up = STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(state) = slot.as_mut() else {
@@ -398,24 +372,19 @@ fn render(window: HWND, format_id: u32) {
         state.renewals > RENEWALS_BEFORE_GIVING_UP
     });
     if give_up {
-        tracing::warn!(
-            format_id,
-            "this machine has promised the far machine's clipboard {RENEWALS_BEFORE_GIVING_UP} \
-             times and served none of them, so it is giving the clipboard back. Copying and \
-             pasting on this machine will work again; what the other machine copied is not \
+        witness(&format!(
+            "promised format {format_id} {RENEWALS_BEFORE_GIVING_UP} times and served \
+             none of them, so the clipboard is being given back. Copying and pasting on \
+             this machine will work again; what the other machine copied is not \
              available here"
-        );
+        ));
         // SAFETY: posting to this window, which is this thread's own.
         let _ = unsafe { PostMessageW(window, WM_RELEASE, WPARAM(0), LPARAM(0)) };
         return;
     }
-    tracing::info!(
-        format_id,
-        "this paste produced nothing; promising it again so the next one can be served"
-    );
     // SAFETY: posting to this window, which is this thread's own. Posted
     // rather than done here because the clipboard is still open for the
-    // length of this handler.
+    // length of the handler this was called from.
     let _ = unsafe { PostMessageW(window, WM_RENEW, WPARAM(0), LPARAM(0)) };
 }
 
@@ -530,8 +499,25 @@ unsafe extern "system" fn window_proc(
             // line appears is the whole of the difference between "the
             // handler did not run" and "the handler ran and said
             // nothing", and telling those apart has cost three rounds.
-            witness(&format!("WM_RENDERFORMAT entered for format {}", wparam.0));
-            render(window, wparam.0 as u32);
+            // Entered, and -- the line that was missing -- returned.
+            // Knowing it was entered while not knowing whether it came
+            // back left a hang with nowhere to look: the absence of a
+            // line was doing the work of evidence, and only worked at
+            // all because somebody could see the log carry on with
+            // other traffic. Both ends are said now, and the outcome
+            // between them, whichever way it went.
+            let format_id = wparam.0 as u32;
+            witness(&format!("WM_RENDERFORMAT entered for format {format_id}"));
+            let began = Instant::now();
+            let outcome = render(format_id);
+            witness(&format!(
+                "WM_RENDERFORMAT for format {format_id} returned after {} ms: {}",
+                began.elapsed().as_millis(),
+                outcome.said()
+            ));
+            if outcome.needs_renewing() {
+                after_a_render_that_kept_nothing(window, format_id);
+            }
             LRESULT(0)
         }
         WM_RENEW => {
@@ -556,7 +542,11 @@ unsafe extern "system" fn window_proc(
                     if Opened::take(window).is_ok() {
                         for format in &offered {
                             for id in native_ids(formats, format) {
-                                render(window, id);
+                                let outcome = render(id);
+                                witness(&format!(
+                                    "rendering everything: format {id}: {}",
+                                    outcome.said()
+                                ));
                             }
                         }
                     }

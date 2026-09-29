@@ -92,6 +92,82 @@ pub(crate) fn witness(text: &str) {
     }
 }
 
+/// How a render ended.
+///
+/// An enum rather than a `bool` threaded through the handler, because
+/// the renewal was added for the path where the contents do not
+/// arrive, and there was nothing stopping it running on the path where
+/// they do. Renewing a promise that was just kept is not a small
+/// mistake -- it re-takes the clipboard, which empties it, which
+/// throws away the very data that was handed over a moment earlier.
+///
+/// So the decision lives in one place, [`Rendered::needs_renewing`],
+/// and is tested. A success path that shares code with a failure path
+/// needs a test that it does not do the failure path's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rendered {
+    /// Handed over, with this many bytes.
+    Served(usize),
+    /// Nothing is on offer, so there was nothing to render. Whoever
+    /// asked will get nothing, and that is correct.
+    NothingOffered,
+    /// A format that was never promised. Windows asks for the ones it
+    /// synthesises too, and those are not ours to supply.
+    NotOurFormat,
+    /// This thread holds no clipboard state at all, which should not
+    /// happen.
+    NoState,
+    /// The contents could not be got in time.
+    CouldNotFetch(String),
+    /// They arrived, but too late to be worth handing over.
+    TooLate(u64),
+    /// They were there and the system would not take them.
+    CouldNotHandOver(String),
+}
+
+impl Rendered {
+    /// Should the promise be made again?
+    ///
+    /// Only when the promise was *not* kept and might be next time.
+    /// Not when it was kept -- that would empty the clipboard we just
+    /// filled. Not when there was nothing to keep, because renewing an
+    /// offer that does not exist is churn with no end to it.
+    pub fn needs_renewing(&self) -> bool {
+        match self {
+            Rendered::CouldNotFetch(_) | Rendered::TooLate(_) | Rendered::CouldNotHandOver(_) => {
+                true
+            }
+            Rendered::Served(_)
+            | Rendered::NothingOffered
+            | Rendered::NotOurFormat
+            | Rendered::NoState => false,
+        }
+    }
+
+    /// What to put in the log, every time, whichever way it went.
+    ///
+    /// Including the success: the absence of a line was doing the work
+    /// of evidence, and that only worked because somebody could see
+    /// the log continue with other traffic.
+    pub fn said(&self) -> String {
+        match self {
+            Rendered::Served(bytes) => format!("served it, {bytes} bytes"),
+            Rendered::NothingOffered => "nothing is on offer, so nothing was served".into(),
+            Rendered::NotOurFormat => {
+                "this format was never promised, so it is not ours to serve".into()
+            }
+            Rendered::NoState => "this thread holds no clipboard state at all".into(),
+            Rendered::CouldNotFetch(why) => format!("could not get the contents: {why}"),
+            Rendered::TooLate(ms) => {
+                format!("the contents took {ms} ms, too late to hand over")
+            }
+            Rendered::CouldNotHandOver(why) => {
+                format!("the system would not take the contents: {why}")
+            }
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ClipboardError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -189,4 +265,50 @@ pub trait CatchDrag: Send {
     /// Returns the files being dragged, or `None` if no drag was in progress
     /// or it could not be read in time. Blocks for a fraction of a second.
     fn catch(&mut self, drive: &mut dyn FnMut(Drive)) -> Option<Vec<std::path::PathBuf>>;
+}
+
+#[cfg(test)]
+mod rendered_tests {
+    use super::Rendered;
+
+    #[test]
+    fn a_promise_that_was_kept_is_never_made_again() {
+        // The whole reason this is an enum. Renewing after a success
+        // re-takes the clipboard, which empties it, which throws away
+        // the data handed over a moment before -- the opposite of what
+        // the renewal was added to do.
+        assert!(!Rendered::Served(17).needs_renewing());
+    }
+
+    #[test]
+    fn a_promise_that_was_not_kept_is_made_again() {
+        assert!(Rendered::CouldNotFetch("timed out".into()).needs_renewing());
+        assert!(Rendered::TooLate(9_000).needs_renewing());
+        assert!(Rendered::CouldNotHandOver("clipboard not open".into()).needs_renewing());
+    }
+
+    #[test]
+    fn nothing_to_keep_is_not_a_promise_to_renew() {
+        // Windows asks for the formats it synthesises from ours, and
+        // those were never promised. Renewing for them would re-take
+        // the clipboard on every paste, for ever.
+        assert!(!Rendered::NotOurFormat.needs_renewing());
+        assert!(!Rendered::NothingOffered.needs_renewing());
+        assert!(!Rendered::NoState.needs_renewing());
+    }
+
+    #[test]
+    fn every_outcome_says_something() {
+        for outcome in [
+            Rendered::Served(1),
+            Rendered::NothingOffered,
+            Rendered::NotOurFormat,
+            Rendered::NoState,
+            Rendered::CouldNotFetch("x".into()),
+            Rendered::TooLate(1),
+            Rendered::CouldNotHandOver("y".into()),
+        ] {
+            assert!(!outcome.said().is_empty(), "{outcome:?} says nothing");
+        }
+    }
 }
