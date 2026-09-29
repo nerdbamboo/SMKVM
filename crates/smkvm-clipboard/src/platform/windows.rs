@@ -39,8 +39,8 @@ use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    PostThreadMessageW, RegisterClassW, SetTimer, TranslateMessage, HWND_MESSAGE, MSG,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WM_RENDERALLFORMATS,
+    PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer, TranslateMessage, HWND_MESSAGE,
+    MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WM_RENDERALLFORMATS,
     WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
 
@@ -58,6 +58,36 @@ const OPEN_PATIENCE: Duration = Duration::from_millis(500);
 const WM_OFFER: u32 = WM_APP + 1;
 /// Asks it to give the clipboard back.
 const WM_RELEASE: u32 = WM_APP + 2;
+
+/// Promise the offered formats again, after a render could not keep the
+/// last promise.
+///
+/// This exists because of the way delayed rendering fails. A handler
+/// that returns from `WM_RENDERFORMAT` *without* calling
+/// `SetClipboardData` has not deferred the question -- it has answered
+/// it, with nothing. Windows records empty data for that format and
+/// never asks again, so one render that could not be served in time
+/// turns into a clipboard that is permanently empty while still listing
+/// the formats and still owned by us. That is precisely the state a
+/// real machine was left in, and it is what "fail fast" bought when it
+/// replaced a render that merely took too long: the slow version at
+/// least got asked again.
+///
+/// So a render that cannot supply the data renews the promise instead
+/// of abandoning it. Posted rather than done inline because the
+/// clipboard is open for the length of the handler and re-taking it has
+/// to happen after that returns.
+const WM_RENEW: u32 = WM_APP + 3;
+
+/// How many times a promise is renewed before the clipboard is given
+/// back altogether.
+///
+/// Holding a promise that cannot be kept is worse for the person than
+/// holding nothing: their own last copy is gone and every paste yields
+/// emptiness. After this many failures the clipboard is released, so
+/// copying and pasting on the machine itself starts working again even
+/// though what the other machine offered is lost.
+const RENEWALS_BEFORE_GIVING_UP: u32 = 3;
 
 /// The timer that lets a burst of change notices settle into one report.
 const SETTLE_TIMER: usize = 1;
@@ -267,6 +297,9 @@ struct State {
     /// Set while this process is the one putting data on the clipboard, so its
     /// own change notification is not mistaken for someone else copying.
     ours: bool,
+    /// How many times running the promise has been renewed without a
+    /// paste ever being served.
+    renewals: u32,
 }
 
 thread_local! {
@@ -274,10 +307,19 @@ thread_local! {
 }
 
 /// Produce one promised format, now that something has asked for it.
-fn render(format_id: u32) {
+fn render(window: HWND, format_id: u32) {
+    // Every way out of this says why, including the ones that cannot
+    // happen. A render that gives up in silence is indistinguishable
+    // from a render that was never asked for, and telling those two
+    // apart has now cost this project three separate rounds.
+    let mut renew = false;
     STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(state) = slot.as_mut() else {
+            tracing::warn!(
+                format_id,
+                "asked to render, but this thread holds no clipboard state at all"
+            );
             return;
         };
         let formats = state.formats;
@@ -308,6 +350,7 @@ fn render(format_id: u32) {
                 }
                 Err(e) => {
                     tracing::warn!(?wanted, "could not supply the clipboard: {e}");
+                    renew = true;
                     return;
                 }
             },
@@ -325,14 +368,57 @@ fn render(format_id: u32) {
                  they were being fetched, so this paste produced nothing. They are kept, \
                  so pasting again will be immediate"
             );
+            renew = true;
             return;
         }
 
         match write_native(formats, &wanted, format_id, &bytes) {
-            Ok(()) => tracing::debug!(format_id, ?wanted, bytes = bytes.len(), "handed over"),
-            Err(e) => tracing::warn!(?wanted, "could not put the data on the clipboard: {e}"),
+            Ok(()) => {
+                state.renewals = 0;
+                tracing::debug!(format_id, ?wanted, bytes = bytes.len(), "handed over");
+            }
+            Err(e) => {
+                tracing::warn!(?wanted, "could not put the data on the clipboard: {e}");
+                renew = true;
+            }
         }
     });
+
+    if !renew {
+        return;
+    }
+    // Nothing was handed over, so Windows now holds empty data for this
+    // format and will not ask again. The promise has to be made afresh
+    // or the clipboard stays permanently empty -- which is the fault
+    // this whole branch exists to fix.
+    let give_up = STATE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(state) = slot.as_mut() else {
+            return true;
+        };
+        state.renewals += 1;
+        state.renewals > RENEWALS_BEFORE_GIVING_UP
+    });
+    if give_up {
+        tracing::warn!(
+            format_id,
+            "this machine has promised the far machine's clipboard {RENEWALS_BEFORE_GIVING_UP} \
+             times and served none of them, so it is giving the clipboard back. Copying and \
+             pasting on this machine will work again; what the other machine copied is not \
+             available here"
+        );
+        // SAFETY: posting to this window, which is this thread's own.
+        let _ = unsafe { PostMessageW(window, WM_RELEASE, WPARAM(0), LPARAM(0)) };
+        return;
+    }
+    tracing::info!(
+        format_id,
+        "this paste produced nothing; promising it again so the next one can be served"
+    );
+    // SAFETY: posting to this window, which is this thread's own. Posted
+    // rather than done here because the clipboard is still open for the
+    // length of this handler.
+    let _ = unsafe { PostMessageW(window, WM_RENEW, WPARAM(0), LPARAM(0)) };
 }
 
 /// The Windows format numbers one of our formats can be supplied as.
@@ -421,7 +507,13 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RENDERFORMAT => {
-            render(wparam.0 as u32);
+            render(window, wparam.0 as u32);
+            LRESULT(0)
+        }
+        WM_RENEW => {
+            if let Err(e) = take_clipboard(window) {
+                tracing::warn!("could not promise the far machine's clipboard again: {e}");
+            }
             LRESULT(0)
         }
         WM_RENDERALLFORMATS => {
@@ -438,7 +530,7 @@ unsafe extern "system" fn window_proc(
                     if Opened::take(window).is_ok() {
                         for format in &offered {
                             for id in native_ids(formats, format) {
-                                render(id);
+                                render(window, id);
                             }
                         }
                     }
@@ -683,6 +775,7 @@ fn clipboard_thread(
 
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(State {
+            renewals: 0,
             formats,
             changes,
             offer: None,
