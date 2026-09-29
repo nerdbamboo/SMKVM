@@ -27,7 +27,11 @@ past which sharing silently stopped.
 - **The clipboard follows the copy, not the cursor.** A copy announces what is
   available; contents are fetched only when something pastes, one chunk at a
   time, so a screenshot that is never pasted costs one small message and
-  there is no size at which sharing quietly fails.
+  there is no size at which sharing quietly fails. A filename that cannot
+  be written as it stands -- a line break in it, a character Windows
+  reserves -- is cleaned and the file arrives under the closest name that
+  can be; only a name that could land outside the folder it was meant for
+  is refused, and the machine receiving it says so.
 - **Files go the same way, and by dragging.** Copy files in Explorer or
   Nautilus and paste them on another machine, or drag them off the edge of one
   screen and let go on another: either way they land in `~/Downloads/SMKVM`

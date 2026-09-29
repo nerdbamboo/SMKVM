@@ -295,7 +295,9 @@ machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
 to start rather than a loop; whether the clipboard works through the
 pipe at all, in either direction, and what a paste feels like with the
-extra hop; whether a copy made while a consent prompt is up behaves as
+extra hop -- on its first deployment the offer reached the worker and
+nothing reached the person's clipboard, and the worker said nothing
+about either, which is what the relayed logging is for; whether a copy made while a consent prompt is up behaves as
 described; whether `WTSQueryUserToken` plus `CreateEnvironmentBlock`
 answers with the person's profile;
 whether the quarter-second desktop comparison is in fact quick enough that
@@ -320,6 +322,44 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**A file with a line break in its name was refused for a week, and that
+was most of "copy and paste does not work".** A journal PDF downloaded
+with its title wrapped across two lines --
+
+    Oracle-Guided Reinforcement Learning for\nDegradation-Aware ... .pdf
+
+-- was abandoned on every attempt, with the only trace a warning in the
+log of the machine doing the *sending*, which is the one place nobody
+looks. It predates the service by a week and has nothing to do with it.
+
+The rule was right about danger and wrong about what to do with it, and
+the fix is to separate the two kinds by what is at stake:
+
+- **Refused**: names that could land somewhere other than the directory
+  they were meant for -- `..`, a leading `/`, a backslash, a NUL, a
+  colon, anything `Path::components` does not make exactly one ordinary
+  component of. Nothing about such a name can be trusted, so it is not
+  tidied up and used anyway.
+- **Cleaned**: names that are merely not writable as they stand --
+  control characters, the characters Windows reserves, trailing dots
+  and spaces, reserved device names, too long. The file arrives under
+  the closest name that can be written, and the change is said once in
+  the log. Losing a newline out of a filename is not a loss worth
+  refusing a file for.
+
+The colon is the interesting one, and it moved *into* the refusal list
+while writing this. It looks like an awkward character and is not: on
+Windows it means a drive or an alternate data stream. Cleaning it to
+`_` would have turned `C:` into the perfectly ordinary-looking `C_` --
+a dangerous name made to look safe, which is precisely how this change
+could have made things worse. The existing escape test caught it, which
+is the second time that test has earned its keep.
+
+A refusal is now also loud on the machine *receiving* the files, not
+only in the reply to the sender. A paste where nothing happens and
+nothing anywhere says why is the shape of fault this project keeps
+paying for.
 
 **The third attempt worked, and it is measured.** Input moved to
 `Winlogon` at 01:52:44.162, the cursor was handed back at .166, a worker
@@ -947,6 +987,17 @@ when they differ, and `mind_workers` tells it what it saw on every look
 rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
 
+**Refusing is not the safe default; it is a different risk.** A check
+that refuses everything doubtful looks conservative and reads as
+careful, and for a week it silently stopped a person transferring their
+own files. Danger and awkwardness are different questions and deserve
+different answers: ask what is actually at stake if the input is
+hostile, and if the answer is "the name would look odd", clean it and
+carry on. If the answer is "it might not land where it was meant to",
+refuse. When separating the two, check that nothing in the cleaning can
+produce something the refusal would have caught -- that is the way the
+change goes wrong.
+
 **Anything that belongs to a session is wrong in a service, and the
 compiler cannot tell you which things those are.** The desktop was the
 first. The clipboard was the second, found the same way -- on a machine,
@@ -978,6 +1029,26 @@ the result was a log that looked like a healthy service and a machine
 that did nothing. Both the no-session wait and the nobody-is-watching
 case now say so once, latched, at info. This is the silent refused
 injection again, in a third costume.
+
+**The worker is a whole process, and it had no voice.** It injected
+every keystroke perfectly -- so the pipe demonstrably worked -- and
+wrote not one line to the log file across three restarts, which made it
+impossible to tell a clipboard that failed to start from a clipboard
+that was never asked for. Why its own logging was silent is still not
+known. What is fixed is the dependence on it: anything worth knowing
+now goes *both* into the worker's log and down the pipe as
+`FromWorker::Said`, which the service writes with a `worker:` prefix.
+Which of the two arrives is itself a diagnosis. The worker also says an
+inventory at startup -- desktop, whether it has capture, where it
+thinks its log is -- and is started with `--unattended` so it never
+decides where to log by asking whether stderr looks like a terminal.
+
+**How to check the clipboard, which is not by reading a log.** Put a
+marker on another machine's clipboard, hold it, and read the clipboard
+*inside the person's session*: a throwaway scheduled task running as
+that account at `LeastPrivilege`, doing `Get-Clipboard`. Anything else
+-- including everything in the service's log -- tells you only that an
+offer was made, not that it reached the person.
 
 **A panicking thread is silent in a service.** A panic prints to stderr
 and unwinds that thread; a service has no stderr anybody reads, so the
