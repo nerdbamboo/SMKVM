@@ -44,6 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
 
+use crate::RENDER_BUDGET;
 use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
 
 /// How long to keep trying to open the clipboard.
@@ -64,11 +65,45 @@ const SETTLE_TIMER: usize = 1;
 /// milliseconds apart; two copies by a person are never this close.
 const SETTLE_MS: u32 = 60;
 
+/// The system's own words for the last error, and its number.
+///
+/// The number matters as much as the words. These machines are Korean,
+/// so every message the system produces comes back in Korean -- and if
+/// anything about the decoding is wrong it arrives as mojibake, which
+/// is unreadable and unsearchable both. A bare number can always be
+/// looked up. `FormatMessageW` is used explicitly rather than left to
+/// anything that might reach for the ANSI form, and the text is
+/// trimmed because the system ends its messages with a newline.
+fn describe_win32(code: u32) -> String {
+    use windows::Win32::System::Diagnostics::Debug::{
+        FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+    };
+    let mut buffer = [0u16; 512];
+    // SAFETY: the buffer is valid for its own length, and no inserts are
+    // read because the flag says to ignore them.
+    let len = unsafe {
+        FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            None,
+            code,
+            0,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            buffer.len() as u32,
+            None,
+        )
+    };
+    let said = String::from_utf16_lossy(&buffer[..len as usize]);
+    let said = said.trim();
+    if said.is_empty() {
+        format!("error {code}")
+    } else {
+        format!("{said} (error {code})")
+    }
+}
+
 fn last_error(what: &str) -> ClipboardError {
-    ClipboardError::Display(format!(
-        "{what}: {}",
-        windows::core::Error::from_win32().message()
-    ))
+    let code = windows::core::Error::from_win32().code().0 as u32 & 0xFFFF;
+    ClipboardError::Display(format!("{what}: {}", describe_win32(code)))
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -263,6 +298,7 @@ fn render(format_id: u32) {
         };
         tracing::debug!(format_id, ?wanted, "something here is pasting");
 
+        let asked_at = Instant::now();
         let bytes = match state.cache.get(&wanted) {
             Some(cached) => cached.clone(),
             None => match source.fetch(&wanted) {
@@ -276,6 +312,21 @@ fn render(format_id: u32) {
                 }
             },
         };
+
+        // Kept even when it is too late to use, because the next paste
+        // will find it here and be instant. A fetch that arrives after
+        // its render is not wasted, only mistimed.
+        let took = asked_at.elapsed();
+        if took > RENDER_BUDGET {
+            tracing::warn!(
+                ?wanted,
+                took_ms = took.as_millis() as u64,
+                "the contents arrived too late to hand over -- the clipboard closed while \
+                 they were being fetched, so this paste produced nothing. They are kept, \
+                 so pasting again will be immediate"
+            );
+            return;
+        }
 
         match write_native(formats, &wanted, format_id, &bytes) {
             Ok(()) => tracing::debug!(format_id, ?wanted, bytes = bytes.len(), "handed over"),

@@ -75,6 +75,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 pub mod acl;
+pub mod budget;
 pub mod carry;
 pub mod plan;
 pub mod reach;

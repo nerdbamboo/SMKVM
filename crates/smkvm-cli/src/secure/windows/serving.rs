@@ -12,6 +12,7 @@
 
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -27,6 +28,20 @@ pub struct Serving {
     write: Box<dyn Write + Send>,
     /// Pastes this process is in the middle of, waiting on the service.
     pastes: Arc<Waiting<Result<Vec<u8>, String>>>,
+    /// What each outstanding question was about, so that an answer
+    /// arriving after its asker gave up can still be put somewhere
+    /// useful.
+    asked: Arc<Mutex<HashMap<u64, ClipFormat>>>,
+    /// Contents that arrived too late for the render that wanted them.
+    ///
+    /// A render has a few seconds; a first fetch across a pipe and a
+    /// network may not fit. Rather than make the render wait longer --
+    /// which is what left data being handed to a closed clipboard --
+    /// the late answer is kept here and the *next* paste is instant.
+    /// So the worst case is one paste that does nothing and a second
+    /// that works, rather than a minute of nothing and a warning
+    /// nobody sees.
+    ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>>,
 }
 
 /// Somewhere to put a frame, whichever thread is holding one.
@@ -68,11 +83,26 @@ pub fn tell(speak: &Speak, level: Level, text: impl Into<String>) {
 struct AskTheService {
     speak: Speak,
     pastes: Arc<Waiting<Result<Vec<u8>, String>>>,
+    asked: Arc<Mutex<HashMap<u64, ClipFormat>>>,
+    ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>>,
 }
 
 impl Fetch for AskTheService {
     fn fetch(&self, format: &ClipFormat) -> smkvm_clipboard::Result<Vec<u8>> {
+        // Something an earlier render asked for and did not get in
+        // time. No round trip at all.
+        if let Some(bytes) = self.ready.lock().expect("not poisoned").remove(format) {
+            tracing::debug!(
+                ?format,
+                "pasting what arrived too late for the last attempt"
+            );
+            return Ok(bytes);
+        }
         let (id, answer) = self.pastes.ask();
+        self.asked
+            .lock()
+            .expect("not poisoned")
+            .insert(id, format.clone());
         tracing::debug!("something here is pasting {format:?}; asking the service for it");
         (self.speak)(&FromWorker::Said {
             level: Level::Info,
@@ -83,20 +113,28 @@ impl Fetch for AskTheService {
             format: format.clone(),
         }) {
             self.pastes.forget(id);
+            self.asked.lock().expect("not poisoned").remove(&id);
             return Err(smkvm_clipboard::ClipboardError::Display(
                 "the service is not there to fetch what was copied".into(),
             ));
         }
         match answer.recv_timeout(PASTE_WITHIN) {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(e)) => Err(smkvm_clipboard::ClipboardError::Display(e)),
-            Err(_) => {
-                self.pastes.forget(id);
-                Err(smkvm_clipboard::ClipboardError::Display(format!(
-                    "the machine that copied this did not answer within {} s",
-                    PASTE_WITHIN.as_secs()
-                )))
+            Ok(Ok(bytes)) => {
+                self.asked.lock().expect("not poisoned").remove(&id);
+                Ok(bytes)
             }
+            Ok(Err(e)) => {
+                self.asked.lock().expect("not poisoned").remove(&id);
+                Err(smkvm_clipboard::ClipboardError::Display(e))
+            }
+            // Given up on, deliberately and early. The question is left
+            // outstanding: whatever comes back goes into `ready`, and
+            // the next paste needs no round trip.
+            Err(_) => Err(smkvm_clipboard::ClipboardError::Display(format!(
+                "the contents did not arrive within {} ms, so this paste produced \
+                 nothing. They are still being fetched; pasting again should work",
+                PASTE_WITHIN.as_millis()
+            ))),
         }
     }
 }
@@ -122,6 +160,8 @@ impl Serving {
         speak: Speak,
     ) -> Result<Serving> {
         let pastes = Arc::new(Waiting::new());
+        let asked: Arc<Mutex<HashMap<u64, ClipFormat>>> = Arc::new(Mutex::new(HashMap::new()));
+        let ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         // Copies are noticed on their own thread, because `next_change`
         // blocks until one happens and the main loop has instructions
         // to be answering meanwhile.
@@ -146,6 +186,8 @@ impl Serving {
             read,
             write,
             pastes,
+            asked,
+            ready,
         })
     }
 
@@ -154,9 +196,14 @@ impl Serving {
     }
 
     pub fn offer(&mut self, formats: &[ClipFormat], speak: Speak) -> Result<(), String> {
+        // A new offer is a new set of contents; whatever was kept from
+        // the last one is not what this announces.
+        self.ready.lock().expect("not poisoned").clear();
         let source = AskTheService {
             speak,
             pastes: self.pastes.clone(),
+            asked: self.asked.clone(),
+            ready: self.ready.clone(),
         };
         self.write
             .offer(formats, Box::new(source))
@@ -168,8 +215,30 @@ impl Serving {
     }
 
     /// The service has fetched what a paste was waiting for.
+    ///
+    /// If nothing is waiting any more -- the render gave up, which is
+    /// the ordinary case for a first paste of anything large -- the
+    /// contents are kept for the next one rather than thrown away. That
+    /// is the difference between "paste twice" and "paste, wait a
+    /// minute, get nothing".
     pub fn pasted(&self, id: u64, bytes: Result<Vec<u8>, String>) {
-        self.pastes.answer(id, bytes);
+        let format = self.asked.lock().expect("not poisoned").remove(&id);
+        let ok = bytes.clone().ok();
+        if self.pastes.answer(id, bytes) {
+            return;
+        }
+        if let (Some(format), Some(bytes)) = (format, ok) {
+            tracing::debug!(
+                ?format,
+                bytes = bytes.len(),
+                "these arrived after the paste that wanted them gave up; keeping them so \
+                 the next paste is immediate"
+            );
+            self.ready
+                .lock()
+                .expect("not poisoned")
+                .insert(format, bytes);
+        }
     }
 
     /// Nothing more will be answered; wake anything mid-paste.

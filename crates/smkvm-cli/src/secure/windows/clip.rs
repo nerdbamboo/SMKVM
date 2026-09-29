@@ -69,14 +69,7 @@ use crate::secure::wire::ToWorker;
 /// replaced does not hold up the exchange.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 
-/// How long the worker waits for the service to fetch what is being
-/// pasted.
-///
-/// This one is a network round trip to another machine, and it is
-/// blocking an application mid-paste, so it is a balance between giving
-/// a slow link time and leaving somebody's editor wedged. Thirty
-/// seconds is the same order as the transfer timeouts elsewhere.
-pub const PASTE_WITHIN: Duration = Duration::from_secs(30);
+pub use crate::secure::budget::{PASTE_WITHIN, SERVICE_FETCH_WITHIN};
 
 /// Questions asked over the pipe that are still waiting for an answer.
 ///

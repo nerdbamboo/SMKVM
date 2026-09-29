@@ -26,6 +26,24 @@ pub mod platform;
 
 use smkvm_proto::ClipFormat;
 
+/// How long a paste may take before what it produces is worthless.
+///
+/// A paste is served while the pasting application waits, and on
+/// Windows the clipboard is open only for the length of that. Take
+/// longer than the requester's patience and the data is handed to a
+/// clipboard that closed while it was being fetched -- which is worse
+/// than handing over nothing, because the person gets an empty paste
+/// long after pressing the keys and a warning they will never see.
+/// That happened on a real machine: sixty seconds, then a successful
+/// fetch into `ERROR_CLIPBOARD_NOT_OPEN`.
+///
+/// Here rather than in the Windows backend because it is not a fact
+/// about Windows -- it is the outermost of a set of nested deadlines,
+/// and every wait inside a paste has to expire before it does. Putting
+/// it where every build can see it is what lets that ordering be
+/// tested on a machine that cannot run any of the code it governs.
+pub const RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
 pub type Result<T> = std::result::Result<T, ClipboardError>;
 
 #[derive(Debug, thiserror::Error)]

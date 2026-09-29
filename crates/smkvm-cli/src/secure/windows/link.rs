@@ -49,7 +49,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::secure::reach::Reach;
 use crate::secure::watch;
-use crate::secure::windows::clip::Waiting;
+use crate::secure::windows::clip::{Waiting, SERVICE_FETCH_WITHIN};
 use crate::secure::windows::pipe::{Pipe, WRITE_WITHIN};
 use crate::secure::wire::{frame, FromWorker, Level, ToWorker};
 
@@ -375,11 +375,45 @@ impl Link {
         let started = std::thread::Builder::new()
             .name("smkvm-paste".into())
             .spawn(move || {
+                // Never queued behind another fetch. Waiting for one in
+                // flight is how a second render came to take sixty
+                // seconds -- thirty behind the first, thirty of its
+                // own -- and produce data for a clipboard that had long
+                // since closed. A paste that cannot start now is
+                // refused now, and the one already running will leave
+                // its answer where the next paste finds it.
+                let Ok(source) = source.try_lock() else {
+                    link.say(&ToWorker::Pasted {
+                        id,
+                        bytes: Err(
+                            "these contents are already being fetched for another paste; \
+                             try again in a moment"
+                                .into(),
+                        ),
+                    });
+                    return;
+                };
+                let asked_at = Instant::now();
                 let bytes = source
-                    .lock()
-                    .expect("not poisoned")
                     .fetch(&format)
                     .map_err(|e| format!("fetching what was copied: {e}"));
+                let took = asked_at.elapsed();
+                if took > SERVICE_FETCH_WITHIN {
+                    // Said, because it is the one number that decides
+                    // whether a paste works first time. The share of
+                    // the render's budget this hop is allowed is
+                    // `SERVICE_FETCH_WITHIN`; past it the worker has
+                    // stopped listening and the contents will be kept
+                    // for the next paste instead of serving this one.
+                    tracing::warn!(
+                        ?format,
+                        took_ms = took.as_millis() as u64,
+                        budget_ms = SERVICE_FETCH_WITHIN.as_millis() as u64,
+                        "the far machine took longer than a paste can wait, so this paste \
+                         produced nothing; the contents are kept and pasting again should \
+                         be immediate"
+                    );
+                }
                 link.say(&ToWorker::Pasted { id, bytes });
             });
         if started.is_err() {
