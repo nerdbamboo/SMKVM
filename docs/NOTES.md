@@ -410,6 +410,40 @@ wrong with the worker's own logging. `WM_RENDERFORMAT entered` is
 written as the first statement of the handler, before it looks at
 anything.
 
+**A hang with nowhere to look, because only one end of the handler
+said anything.** The data arrives instantly and correctly -- both hops
+measured at zero milliseconds, seventeen bytes for a seventeen-byte
+marker -- and then the log stops. No hand-over, no error, no renewal,
+while the process goes on logging other things and the pasting
+application never returns.
+
+What made that hard to place is a fault in the instrumentation rather
+than in the code. `WM_RENDERFORMAT entered` was said; nothing said
+whether it came back. The absence of a further line was doing the work
+of evidence, and it only worked at all because somebody could see the
+log carry on with unrelated traffic. Both ends are said now, with the
+outcome between them and how long it took:
+
+    clipboard: WM_RENDERFORMAT entered for format 13
+    clipboard: WM_RENDERFORMAT for format 13 returned after 2 ms: served it, 17 bytes
+
+Reading the code in that gap ruled out the obvious candidates rather
+than confirming one: `write_raw` has no loop, no `OpenClipboard` and
+no blocking call -- which is correct for a render, since the requester
+already holds the clipboard open -- so the hand-over itself cannot
+hang. That leaves either something after the handler returns, or a
+path not yet visible. The next run says which, and that is the point.
+
+**And the renewal could run on the success path.** Whether to promise
+again was a `bool` threaded through the body, set in three places, and
+nothing prevented the path that *succeeded* from setting it. Renewing
+a promise that was just kept is not a small mistake: it re-takes the
+clipboard, which empties it, which throws away the data handed over a
+moment earlier. It is now `Rendered`, returned by the render and acted
+on by the caller, with `needs_renewing` beside the outcomes and tested
+-- including the case that matters, that a kept promise is never made
+again.
+
 **UIPI was it, and the filter is the cure.** Under the service, with
 the filter asked for, the handler is entered:
 
@@ -475,8 +509,13 @@ at:
 
 - `clipboard: WM_RENDERFORMAT entered`, then `a paste waited on the
   service waited_ms=...`, then `the far machine answered a paste
-  took_ms=...`. Those three bracket the whole cost, and the difference
-  between the outer two is what the pipe and this code add to it.
+  took_ms=...`, and now `WM_RENDERFORMAT for format 13 returned after
+  N ms: ...`. Those bracket the whole cost. All four have been seen
+  except the last, which is the one that says whether the handler
+  comes back at all -- and if it does not appear, the hang is inside
+  the handler and after the hand-over; if it appears and the paste
+  still does not finish, the hang is somewhere after the handler
+  returns and nothing in this file is the cause.
 - `pasting what arrived too late for the last attempt` on a second
   paste is the cache doing what was promised. Its absence means the
   cache is still being cleared underneath, which the self-collision
@@ -1195,6 +1234,25 @@ input-desktop update. Log off while a worker is running and neither ran:
 no session on it, claiming input was landing, until the next injection
 timed out a second later. The wait now goes *after* the observing, and
 detaches before it waits.
+
+**A success path that shares code with a failure path needs a test
+that it does not do the failure path's work.** The renewal was written
+for the case where the contents do not arrive, and lived in the same
+function as the case where they do, joined by a mutable flag. Nothing
+in the type system, the tests or the review stopped the good path
+taking the bad path's action -- and that action was the exact opposite
+of what had just been achieved. Where two paths share a function and
+only one should act, return what happened and let the caller decide;
+then the decision is one function with a name, and it can be tested
+without a machine.
+
+**Log the thing that worked, not only the things that did not.** A
+handler that says "entered" and nothing else leaves a hang
+indistinguishable from a silence, and reading it requires noticing
+that *other* traffic continued. One line saying `served it, 17 bytes`
+would have placed this in a second. Every exit says so now, success
+included, and the entry line is paired with a return line carrying the
+elapsed time.
 
 **A guard that remembers cannot count, and one copy is several
 notices.** The self-change guard was a boolean set on taking the
