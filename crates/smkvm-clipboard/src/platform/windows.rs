@@ -28,7 +28,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -38,14 +38,15 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer, TranslateMessage, HWND_MESSAGE,
-    MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WM_RENDERALLFORMATS,
-    WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetMessageW, KillTimer, PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer,
+    TranslateMessage, HWND_MESSAGE, MSG, MSGFLT_ALLOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_CLIPBOARDUPDATE, WM_DESTROYCLIPBOARD, WM_QUIT, WM_RENDERALLFORMATS, WM_RENDERFORMAT,
+    WM_TIMER, WNDCLASSW,
 };
 
-use crate::RENDER_BUDGET;
 use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
+use crate::{witness, RENDER_BUDGET};
 
 /// How long to keep trying to open the clipboard.
 ///
@@ -507,16 +508,23 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RENDERFORMAT => {
+            // First thing, before anything is looked at. Whether this
+            // line appears is the whole of the difference between "the
+            // handler did not run" and "the handler ran and said
+            // nothing", and telling those apart has cost three rounds.
+            witness(&format!("WM_RENDERFORMAT entered for format {}", wparam.0));
             render(window, wparam.0 as u32);
             LRESULT(0)
         }
         WM_RENEW => {
+            witness("promising the far machine's clipboard again");
             if let Err(e) = take_clipboard(window) {
                 tracing::warn!("could not promise the far machine's clipboard again: {e}");
             }
             LRESULT(0)
         }
         WM_RENDERALLFORMATS => {
+            witness("WM_RENDERALLFORMATS entered; everything promised is wanted now");
             // The process is going away; anything promised has to be made real
             // now or it vanishes with us.
             STATE.with(|cell| {
@@ -589,6 +597,24 @@ fn take_clipboard(window: HWND) -> Result<()> {
             let _ = unsafe { SetClipboardData(id, HANDLE::default()) };
         }
     }
+    // Who the system thinks owns it, rather than who we asked it to.
+    // If these ever differ, nothing inside the render matters and the
+    // question is which window holds the promise -- which is the first
+    // thing to establish and was, for three rounds, unestablished.
+    // SAFETY: reading the owner takes no pointers.
+    let owner = unsafe { GetClipboardOwner() }.map(|o| o.0).ok();
+    witness(&format!(
+        "promised {:?}; the clipboard's owner is now window={:?}, and this window is \
+         {:?} ({})",
+        offered,
+        owner.unwrap_or(std::ptr::null_mut()),
+        window.0,
+        if owner == Some(window.0) {
+            "the same"
+        } else {
+            "NOT the same -- renders will go elsewhere"
+        }
+    ));
     Ok(())
 }
 
@@ -798,6 +824,50 @@ fn clipboard_thread(
 
     // SAFETY: no pointers involved.
     let thread_id = unsafe { GetCurrentThreadId() };
+
+    // A window of a higher integrity level than the process asking it
+    // for something does not, by default, receive that ask. Windows
+    // drops the message and tells nobody -- which is the same rule,
+    // with the same silence, as the very first fault this program ever
+    // had: `SendInput` refused by UIPI, returning zero and saying
+    // nothing.
+    //
+    // It matters here and nowhere else in this program's history
+    // because the worker runs as the system account, and the
+    // application the person is pasting into does not. Delayed
+    // rendering works by the system sending `WM_RENDERFORMAT` to the
+    // clipboard's owner on behalf of whoever is pasting; from a medium
+    // integrity application to a system integrity window, that send is
+    // exactly what UIPI exists to stop. The clipboard then lists the
+    // formats, names us as the owner, and yields nothing -- with no
+    // handler ever entered, which is precisely what a real machine
+    // showed.
+    //
+    // Under the scheduled task none of this arises: that daemon runs at
+    // high integrity but in the person's own session, and the same code
+    // pastes correctly there. The control is what makes this the
+    // explanation rather than a guess.
+    //
+    // Asking for each message by name rather than turning the filter
+    // off wholesale: these three are what a clipboard owner must
+    // receive, and nothing else needs to reach a window running as the
+    // system account.
+    for message in [WM_RENDERFORMAT, WM_RENDERALLFORMATS, WM_DESTROYCLIPBOARD] {
+        // SAFETY: a window this thread made, and no filter structure.
+        if unsafe { ChangeWindowMessageFilterEx(window, message, MSGFLT_ALLOW, None) }.is_err() {
+            tracing::warn!(
+                message,
+                "could not ask to receive this message from lower-privileged \
+                 applications; if this process is more privileged than they are, pasting \
+                 will produce nothing"
+            );
+        }
+    }
+
+    witness(&format!(
+        "the clipboard window is up: window={:?} thread={thread_id}",
+        window.0
+    ));
     let _ = ready.send(Ok((thread_id, formats)));
 
     let mut message = MSG::default();

@@ -153,12 +153,31 @@ impl Serving {
         )
     }
 
+    /// Point the clipboard crate's most important lines at the pipe.
+    ///
+    /// Its own `tracing` output has been unreliable in this process in
+    /// a way nobody has pinned down, and the pipe demonstrably is not:
+    /// it carries every keystroke. Three rounds have been spent unable
+    /// to tell "the render did not run" from "the render ran and said
+    /// nothing", so the render now says it through the channel that is
+    /// known to survive.
+    fn speak_for_the_clipboard(speak: &Speak) {
+        let speak = speak.clone();
+        smkvm_clipboard::witness_through(Box::new(move |text| {
+            speak(&FromWorker::Said {
+                level: Level::Info,
+                text: format!("clipboard: {text}"),
+            });
+        }));
+    }
+
     fn from_parts(
         watch: Box<dyn Watch + Send>,
         read: Box<dyn Read + Send>,
         write: Box<dyn Write + Send>,
         speak: Speak,
     ) -> Result<Serving> {
+        Self::speak_for_the_clipboard(&speak);
         let pastes = Arc::new(Waiting::new());
         let asked: Arc<Mutex<HashMap<u64, ClipFormat>>> = Arc::new(Mutex::new(HashMap::new()));
         let ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));

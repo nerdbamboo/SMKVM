@@ -44,6 +44,44 @@ use smkvm_proto::ClipFormat;
 /// tested on a machine that cannot run any of the code it governs.
 pub const RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// Somewhere to say things that must not be lost.
+///
+/// This crate logs through `tracing` like everything else, and in the
+/// worker that has been unreliable in a way nobody has pinned down --
+/// three rounds of diagnosis have been spent unable to tell "the code
+/// did not run" from "the code ran and said nothing". The caller can
+/// set this to a second, independent way of speaking: in the worker it
+/// relays down the pipe to the service, which is the one channel known
+/// to work because it carries every keystroke.
+///
+/// Set once, by whoever knows where words should go. Never read for
+/// anything but saying something.
+type Saying = Box<dyn Fn(&str) + Send + Sync>;
+static WITNESS: std::sync::OnceLock<Saying> = std::sync::OnceLock::new();
+
+/// Say where this crate's most important lines should also go.
+pub fn witness_through(say: Saying) {
+    let _ = WITNESS.set(say);
+}
+
+/// Say something twice: once into the log, once wherever
+/// [`witness_through`] points.
+///
+/// For the handful of things whose absence is itself the diagnosis --
+/// a window being made, a promise being taken, a render being entered.
+/// A paste is a human action, so none of these is frequent enough to
+/// be worth being quiet about.
+// Only the Windows backend has anything whose absence is itself the
+// diagnosis; on X11 the clipboard runs in the person's own session and
+// none of this arises.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn witness(text: &str) {
+    tracing::info!("{text}");
+    if let Some(say) = WITNESS.get() {
+        say(text);
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ClipboardError>;
 
 #[derive(Debug, thiserror::Error)]
