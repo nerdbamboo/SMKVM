@@ -1581,6 +1581,25 @@ killed hard, its report goes stale after 15 s and the next start is allowed.
 cross-compiling from Linux, hence the `pure` feature. Anything else pulling in
 assembly will need the same treatment.
 
+**`SetClipboardData` returns null on success, and Rust cannot say so.**
+The call returns the handle it was given. A delayed-render promise
+gives it null, so a successful promise returns null -- and
+`windows-rs` maps a null return to `Err(Error::from_win32())`, which
+carries whatever `GetLastError` happened to be holding from some
+earlier, unrelated call. The first version of the read-back below
+printed that as `REFUSED (error 6)` on every promise ever made, next
+to `listed` in the same line, and the contradiction was read as a real
+refusal rather than as a broken diagnostic. The error is cleared with
+`SetLastError(0)` before the call now, so a null return with the error
+still clear is read as what it is. `promise_said` is a pure function
+with tests because getting this wrong once already cost a round.
+
+The general form is worth keeping: **a diagnostic that can only say
+"failed" will say it, and be believed.** Two independent readings of
+the same fact -- the call's result and `IsClipboardFormatAvailable` --
+are what caught this, and when they disagree the line now says so
+instead of picking one.
+
 **Ask the system what it is holding, and never with `GetClipboardData`
 from the owner.** The promise at the start of the delayed-rendering
 chain is `SetClipboardData(format, NULL)`, and its result was thrown
@@ -1600,6 +1619,16 @@ Reading the promise that way destroys it. What `GetClipboardData`
 returns is the most valuable of the four values, and it can only be
 asked by a process that is pasting.
 
+**A single sample is not a measurement.** `smkvm status` caught
+Windows Defender's session helper holding the clipboard for an instant
+-- perfectly normal, every copy and paste does it -- and announced
+that nothing in the session could copy or paste. True of that instant,
+false of the situation, and alarming. It samples five times over a
+second now, and only a holder present in every sample gets the
+verdict; a holder seen in some of them is named and called normal. A
+diagnostic exists to be trusted, so an alarming sentence about an
+ordinary event is worse than no sentence at all.
+
 **`smkvm status` prints the four values.** Who owns the clipboard,
 which formats it lists, whether anything is holding it open, and what
 a paste returns for each format with how long it took. Those four
@@ -1615,7 +1644,7 @@ collected its outcomes into a list and then never said them -- the one
 message able to quietly replace a promise was also the only one that
 reported nothing.
 
-**Measure from inside the session.** Five faults in the clipboard path
+**Measure from inside the session.** Six faults in the clipboard path
 so far, and not one was found by reading the code or the log. Each was
 found by asking the running system a question from the session it was
 in. The pattern is consistent enough to be a rule: when a theory and a

@@ -168,6 +168,49 @@ impl Rendered {
     }
 }
 
+/// What to say about one delayed-rendering promise, given what the
+/// three questions answered.
+///
+/// `handed_back` is whether `SetClipboardData` returned a handle,
+/// `last` is the error number left behind when it did not, and
+/// `listed` is what `IsClipboardFormatAvailable` said afterwards.
+///
+/// This is a pure function with tests because getting it wrong once
+/// already cost a round. `SetClipboardData` returns the handle it was
+/// given, and a delayed-render promise gives it a null one -- so on
+/// success it returns null, which the Rust binding cannot tell from
+/// failure and reports as an error carrying whatever `GetLastError`
+/// happened to hold. Read naively that says the promise was refused
+/// at the moment it was made. The way out is the one Win32 has always
+/// documented for a call that can return null on success: clear the
+/// error first, and if the result is null with the error still clear,
+/// the call succeeded.
+pub fn promise_said(handed_back: bool, last: u32, listed: bool) -> String {
+    let made = handed_back || last == 0;
+    let how = if handed_back {
+        "promised".to_string()
+    } else if last == 0 {
+        // The ordinary case, and it happens every single time.
+        "promised (returned null, which is the promise itself)".to_string()
+    } else {
+        format!("REFUSED (error {last})")
+    };
+    let seen = match (listed, made) {
+        (true, _) => "listed",
+        // A promise the system accepted but does not list is the one
+        // combination that means nothing can ever paste it.
+        (false, true) => "NOT LISTED -- nothing can paste it",
+        (false, false) => "not listed, which agrees",
+    };
+    if !made && listed {
+        // Said loudly because reading half of this is how a refusal
+        // that never happened became a whole round of work.
+        format!("{how} BUT {seen} -- these disagree; trust the listing")
+    } else {
+        format!("{how}, {seen}")
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ClipboardError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -269,7 +312,7 @@ pub trait CatchDrag: Send {
 
 #[cfg(test)]
 mod rendered_tests {
-    use super::Rendered;
+    use super::{promise_said, Rendered};
 
     #[test]
     fn a_promise_that_was_kept_is_never_made_again() {
@@ -310,5 +353,38 @@ mod rendered_tests {
         ] {
             assert!(!outcome.said().is_empty(), "{outcome:?} says nothing");
         }
+    }
+
+    #[test]
+    fn a_null_return_with_no_error_is_the_promise_not_a_refusal() {
+        // The whole point. This is what every successful promise looks
+        // like from Rust, and calling it a refusal cost a round.
+        let said = promise_said(false, 0, true);
+        assert!(said.contains("promised"), "{said}");
+        assert!(!said.contains("REFUSED"), "{said}");
+    }
+
+    #[test]
+    fn a_stale_error_number_does_not_make_it_a_refusal_when_the_format_is_listed() {
+        // What was actually seen on the machine: error 6, and the
+        // format listed in the same breath. Both halves are reported,
+        // and the contradiction is named rather than resolved
+        // silently.
+        let said = promise_said(false, 6, true);
+        assert!(said.contains("disagree"), "{said}");
+        assert!(said.contains("trust the listing"), "{said}");
+    }
+
+    #[test]
+    fn a_promise_the_system_took_but_does_not_list_is_the_one_that_matters() {
+        let said = promise_said(true, 0, false);
+        assert!(said.contains("NOT LISTED"), "{said}");
+    }
+
+    #[test]
+    fn a_refusal_the_listing_agrees_with_reads_as_a_refusal() {
+        let said = promise_said(false, 6, false);
+        assert!(said.contains("REFUSED"), "{said}");
+        assert!(!said.contains("disagree"), "{said}");
     }
 }

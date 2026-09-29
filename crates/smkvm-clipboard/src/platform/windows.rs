@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 
 use smkvm_proto::ClipFormat;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    SetLastError, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
     GetClipboardData, GetClipboardOwner, GetOpenClipboardWindow, IsClipboardFormatAvailable,
@@ -89,6 +91,19 @@ const WM_RENEW: u32 = WM_APP + 3;
 /// copying and pasting on the machine itself starts working again even
 /// though what the other machine offered is lost.
 const RENEWALS_BEFORE_GIVING_UP: u32 = 3;
+
+/// How many times `smkvm status` looks to see whether the clipboard is
+/// held open, and how long it leaves between looks.
+///
+/// Spread across roughly a second, which is long enough that an
+/// application merely copying or pasting will have let go, and short
+/// enough that nobody minds the command taking it.
+const HELD_OPEN_SAMPLES: usize = 5;
+const HELD_OPEN_GAP: Duration = Duration::from_millis(200);
+
+/// How many times `smkvm status` will wait out `OPEN_PATIENCE` before
+/// reporting that the clipboard could not be opened.
+const OPEN_ATTEMPTS_FOR_STATUS: u32 = 4;
 
 /// The timer that lets a burst of change notices settle into one report.
 const SETTLE_TIMER: usize = 1;
@@ -650,11 +665,22 @@ fn take_clipboard(window: HWND) -> Result<()> {
             // A null handle is the promise: the data is produced only if
             // something pastes it.
             // SAFETY: promising a format takes no memory.
+            //
+            // The error is cleared first, and that is not a
+            // formality. `SetClipboardData` returns the handle it was
+            // given; a promise gives it null, so on success it returns
+            // null, which the Rust binding cannot tell from failure --
+            // it reports an error carrying whatever `GetLastError`
+            // last held. Reported naively that reads as a refusal on
+            // every promise ever made, and it did: a stale
+            // `ERROR_INVALID_HANDLE` from some earlier call was taken
+            // for the promise being rejected. Clearing the error first
+            // is what Win32 has always documented for a call that can
+            // return null on success.
+            // SAFETY: clearing the thread's last-error value.
+            unsafe { SetLastError(WIN32_ERROR(0)) };
             let set = unsafe { SetClipboardData(id, HANDLE::default()) };
-            let took = match set {
-                Ok(_) => "promised".to_string(),
-                Err(_) => format!("REFUSED ({})", describe_win32(last_win32())),
-            };
+            let last = last_win32();
             // Asked of the system rather than assumed. `IsClipboardFormatAvailable`
             // is the only read that is safe from this side: it answers
             // from the list of formats without touching the data.
@@ -672,12 +698,8 @@ fn take_clipboard(window: HWND) -> Result<()> {
             // SAFETY: asking whether a format is listed takes no pointers.
             let listed = unsafe { IsClipboardFormatAvailable(id) }.is_ok();
             promises.push(format!(
-                "{id}: {took}, {}",
-                if listed {
-                    "listed"
-                } else {
-                    "NOT LISTED -- nothing can paste it"
-                }
+                "{id}: {}",
+                crate::promise_said(set.is_ok(), last, listed)
             ));
         }
     }
@@ -715,6 +737,31 @@ fn take_clipboard(window: HWND) -> Result<()> {
              while that is true"
         ));
     }
+    // The thread that made the promise, against the thread that owns
+    // the window it was made for.
+    //
+    // `SetClipboardData` requires the calling thread to be the one
+    // holding the clipboard open, on a window belonging to that
+    // thread, and nothing in the original single-process code ever had
+    // to name a thread. Splitting the work across a service and a
+    // worker made that assumption worth checking rather than assuming,
+    // so both numbers are said and compared. If they ever differ, the
+    // fix is to do the work on the thread that owns the window rather
+    // than wherever the instruction happened to arrive.
+    // SAFETY: both take no pointers beyond the place for the id.
+    let (here, owns) = unsafe {
+        let mut owning = 0u32;
+        let owns = GetWindowThreadProcessId(window, Some(&mut owning));
+        (GetCurrentThreadId(), owns)
+    };
+    witness(&format!(
+        "promising on thread {here}; the window belongs to thread {owns} ({})",
+        if here == owns {
+            "the same, which is what SetClipboardData requires"
+        } else {
+            "NOT the same -- SetClipboardData will refuse"
+        }
+    ));
     witness(&format!(
         "what the system says it now holds: [{}]",
         promises.join("; ")
@@ -784,16 +831,63 @@ pub fn verdict() -> Vec<String> {
         }
     }
 
-    match who_is_holding_it_open() {
-        None => lines.push("held open       no -- nothing is holding it open".to_string()),
-        Some((window, pid)) => lines.push(format!(
-            "held open       YES, by window {window:#x} of process {pid}. Nothing in this \
-             session can copy or paste until that lets go"
+    // Sampled repeatedly, because one sample cannot tell a passer-by
+    // from a squatter and the difference is the whole meaning of the
+    // line.
+    //
+    // Every application that copies or pastes holds the clipboard for
+    // an instant, and on these machines Windows Defender's session
+    // helper does it often. The first version of this line caught one
+    // of those and announced that nothing in the session could copy or
+    // paste -- true of that instant, false of the situation, and
+    // alarming. A diagnostic exists to be trusted, so an alarming
+    // sentence about an ordinary event is worse than no sentence. Only
+    // a holder present in every sample gets the verdict; anything else
+    // is named without one.
+    let mut samples = Vec::new();
+    for i in 0..HELD_OPEN_SAMPLES {
+        samples.push(who_is_holding_it_open());
+        if i + 1 < HELD_OPEN_SAMPLES {
+            std::thread::sleep(HELD_OPEN_GAP);
+        }
+    }
+    let held = samples.iter().filter_map(|s| *s).count();
+    let ever = samples.iter().find_map(|s| *s);
+    match (held, ever) {
+        (0, _) | (_, None) => lines.push(format!(
+            "held open       no -- free in all {HELD_OPEN_SAMPLES} samples over the last second"
+        )),
+        (n, Some((window, pid))) if n == HELD_OPEN_SAMPLES => lines.push(format!(
+            "held open       YES, by window {window:#x} of process {pid}, in all {n} samples \
+             over the last second.\n\x20               Nothing in this session can copy or \
+             paste until that lets go"
+        )),
+        (n, Some((window, pid))) => lines.push(format!(
+            "held open       briefly, by window {window:#x} of process {pid}, in {n} of \
+             {HELD_OPEN_SAMPLES} samples.\n\x20               That is what an application \
+             copying or pasting looks like, and is normal"
         )),
     }
 
-    let Ok(_open) = Opened::take(HWND::default()) else {
-        lines.push("formats         could not be read: the clipboard would not open".to_string());
+    // Patient, because the value behind this open is the one the
+    // reader most needs and giving up leaves the four values as three.
+    // `Opened::take` waits `OPEN_PATIENCE`; this waits several of
+    // those, which is still under three seconds and well within what
+    // somebody typing a command will wait for an answer.
+    let mut opened = Err(ClipboardError::Busy);
+    for _ in 0..OPEN_ATTEMPTS_FOR_STATUS {
+        opened = Opened::take(HWND::default());
+        if opened.is_ok() {
+            break;
+        }
+    }
+    let Ok(_open) = opened else {
+        lines.push(format!(
+            "formats         could not be read: the clipboard would not open in \
+             {OPEN_ATTEMPTS_FOR_STATUS} tries over \
+             {} s, so something is holding it",
+            (OPEN_PATIENCE * OPEN_ATTEMPTS_FOR_STATUS).as_secs_f32()
+        ));
         return lines;
     };
 
