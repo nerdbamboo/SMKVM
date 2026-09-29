@@ -429,6 +429,18 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
         for step in &carried.steps {
             println!("  {}", step.said());
         }
+        if !carried.differing.is_empty() {
+            println!();
+            println!(
+                "The machine-wide {} not the same as this account's. The service will \
+                 use the machine-wide ones; the lines above say which.",
+                if carried.differing.len() == 1 {
+                    format!("{} is", carried.differing[0])
+                } else {
+                    format!("{} are", carried.differing.join(" and "))
+                }
+            );
+        }
         if !carried.missing.is_empty() {
             println!();
             if carried.missing.contains(&smkvm_config::paths::CONFIG_NAME) {
@@ -465,7 +477,16 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
         for step in plan::uninstall(there) {
             match step {
                 plan::Step::RemoveTask => uninstall_task()?,
-                plan::Step::RemoveService => scm::uninstall()?,
+                plan::Step::RemoveService => {
+                    scm::uninstall()?;
+                    // The report goes even though the identity stays. A
+                    // dead one left machine-wide is preferred by every
+                    // reader over the live one a hand-started daemon
+                    // writes in its own profile, so `smkvm status` would
+                    // say nothing is running while it runs perfectly --
+                    // for ever, with nothing to explain it.
+                    store::forget_the_report();
+                }
                 plan::Step::RegisterTask | plan::Step::RegisterService => {}
             }
         }

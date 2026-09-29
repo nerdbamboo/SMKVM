@@ -198,6 +198,26 @@ pub const IDENTITY_NAME: &str = "device.toml";
 pub const PEERS_NAME: &str = "peers.toml";
 pub const STATUS_NAME: &str = "status.toml";
 
+/// The one corner of the machine-wide directory an ordinary account may
+/// read.
+///
+/// A subdirectory rather than a permission on the file, because the file
+/// does not exist when the access lists are set: it is written by the
+/// daemon, later, and a file created later inherits whatever the
+/// directory says. So the directory says it. The parent grants the
+/// system account and administrators and nobody else, which is what
+/// makes a private key created later fail closed; this one adds read for
+/// ordinary accounts, and holds nothing but the report.
+///
+/// The alternative -- grant the person's account read on the parent and
+/// tighten each secret afterwards -- is what this replaced, and it was
+/// wrong in three separate ways at once: a key the service generated
+/// itself was never tightened at all, a copied key was readable for the
+/// milliseconds between being written and being tightened, and anything
+/// added later would have been open by default. A default that is closed
+/// needs no vigilance.
+pub const READABLE_CORNER: &str = "public";
+
 pub fn config_file() -> PathBuf {
     config_dir().join(CONFIG_NAME)
 }
@@ -220,7 +240,16 @@ pub fn log_file() -> PathBuf {
 /// needs to read it, on any platform, with nothing to connect to and
 /// nothing to fail when the daemon is not running.
 pub fn status_file() -> PathBuf {
-    state_dir().join(STATUS_NAME)
+    status_file_in(scope(), &Roots::from_env(), cfg!(windows))
+}
+
+/// Where a daemon of this scope writes its report.
+pub fn status_file_in(scope: Scope, roots: &Roots, windows: bool) -> PathBuf {
+    let dir = state_dir_in(scope, roots, windows);
+    match (scope, windows) {
+        (Scope::Machine, true) => dir.join(READABLE_CORNER).join(STATUS_NAME),
+        _ => dir.join(STATUS_NAME),
+    }
 }
 
 /// Every place a report might be, in the order to believe them.
@@ -244,24 +273,53 @@ pub fn status_candidates() -> Vec<PathBuf> {
     let windows = cfg!(windows);
     let mut places = Vec::with_capacity(2);
     if windows {
-        places.push(state_dir_in(Scope::Machine, &roots, windows).join(STATUS_NAME));
+        places.push(status_file_in(Scope::Machine, &roots, windows));
     }
-    let person = state_dir_in(Scope::Person, &roots, windows).join(STATUS_NAME);
+    let person = status_file_in(Scope::Person, &roots, windows);
     if !places.contains(&person) {
         places.push(person);
     }
     places
 }
 
-/// The report to read, which is the first of [`status_candidates`] that is
-/// there at all.
-pub fn status_file_to_read() -> PathBuf {
-    let places = status_candidates();
-    places
+/// Which of several reports to believe, given when each says it was
+/// written.
+///
+/// By age, not by which directory it is in. Preferring the machine-wide
+/// one because it is first in the list was wrong in a way that lasted
+/// for ever: nothing deletes that file when a service is uninstalled, so
+/// a dead report sat in `%ProgramData%` permanently and shadowed the
+/// live one a hand-started daemon was writing in its own profile. Every
+/// reader picked the stale file, `Status::current` then filtered it out
+/// as too old, and `smkvm status` said nothing was running while the
+/// daemon ran perfectly. The report carries the time it was written, so
+/// the question has an answer that does not depend on where it is.
+///
+/// `None` for a report that is absent or would not parse, which loses to
+/// any report that has a time. When none of them has one, the first is
+/// returned so that a caller has a path to name in a message.
+pub fn freshest(candidates: &[(PathBuf, Option<u64>)]) -> Option<PathBuf> {
+    candidates
         .iter()
-        .find(|path| path.exists())
-        .cloned()
-        .unwrap_or_else(|| places.into_iter().next().unwrap_or_else(status_file))
+        .filter_map(|(path, written)| written.map(|w| (path, w)))
+        .max_by_key(|(_, written)| *written)
+        .map(|(path, _)| path.clone())
+        .or_else(|| candidates.first().map(|(path, _)| path.clone()))
+}
+
+/// The report to read: whichever candidate was written most recently.
+pub fn status_file_to_read() -> PathBuf {
+    let dated: Vec<(PathBuf, Option<u64>)> = status_candidates()
+        .into_iter()
+        .map(|path| {
+            let written = crate::status::Status::load(&path)
+                .ok()
+                .flatten()
+                .map(|report| report.updated);
+            (path, written)
+        })
+        .collect();
+    freshest(&dated).unwrap_or_else(status_file)
 }
 
 /// This machine's name, when the configuration does not give one.
@@ -445,7 +503,7 @@ mod scope_tests {
     }
 
     #[test]
-    fn a_reader_looks_machine_wide_first_and_in_a_profile_second() {
+    fn a_reader_has_both_places_to_look() {
         let places = status_candidates();
         assert!(!places.is_empty());
         if cfg!(windows) {
@@ -454,6 +512,78 @@ mod scope_tests {
         } else {
             assert_eq!(places.len(), 1);
         }
+    }
+
+    #[test]
+    fn the_machine_report_sits_in_the_corner_an_ordinary_account_may_read() {
+        // Not beside the key. The directory holding the key grants
+        // nothing to ordinary accounts, so a report written into it
+        // would be unreadable to `smkvm status` -- which the person at
+        // the desk runs.
+        let roots = windows_roots();
+        let report = status_file_in(Scope::Machine, &roots, true);
+        assert_eq!(
+            report,
+            under(r"C:\ProgramData")
+                .join(READABLE_CORNER)
+                .join(STATUS_NAME)
+        );
+        assert_ne!(
+            report.parent(),
+            Some(state_dir_in(Scope::Machine, &roots, true).as_path())
+        );
+        // A person's own report is where it always was.
+        assert_eq!(
+            status_file_in(Scope::Person, &roots, true),
+            under(r"C:\Users\someone\AppData\Local").join(STATUS_NAME)
+        );
+    }
+
+    #[test]
+    fn the_newer_report_wins_wherever_it_is() {
+        // The case that was wrong: a service was uninstalled and left a
+        // report behind, and a hand-started daemon is running now. The
+        // stale machine-wide file used to win for ever, and the answer
+        // was "smkvm is not running here" while it was.
+        let machine = PathBuf::from(r"C:\ProgramData\smkvm\public\status.toml");
+        let person = PathBuf::from(r"C:\Users\someone\AppData\Local\smkvm\status.toml");
+        assert_eq!(
+            freshest(&[
+                (machine.clone(), Some(1_000)),
+                (person.clone(), Some(2_000))
+            ]),
+            Some(person.clone())
+        );
+        // And the other way round, which is a running service beside a
+        // report some earlier hand-started daemon left in a profile.
+        assert_eq!(
+            freshest(&[
+                (machine.clone(), Some(3_000)),
+                (person.clone(), Some(2_000))
+            ]),
+            Some(machine.clone())
+        );
+    }
+
+    #[test]
+    fn a_report_that_is_there_beats_one_that_is_not() {
+        let machine = PathBuf::from("machine");
+        let person = PathBuf::from("person");
+        assert_eq!(
+            freshest(&[(machine.clone(), None), (person.clone(), Some(1))]),
+            Some(person)
+        );
+        assert_eq!(
+            freshest(&[(machine.clone(), Some(1)), (PathBuf::from("person"), None)]),
+            Some(machine.clone())
+        );
+        // Nothing anywhere still names a path, so a message can say where
+        // it looked.
+        assert_eq!(
+            freshest(&[(machine.clone(), None), (PathBuf::from("person"), None)]),
+            Some(machine)
+        );
+        assert_eq!(freshest(&[]), None);
     }
 
     #[test]

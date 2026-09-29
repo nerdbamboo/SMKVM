@@ -29,7 +29,7 @@ use windows::Win32::System::Services::{
 };
 
 use crate::secure::watch::{self, Seen, Step, Watch};
-use crate::secure::windows::{link, pipe, secret, token, Aligned};
+use crate::secure::windows::{link, pipe, secret, store, token, Aligned};
 use crate::secure::{acl, wire};
 
 /// What the service is registered as. The scheduled task is `SMKVM`; this
@@ -452,17 +452,47 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
 
 /// Everything the service does, once it is a service.
 fn serve() -> Result<()> {
-    // First, before anything reads a path. This process runs as the
-    // system account, whose `APPDATA` is the system profile -- a real
-    // directory that resolves perfectly well and has none of this
-    // machine's files in it. On the first real installation the daemon
-    // looked there, found no configuration, and exited; the whole of the
-    // fix is this line and the directory it chooses.
-    smkvm_config::paths::use_machine_scope();
+    // The scope was set in `main`, before the log was opened, so that
+    // the log lands machine-wide with everything else. Said here because
+    // this is where somebody reading the log starts.
+    //
+    // Why there is a scope at all: this process runs as the system
+    // account, whose `APPDATA` is the system profile -- a real directory
+    // that resolves perfectly well and has none of this machine's files
+    // in it. On the first real installation the daemon looked there,
+    // found no configuration, and exited.
+    debug_assert_eq!(
+        smkvm_config::paths::scope(),
+        smkvm_config::paths::Scope::Machine
+    );
     tracing::info!(
         configuration = %smkvm_config::paths::config_file().display(),
         "reading this machine's files from the machine-wide directory, not a profile"
     );
+
+    // Before the key is used for anything, and before the network link
+    // exists. The install sets the access lists and confirms them, but
+    // the install is not the only way a file gets into that directory:
+    // an earlier version of this program left one there readable, and a
+    // key generated later by this very process inherits whatever the
+    // directory says. Somebody diagnosing this machine will check with
+    // `type %ProgramData%\smkvm\device.toml` from an ordinary account;
+    // this is the same check, made by the program, before there is
+    // anything worth reading.
+    //
+    // A key that anyone can read is refused rather than warned about,
+    // because carrying on means handshaking with a secret that is not
+    // one. A list that cannot be *read* is only a warning: failing to
+    // parse is not evidence of a fault, and refusing to start over it
+    // would take the machine down for a reason that may not exist.
+    let key = smkvm_config::paths::identity_file();
+    if key.exists() {
+        store::confirm_key_is_private(&key)?;
+        tracing::info!(
+            key = %key.display(),
+            "this machine's key is readable only by the system account and administrators"
+        );
+    }
     token::enable_tcb_privilege()?;
     tracing::info!(
         "running as a service; workers will be started as the system account on whichever \

@@ -178,6 +178,21 @@ enum ServiceAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Before the log is opened, because the log is a path like any other
+    // and `start_logging` resolves it. Done inside `serve()` -- several
+    // frames later -- it left the service writing its log into the
+    // system profile while its configuration, identity and report were
+    // all machine-wide: one path in one scope and the rest in the other,
+    // with `smkvm status` printing the wrong one. No risk in that, but
+    // the log is the single artefact that turned the last outage into
+    // one look instead of an afternoon, so it is worth its own line at
+    // the top of the program.
+    if matches!(
+        cli.command,
+        Command::ServiceMain | Command::DesktopWorker { .. }
+    ) {
+        paths::use_machine_scope();
+    }
     start_logging(cli.verbose, cli.log_file.clone(), cli.unattended)?;
 
     let result = match cli.command {

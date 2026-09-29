@@ -112,6 +112,94 @@ impl Guard {
     ];
 }
 
+/// The two that may hold this machine's private key: the system account
+/// and the built-in administrators.
+///
+/// As SDDL writes them, which is how they come back out of `icacls
+/// /save`. Aliases rather than full identifiers because that is what the
+/// system emits, and unlike the names `icacls` prints in its ordinary
+/// output they are not translated.
+pub const MAY_HOLD_THE_KEY: [&str; 2] = ["SY", "BA"];
+
+/// Everyone an access list lets in, besides those named.
+///
+/// Setting a list and believing it worked is the same class of mistake as
+/// the silent refused injection this whole project began with: the call
+/// reports success, nothing is visibly wrong, and the consequence is
+/// invisible until somebody goes looking. `icacls` in particular prints
+/// "Successfully processed 0 files; Failed processing 1 files" and has
+/// been known to exit zero doing it. So the list is read back and
+/// checked, and this is the checking -- pure, because it is the part
+/// with a decision in it, and because a parser that is wrong in the
+/// permissive direction would be worse than no check at all.
+///
+/// Only allow entries are considered. A deny entry cannot grant anything,
+/// and an audit entry is not access.
+pub fn granted_to_anyone_but(sddl: &str, allowed: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = sddl;
+    // Only the discretionary part. A system part (`S:`) holds audit and
+    // integrity entries, which grant nobody anything, and reading them
+    // as grants would refuse lists that are perfectly correct.
+    if let Some(at) = rest.find("D:") {
+        rest = &rest[at + 2..];
+        if let Some(end) = rest.find("S:") {
+            rest = &rest[..end];
+        }
+    } else {
+        // No discretionary list at all means no restriction whatsoever --
+        // every access is granted to everyone. Reported as the worst
+        // possible answer rather than as an empty list of offenders,
+        // which is exactly how it would read if it were counted by ACEs.
+        return vec!["everyone (the list is absent, which grants all access)".into()];
+    }
+    for ace in rest.split('(').skip(1) {
+        let ace = ace.split(')').next().unwrap_or_default();
+        let fields: Vec<&str> = ace.split(';').collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        if !fields[0].eq_ignore_ascii_case("A") && !fields[0].eq_ignore_ascii_case("OA") {
+            continue;
+        }
+        let trustee = fields[5].trim();
+        if trustee.is_empty() {
+            continue;
+        }
+        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(trustee)) {
+            found.push(trustee.to_string());
+        }
+    }
+    found
+}
+
+/// Pull the security descriptors out of what `icacls /save` writes.
+///
+/// The format is a line naming the file, then a line of SDDL, repeated.
+/// Written as a tolerant scan rather than a strict parse because the
+/// exact shape is not worth depending on, and because the only thing
+/// done with the result is to look for entries that should not be there
+/// -- a line missed is a check not made, which the caller treats as a
+/// reason to refuse rather than as a pass.
+pub fn descriptors_in(saved: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    for line in saved.lines() {
+        let line = line.trim_end_matches(['\r', '\u{feff}']).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("D:") || line.starts_with("O:") || line.starts_with("G:") {
+            if let Some(name) = name.take() {
+                out.push((name, line.to_string()));
+            }
+        } else {
+            name = Some(line.trim_start_matches('\u{feff}').to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +244,64 @@ mod tests {
         two[0] = 2;
         assert_ne!(pipe_name(&one), pipe_name(&two));
         assert_eq!(pipe_name(&one).len(), 13 + NAME_BYTES * 2);
+    }
+
+    #[test]
+    fn a_list_naming_only_the_two_that_may_hold_the_key_has_nobody_else_on_it() {
+        let good = "D:PAI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)";
+        assert!(granted_to_anyone_but(good, &MAY_HOLD_THE_KEY).is_empty());
+    }
+
+    #[test]
+    fn ordinary_accounts_on_the_list_are_reported() {
+        // `BU` is the built-in Users group -- every ordinary account on
+        // the machine. This is the exact list the first version of the
+        // directory produced, and the exact thing the install then
+        // printed a line claiming was not so.
+        let bad = "D:PAI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;0x1200a9;;;BU)";
+        assert_eq!(granted_to_anyone_but(bad, &MAY_HOLD_THE_KEY), vec!["BU"]);
+    }
+
+    #[test]
+    fn a_stranger_who_made_the_directory_first_is_reported() {
+        // A local account that pre-created the directory keeps an
+        // explicit entry, written out as its full identifier rather than
+        // an alias. Anything not on the allowed list counts, whatever
+        // shape it takes.
+        let squatted = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-11)";
+        assert_eq!(
+            granted_to_anyone_but(squatted, &MAY_HOLD_THE_KEY),
+            vec!["S-1-5-11"]
+        );
+    }
+
+    #[test]
+    fn a_denial_grants_nobody_anything_and_a_system_list_is_not_a_grant() {
+        let with_a_denial = "D:PAI(D;;FA;;;BU)(A;;FA;;;SY)(A;;FA;;;BA)";
+        assert!(granted_to_anyone_but(with_a_denial, &MAY_HOLD_THE_KEY).is_empty());
+        // An integrity label lives in the system part and is not access.
+        let labelled = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NWNRNX;;;LW)";
+        assert!(granted_to_anyone_but(labelled, &MAY_HOLD_THE_KEY).is_empty());
+    }
+
+    #[test]
+    fn no_list_at_all_is_the_worst_answer_rather_than_a_clean_one() {
+        // A descriptor with no discretionary part grants everything to
+        // everybody. Counting offending entries would find none and call
+        // it safe, which is the direction a check must never fail in.
+        let none = "O:BAG:BA";
+        assert_eq!(granted_to_anyone_but(none, &MAY_HOLD_THE_KEY).len(), 1);
+        assert!(granted_to_anyone_but(none, &MAY_HOLD_THE_KEY)[0].contains("absent"));
+    }
+
+    #[test]
+    fn what_icacls_saves_is_read_back_as_a_file_and_its_list() {
+        let saved = "smkvm\r\nD:PAI(A;OICI;FA;;;SY)\r\ndevice.toml\r\nD:AI(A;ID;FA;;;SY)\r\n";
+        let found = descriptors_in(saved);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, "smkvm");
+        assert_eq!(found[1].0, "device.toml");
+        assert!(found[1].1.starts_with("D:"));
     }
 
     #[test]
