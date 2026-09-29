@@ -410,6 +410,55 @@ wrong with the worker's own logging. `WM_RENDERFORMAT entered` is
 written as the first statement of the handler, before it looks at
 anything.
 
+**The worker held the clipboard open, and that takes it away from
+everybody.** Found by measuring from inside the person's session
+rather than by reading anything:
+
+    OPEN BY window=5179950 pid=16280 name=smkvm
+    OWNER   window=5179950 pid=16280 name=smkvm
+    attempt 1: FAILED, error 5   (and again, and again)
+
+Only one process in a session may have the clipboard open at a time.
+While ours held it, *nothing* on that machine could copy or paste --
+not the person's own applications, not `Get-Clipboard`, and not the
+system on somebody's behalf, which is why no `WM_RENDERFORMAT` was
+ever triggered and why a paste returned empty in about a second
+instead of waiting. There is no timeout on this and no recovery but
+the holder letting go or dying.
+
+The cause was a log line. `take_clipboard` opens the clipboard,
+promises the formats, and -- as of the round that added the owner
+check -- said what it had done *before* closing. Saying something
+reaches `witness`, which in the worker relays down the pipe, and that
+write is blocking with no deadline on a pipe that also carries every
+captured pointer movement. One write that did not return left the
+clipboard open for ever.
+
+So the rule, which is short and has no exceptions: **between an open
+and a close, do nothing that can wait on anything.** Not a log line,
+not a lock, not a channel, not a pipe. Gather what is needed, close,
+then speak. `take_clipboard` now drops the guard by name before it
+says a word, and then asks `GetOpenClipboardWindow` whether the
+clipboard really is closed, saying so loudly if it is not -- because
+that state costs everybody on the machine, not only us.
+
+`smkvm status` reports it too, and for the same reason it re-measures
+the key rather than trusting a log line: somebody whose copy and paste
+has stopped should find out in one command whether we are the reason,
+without reading a log or knowing this program has a worker.
+
+**And a guard in an `if` condition is dropped before the block.**
+Found by reading, while looking for the above. `if Opened::take(w).is_ok()
+{ ... }` reads as "open it, and if that worked, do this" and does not
+mean that: the condition of an `if` is a terminating scope, so the
+guard is dropped -- closing the clipboard -- before the block runs.
+Both places that did this ran their bodies with the clipboard closed,
+which is where an earlier round's `ERROR_CLIPBOARD_NOT_OPEN` came
+from. `if let Ok(_open) = ...` keeps it alive for the block, which is
+what was meant. Worth knowing generally: this is the same footgun as
+`if mutex.lock().unwrap().is_empty() { ... }`, which releases the lock
+before the block it is guarding.
+
 **A hang with nowhere to look, because only one end of the handler
 said anything.** The data arrives instantly and correctly -- both hops
 measured at zero milliseconds, seventeen bytes for a seventeen-byte
@@ -1234,6 +1283,22 @@ input-desktop update. Log off while a worker is running and neither ran:
 no session on it, claiming input was landing, until the next injection
 timed out a second later. The wait now goes *after* the observing, and
 detaches before it waits.
+
+**Holding a system-wide singleton is not like holding a lock of your
+own.** The Windows clipboard can be open by one process at a time, for
+everybody. A window left in there is not a bug this program suffers,
+it is a bug this program *inflicts* -- the machine's copy and paste
+stops and stays stopped, with no error anybody sees and no way out but
+killing the holder. Anything with that shape deserves the strictest
+possible rule about what may run while it is held, a guard whose drop
+releases it, and a check afterwards that it really was released.
+
+**Logging is not free, and it is not safe everywhere.** Three rounds
+were spent adding places where this program says what it is doing,
+which was right; this round one of those lines took the machine's
+clipboard away. A log line that relays over a pipe is a blocking
+write, and a blocking write inside a critical region is a deadlock
+waiting for a slow reader. Say things where waiting is allowed.
 
 **A success path that shares code with a failure path needs a test
 that it does not do the failure path's work.** The renewal was written
