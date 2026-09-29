@@ -180,14 +180,6 @@ say what each one was. What remains:
   replacement and stale clears are recognised, so nothing is lost -- but a
   slow fetch still delays the next offer. The Windows side has the same shape
   inside `WM_RENDERFORMAT`.
-- **In service mode, a `transfer.directory` of `~/Downloads/SMKVM` lands in
-  the system profile.** The system account's home is not the person's, so
-  files pasted or dragged onto a machine running the service arrive
-  somewhere the person cannot see. Guessing whose Downloads a service meant
-  is the same bad question as guessing whose configuration to read, so the
-  answer is probably an explicit path in `smkvm.toml` rather than a
-  cleverer `~`. Not yet done, and not yet run into, because files have not
-  been tried in service mode at all.
 - **The GUI on a client shows only that client.** A client's status report
   carries no desk -- `monitor = []` even for its own screens -- so the desk
   view is complete only on the server. Either the server sends the desk to
@@ -301,7 +293,11 @@ readable by `smkvm status` while `device.toml` is refused to an ordinary
 account; whether carrying the three files across leaves an already-paired
 machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
-to start rather than a loop;
+to start rather than a loop; whether the clipboard works through the
+pipe at all, in either direction, and what a paste feels like with the
+extra hop; whether a copy made while a consent prompt is up behaves as
+described; whether `WTSQueryUserToken` plus `CreateEnvironmentBlock`
+answers with the person's profile;
 whether the quarter-second desktop comparison is in fact quick enough that
 nothing is typed into the wrong desktop, as opposed to merely narrower
 than it was; and what the clipboard and the drag catcher do in a process
@@ -324,6 +320,93 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**The third attempt worked, and it is measured.** Input moved to
+`Winlogon` at 01:52:44.162, the cursor was handed back at .166, a worker
+was on `Winlogon` at .190, the cursor was taken back at .239 --
+seventy-seven milliseconds end to end. The prompt closing puts it back
+on `Default` and it does not stick there, which was the thing flagged as
+unproven when the watching was inverted. The injection refusals just
+before each switch are in the log doing their job as the signal that the
+desktop moved.
+
+So the feature this whole branch exists for works on a real machine.
+What follows is what the person hit the moment after.
+
+**Copy and paste was broken in service mode, and it is the same fault
+one layer along.** `client.rs` opens the clipboard through
+`platform::clipboard()`; in service mode that runs in session 0. Session
+0 has a clipboard of its own and it is not the one the person copies
+into -- so the daemon watched a clipboard nobody writes to and offered
+onto one nobody reads, without a single error anywhere. The drag catcher
+was in the same place for the same reason. Exactly the shape of the
+desktop bug: a thing that is per-session being done from the wrong
+session.
+
+The cure is the seam that already works for input. The exchange -- what
+has been copied, what is announced, what is being fetched -- stays in the
+service with the link and the state machine. The worker owns the actual
+clipboard, because it is the only process of ours in the session. They
+talk over the pipe that already exists; no second channel, and the
+exchange did not move.
+
+**The one thing that runs backwards.** Offering is lazy on purpose: a
+copy announces what is available and the contents are fetched only if
+something pastes, which is what stops a screenshot nobody pastes costing
+anything. But the thing that pastes is on the *worker's* desktop and the
+contents are on another machine, reachable only through the service. So
+the worker asks the service mid-paste and waits -- `WantsPaste` out,
+`Pasted` back. That is why the pipe now needs a question-and-answer in
+both directions, and why there is a numbered waiting table on each side:
+two pastes of different formats in flight at once would otherwise each
+take whichever answer came first, which is a clipboard that hands over
+the wrong thing rather than one that fails.
+
+The wait itself is not new. On Windows the answer is rendered inside
+`WM_RENDERFORMAT` with the pasting application stopped until it returns,
+which was already a network round trip and is recorded further down this
+file as a known shortcoming. The pipe adds one hop to it. What is new is
+that it is bounded: a paste that is not answered in thirty seconds gives
+up, so an application stalls rather than wedging.
+
+**The clipboard belongs to the `Default` worker only.** The Windows
+clipboard is per *window station*, not per desktop, so a worker on
+`Winlogon` is on `WinSta0` and could probably reach it. It should not,
+for a better reason than that: owning a clipboard means owning a
+*window* that answers when something pastes, and that window is on the
+desktop the worker is attached to and dies when the worker is replaced.
+A worker that took the clipboard onto `Winlogon` would throw the
+standing offer away every time a consent prompt appeared. So a switch
+to `Winlogon` *suspends* the clipboard rather than losing it: the offer
+lives in the service, which announces it again as soon as a worker is
+back on the ordinary desktop.
+
+**What a person should expect.** A copy on another machine can be pasted
+here as usual. If a consent prompt is up, the clipboard is not being
+served for as long as it is up -- a paste during that moment does
+nothing, and works again when the prompt goes. Nothing is lost by
+waiting. A file sent to this machine lands under the person's own
+`transfer.directory`, which by default is `~/Downloads/SMKVM` in *their*
+profile, not the system one; an explicit path in `smkvm.toml` is used as
+written and is the way to put it anywhere else.
+
+**Where a received file lands, and why the service answers that
+question.** It used to resolve `~` in the system profile, which is
+recorded below as a gap. It is not the same question as "whose
+configuration should a service read", and that is the good part: there
+*is* a person at the screen and the system knows who. The service asks
+`WTSQueryUserToken` for their token and `CreateEnvironmentBlock` for
+their environment, and reads `USERPROFILE` out of it -- no guess at
+`C:\Users\<name>`, no registry, no assumption that profiles are in the
+usual place. Walking that block is pure and tested.
+
+The worker could have been asked instead, being in the session. It was
+not, and the reason is worth stating because it looks like the obvious
+choice: the worker is the system account too, so it would have to ask
+the same way, and the service already holds the privilege it needs. The
+worker has exactly one thing the service lacks -- being in the session
+-- and for this question the service can get the same answer without a
+round trip.
 
 **What the second attempt on real hardware found, and the thing it
 settled.** Three things worked that had never been run before: the
@@ -863,6 +946,18 @@ worker's desktop and the last polled input desktop and reports no reach
 when they differ, and `mind_workers` tells it what it saw on every look
 rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
+
+**Anything that belongs to a session is wrong in a service, and the
+compiler cannot tell you which things those are.** The desktop was the
+first. The clipboard was the second, found the same way -- on a machine,
+by somebody trying to use it -- and the drag catcher came with it. Both
+ran without error against a real object that was simply the wrong one,
+because session 0 has a desktop and a clipboard of its own. The list of
+things to suspect is anything the system keeps one of *per session or
+per window station*: the clipboard, the desktop, window stations,
+interactive windows, the shell, the pointer. If the service is doing any
+of them itself rather than through the worker, it is doing them in a
+place nobody can see.
 
 **A window station is not a privilege, and the system account does not
 get you across one.** Every desktop and window-station call is scoped to

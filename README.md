@@ -120,6 +120,14 @@ with every other machine again. Only the system account and administrators
 can read the identity file. `uninstall` leaves the copies where they are and
 says so.
 
+The clipboard, dragging and pasted files all work under the service as
+they do under the task, because the worker in your session owns them --
+they belong to a session, and a service is not in one. While a consent
+prompt or the lock screen is up the clipboard is suspended rather than
+lost: a paste during that moment does nothing and works again once the
+prompt goes. Files sent to the machine land under your own
+`transfer.directory`, not the system account's.
+
 The files come from whoever is logged in at the screen, which is usually
 not the account running the install -- these machines are often
 administered from elsewhere. `--user <name>` says whose to take when that
