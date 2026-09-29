@@ -163,6 +163,29 @@ fn machine_dir(roots: &Roots) -> PathBuf {
         .join("smkvm")
 }
 
+/// The three files, inside a profile that is not this process's.
+///
+/// `install --system` has to carry a machine's configuration, identity
+/// and paired list into the machine-wide directory, and on these
+/// machines the install happens over ssh as an administrator account
+/// that is not the person at the desk. Read from the installing
+/// account's own profile it finds nothing, correctly says so, and
+/// leaves `--system` impossible to install remotely -- which is what
+/// happened. So the profile is an argument.
+///
+/// Built from the profile root rather than from the environment,
+/// because the environment belongs to whoever is running, and the whole
+/// point is that they are the wrong person.
+pub fn person_files_under(profile: &Path) -> [(&'static str, PathBuf); 3] {
+    let roaming = profile.join("AppData").join("Roaming").join("smkvm");
+    let local = profile.join("AppData").join("Local").join("smkvm");
+    [
+        (CONFIG_NAME, roaming.join(CONFIG_NAME)),
+        (IDENTITY_NAME, local.join(IDENTITY_NAME)),
+        (PEERS_NAME, local.join(PEERS_NAME)),
+    ]
+}
+
 /// The machine-wide directory, whatever this process's own scope is.
 ///
 /// Needed by `service install --system`, which runs as the person and has
@@ -198,6 +221,22 @@ pub const IDENTITY_NAME: &str = "device.toml";
 pub const PEERS_NAME: &str = "peers.toml";
 pub const STATUS_NAME: &str = "status.toml";
 
+/// A file holding nothing but a log filter, read at startup.
+///
+/// A service cannot be told anything on a command line and has no
+/// terminal to set a variable in. The documented way is a `REG_MULTI_SZ`
+/// value named `Environment` under the service's key -- which is real,
+/// and which silently does nothing if the value is written as `REG_SZ`
+/// instead, as it will be by anyone who reaches for `New-ItemProperty`
+/// without saying otherwise. That is a trap with no error message, and
+/// it cost a diagnosis on a real machine.
+///
+/// So there is also a file. Drop one line -- `debug`, or anything
+/// `RUST_LOG` syntax accepts -- next to the rest of this machine's
+/// files, restart the service, and it says more. Nothing to get right
+/// but the contents.
+pub const LOG_LEVEL_NAME: &str = "log-level";
+
 /// The one corner of the machine-wide directory an ordinary account may
 /// read.
 ///
@@ -232,6 +271,11 @@ pub fn peers_file() -> PathBuf {
 
 pub fn log_file() -> PathBuf {
     state_dir().join("smkvm.log")
+}
+
+/// Where to look for a log filter written down rather than passed in.
+pub fn log_level_file() -> PathBuf {
+    state_dir().join(LOG_LEVEL_NAME)
 }
 
 /// Where the running daemon reports what it is connected to.
@@ -488,6 +532,35 @@ mod scope_tests {
         // the working directory -- visible and wrong -- rather than
         // `C:\ProgramData` on a machine whose Windows is somewhere else.
         assert_eq!(config_dir_in(Scope::Machine, &roots, true), under("."));
+    }
+
+    #[test]
+    fn another_persons_files_are_found_under_their_profile() {
+        // The same two places this program uses for its own, but
+        // underneath somebody else's profile: roaming for what is
+        // edited, local for the identity and the paired list.
+        let files = person_files_under(Path::new(r"C:\Users\someone"));
+        let named: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
+        assert_eq!(named, CARRIED_OVER.to_vec());
+        assert_eq!(
+            files[0].1,
+            PathBuf::from(r"C:\Users\someone")
+                .join("AppData")
+                .join("Roaming")
+                .join("smkvm")
+                .join(CONFIG_NAME)
+        );
+        for (_, path) in &files[1..] {
+            assert!(
+                path.to_string_lossy().contains("Local"),
+                "the identity and the paired list are not roaming state: {path:?}"
+            );
+        }
+        // And nothing resolved out of this process's own environment,
+        // which belongs to the wrong person by construction.
+        for (_, path) in &files {
+            assert!(path.starts_with(Path::new(r"C:\Users\someone")));
+        }
     }
 
     #[test]

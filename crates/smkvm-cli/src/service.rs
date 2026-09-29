@@ -345,7 +345,7 @@ mod windows {
                     // Before the service is registered, so that a machine
                     // whose files cannot be put where a service could read
                     // them never gets a service pointed at it.
-                    carry_files_over()?;
+                    carry_files_over(user.as_deref())?;
                     scm::install(exe)?;
                 }
             }
@@ -423,8 +423,67 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
     /// the login task, which simply works, that would be a regression, so
     /// the files are carried across once and the person is told what
     /// happened to each of them.
-    fn carry_files_over() -> Result<()> {
-        let carried = store::prepare()?;
+    /// Whoever is logged in at the screen, as the system sees it.
+    ///
+    /// `DOMAIN\\name`, or nothing when nobody is. Asked because the
+    /// account installing this is usually not the account the machine
+    /// is paired as: these are administered over ssh, and the person at
+    /// the desk is somebody else entirely.
+    fn who_is_at_the_screen() -> Option<String> {
+        let said = powershell("(Get-CimInstance Win32_ComputerSystem).UserName").ok()?;
+        let said = said.trim();
+        (!said.is_empty() && said != "null").then(|| said.to_string())
+    }
+
+    /// Where an account's files are, by its name.
+    ///
+    /// The profile list is the same place the login task's principal is
+    /// looked up in, and for the same reason: it remembers every account
+    /// that has logged in on this machine whether or not its directory
+    /// can be reached today, which a cloud or domain account's often
+    /// cannot. Matched on the last component of the profile path, since
+    /// that is what survives a name written with or without its domain.
+    fn profile_of(user: &str) -> Result<PathBuf> {
+        let script = format!(
+            r#"$ErrorActionPreference = 'Stop'
+$short = ({user} -split '\\')[-1]
+$found = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' |
+  ForEach-Object {{ [string]$_.GetValue('ProfileImagePath') }} |
+  Where-Object {{ $_ -and (Split-Path -Leaf $_) -ieq $short }} |
+  Select-Object -First 1
+if (-not $found) {{ throw "no account called $short has a profile on this machine" }}
+$found
+"#,
+            user = quote(user)
+        );
+        let path =
+            powershell(&script).with_context(|| format!("finding {user}'s profile directory"))?;
+        Ok(PathBuf::from(path.trim()))
+    }
+
+    fn carry_files_over(user: Option<&str>) -> Result<()> {
+        // Named, or whoever is at the screen, or -- failing both -- this
+        // account, which is right when somebody is installing on the
+        // machine they sit at.
+        let whose = match user {
+            Some(user) => Some(user.to_string()),
+            None => who_is_at_the_screen(),
+        };
+        let profile = match &whose {
+            Some(user) => {
+                let profile = profile_of(user)?;
+                println!("carrying {user}'s files from {}", profile.display());
+                Some(profile)
+            }
+            None => {
+                println!(
+                    "nobody is logged in at the screen and no --user was given, so this \
+                     account's own files are what will be carried."
+                );
+                None
+            }
+        };
+        let carried = store::prepare(profile.as_deref())?;
         println!("machine-wide files in {}:", carried.directory.display());
         for step in &carried.steps {
             println!("  {}", step.said());
@@ -445,9 +504,12 @@ Register-ScheduledTask -TaskName {name} -Xml $xml -Force | Out-Null
             println!();
             if carried.missing.contains(&smkvm_config::paths::CONFIG_NAME) {
                 println!(
-                    "note: there is no configuration to carry over, so the service will \
-                     not start. Run `smkvm init` as yourself first, pair this machine, \
-                     then install again -- or put a {} in {} by hand.",
+                    "note: there is no configuration to carry over from {}, so the \
+                     service will not start. If the machine is paired under a different \
+                     account, name it: `smkvm service install --system --user <name>`. \
+                     Otherwise run `smkvm init` and pair as that account first, or put a \
+                     {} in {} by hand.",
+                    carried.from.display(),
                     smkvm_config::paths::CONFIG_NAME,
                     carried.directory.display()
                 );

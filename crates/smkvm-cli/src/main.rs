@@ -150,8 +150,13 @@ enum ServiceAction {
     /// task in the desktop session with highest privileges, on Linux a login
     /// item. Run from an administrator prompt on Windows.
     Install {
-        /// Windows: the account whose login starts it, when that is not the
-        /// account registering it (as `DOMAIN\name` or `name`).
+        /// Windows: the account whose login starts it, when that is not
+        /// the account registering it (as `DOMAIN\name` or `name`).
+        /// With --system it instead names the account whose
+        /// configuration, identity and paired machines are carried into
+        /// the machine-wide directory; the default there is whoever is
+        /// logged in at the screen, which is usually not the account
+        /// installing over ssh.
         #[arg(long)]
         user: Option<String>,
         /// Windows: register without highest privileges. Windows will then
@@ -194,6 +199,7 @@ fn main() -> Result<()> {
         paths::use_machine_scope();
     }
     start_logging(cli.verbose, cli.log_file.clone(), cli.unattended)?;
+    log_panics_too();
 
     let result = match cli.command {
         Command::Init {
@@ -254,9 +260,14 @@ fn main() -> Result<()> {
 fn start_logging(verbose: bool, explicit: Option<PathBuf>, unattended: bool) -> Result<()> {
     use std::io::IsTerminal as _;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_env("SMKVM_LOG").unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(if verbose { "debug" } else { "info" })
-    });
+    // Written down beats passed in, for a process nothing can pass
+    // anything to. See `choose_filter`.
+    let from_file = std::fs::read_to_string(paths::log_level_file()).ok();
+    let filter = tracing_subscriber::EnvFilter::new(choose_filter(
+        std::env::var("SMKVM_LOG").ok().as_deref(),
+        from_file.as_deref(),
+        verbose,
+    ));
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false);
@@ -287,6 +298,46 @@ fn start_logging(verbose: bool, explicit: Option<PathBuf>, unattended: bool) -> 
         }
     }
     Ok(())
+}
+
+/// Which log filter to use, given everything that might say.
+///
+/// In order: the environment, then a file beside this machine's other
+/// files, then `--verbose`, then the default. The file is here for the
+/// service, which has no command line to be given a flag on and no
+/// terminal to set a variable in; the documented `Environment` value
+/// under the service's registry key works only when it is written as
+/// `REG_MULTI_SZ`, and does nothing at all -- with no error anywhere --
+/// when it is written as `REG_SZ`. That is exactly the kind of silence
+/// this program keeps losing days to, so there is a way that has
+/// nothing to get wrong.
+fn choose_filter(from_env: Option<&str>, from_file: Option<&str>, verbose: bool) -> String {
+    for said in [from_env, from_file].into_iter().flatten() {
+        let said = said.trim();
+        if !said.is_empty() {
+            return said.to_string();
+        }
+    }
+    if verbose { "debug" } else { "info" }.to_string()
+}
+
+/// Make a thread that dies say so.
+///
+/// A panic on a spawned thread prints to stderr and returns; a service
+/// has no stderr anybody reads, so the thread simply stops and nothing
+/// anywhere mentions it. The minding thread stopping that way would look
+/// exactly like the minding thread deciding to do nothing -- and telling
+/// those two apart by reading a log was the thing that could not be done
+/// on a real machine.
+fn log_panics_too() {
+    let already = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        tracing::error!(
+            "a thread has died: {panic}. Whatever it was minding is no longer being \
+             minded, and this process will not notice by itself"
+        );
+        already(panic);
+    }));
 }
 
 /// Keep the log from growing without bound: past a certain size the current
@@ -907,6 +958,40 @@ async fn connect(config_path: Option<PathBuf>, host: Option<String>) -> Result<(
     info!(server = %peer.name, %address, "connecting");
     platform::report_rank();
     client::run(identity, peer, address, config).await
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::choose_filter;
+
+    #[test]
+    fn the_environment_wins_because_it_is_the_most_deliberate() {
+        assert_eq!(choose_filter(Some("trace"), Some("debug"), true), "trace");
+    }
+
+    #[test]
+    fn a_file_beats_a_flag_a_service_can_never_be_given() {
+        assert_eq!(choose_filter(None, Some("debug"), false), "debug");
+        assert_eq!(
+            choose_filter(None, Some("smkvm_cli=debug,info"), false),
+            "smkvm_cli=debug,info"
+        );
+    }
+
+    #[test]
+    fn a_file_with_nothing_in_it_says_nothing() {
+        // An empty or whitespace file is somebody having made the file
+        // and not yet written the level, which must not turn logging
+        // off or produce a filter that matches nothing.
+        assert_eq!(choose_filter(None, Some(""), false), "info");
+        assert_eq!(choose_filter(None, Some("  \n"), true), "debug");
+        assert_eq!(choose_filter(None, None, false), "info");
+    }
+
+    #[test]
+    fn the_trailing_newline_every_editor_adds_is_not_part_of_the_level() {
+        assert_eq!(choose_filter(None, Some("debug\r\n"), false), "debug");
+    }
 }
 
 #[cfg(test)]

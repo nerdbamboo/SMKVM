@@ -74,6 +74,15 @@ pub enum Step {
     GiveUp { desktop: String, tries: u32 },
 }
 
+/// The desktop an interactive session always has.
+///
+/// Where a worker is put when there is no worker to ask. The service
+/// cannot find out which desktop has the input -- that question can only
+/// be answered from inside the session -- so the first worker goes to
+/// the one that is always there, and from then on the worker says where
+/// the input actually is.
+pub const ALWAYS_THERE: &str = "Default";
+
 /// The window station every interactive desktop lives on.
 ///
 /// There is exactly one that has a screen attached, and it is always called
@@ -121,10 +130,15 @@ impl Watch {
         self.worker_on.as_deref()
     }
 
-    /// One look at the input desktop.
+    /// One report of where the input is.
     pub fn saw(&mut self, seen: Seen) -> Step {
-        let Seen::Desktop(desktop) = seen else {
-            return Step::Stay;
+        let desktop = match seen {
+            Seen::Desktop(desktop) => desktop,
+            // Nobody is there to ask. Somebody has to be, or nothing
+            // will ever answer, so one goes on the desktop that always
+            // exists and reports from there.
+            Seen::Unreadable if self.worker_on.is_none() => ALWAYS_THERE.to_string(),
+            Seen::Unreadable => return Step::Stay,
         };
         if self.worker_on.as_deref() == Some(desktop.as_str()) {
             return Step::Stay;
@@ -283,6 +297,46 @@ mod tests {
                 on: r"WinSta0\Default".into()
             }
         );
+    }
+
+    #[test]
+    fn with_nobody_to_ask_a_worker_goes_where_one_always_can_live() {
+        // The hardware failure, pinned. The service cannot find out
+        // which desktop has the input -- only something inside the
+        // session can -- so on a fresh service every look says
+        // "unreadable". Treating that as no news meant no worker was
+        // ever started, no line was ever logged, and the machine sat
+        // there for ever looking like it was working.
+        let mut watch = Watch::new();
+        assert_eq!(
+            watch.saw(Seen::Unreadable),
+            Step::Move {
+                desktop: "Default".into(),
+                on: r"WinSta0\Default".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_worker_that_cannot_tell_is_not_a_reason_to_replace_it() {
+        // With one running, the same answer means something different:
+        // it looked and could not say, and moving it would be churn.
+        let mut watch = Watch::new();
+        watch.worker_started("Default", "Default", Instant::now());
+        assert_eq!(watch.saw(Seen::Unreadable), Step::Stay);
+    }
+
+    #[test]
+    fn giving_up_covers_the_bootstrap_too() {
+        // Otherwise a session that will not take a worker at all is a
+        // process started four times a second for ever, which is the
+        // relaunch loop by another door.
+        let mut watch = Watch::new();
+        for _ in 0..GIVE_UP_AFTER {
+            assert!(matches!(watch.saw(Seen::Unreadable), Step::Move { .. }));
+            watch.worker_failed("Default");
+        }
+        assert!(matches!(watch.saw(Seen::Unreadable), Step::GiveUp { .. }));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use smkvm_input::platform::windows::{desktop, WindowsInput};
 use smkvm_input::{Inject, Monitors};
 
 use crate::secure::acl;
+use crate::secure::watch::LOOK_EVERY as WATCH_EVERY;
 
 use crate::secure::windows::pipe;
 use crate::secure::wire::{frame, read_frame, FromWorker, Saw, ToWorker, WORKER_PROTOCOL};
@@ -79,6 +80,36 @@ pub fn run(pipe_name: &str) -> Result<()> {
         },
     )?;
     tracing::info!(desktop = %here, "the worker is on the desktop and connected");
+
+    // Watching where the input has gone, which is a thing only
+    // something inside the session can do. `OpenInputDesktop` is per
+    // window station; a service is in session 0 on `Service-0x0-3e7$`
+    // and cannot see session 1's at all. The service polled it from out
+    // there, got nothing every time, treated nothing as no news and
+    // never started a single worker -- so this is where the watching
+    // lives now, and the service acts on what it is told.
+    {
+        let mut back = to_service.share()?;
+        std::thread::Builder::new()
+            .name("smkvm-worker-desktops".into())
+            .spawn(move || {
+                let mut last: Option<Option<String>> = None;
+                loop {
+                    let now = desktop::input_name();
+                    // Only on a change, so the pipe carries one frame
+                    // when something happens rather than four a second
+                    // when nothing does.
+                    if last.as_ref() != Some(&now) {
+                        if say(&mut back, &FromWorker::InputDesktop(now.clone())).is_err() {
+                            return;
+                        }
+                        last = Some(now);
+                    }
+                    std::thread::sleep(WATCH_EVERY);
+                }
+            })
+            .context("starting the worker's desktop watch")?;
+    }
 
     // The capture hooks go on their own thread with a message loop, which
     // is what `Capture::start` arranges. It inherits this process's desktop,

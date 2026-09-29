@@ -75,6 +75,9 @@ pub struct Link {
     swallow: Mutex<bool>,
     /// Whether input is getting to a screen, and why not when it is not.
     reach: Mutex<Reach>,
+    /// Where the worker last said the input was. The service has no way
+    /// of its own to find this out, so this is the only source.
+    said_input_is_on: Mutex<Option<String>>,
 }
 
 impl Link {
@@ -107,6 +110,11 @@ impl Link {
         *self.write.lock().expect("not poisoned") = None;
         self.answers.lock().expect("not poisoned").monitors = None;
         self.reach.lock().expect("not poisoned").attached(None);
+        // Nobody is reporting any more, so what the last one said is no
+        // longer a fact about now. Kept as unknown rather than as the
+        // old answer, which would have the service believing a desktop
+        // nothing is watching.
+        *self.said_input_is_on.lock().expect("not poisoned") = None;
     }
 
     /// Where captured input should go. Set once, by the server glue.
@@ -114,14 +122,9 @@ impl Link {
         *self.capture.lock().expect("not poisoned") = Some(events);
     }
 
-    /// What the service's poll of the input desktop saw, so that a
-    /// worker left behind on the desktop the input has moved off is known
-    /// to be the wrong place to send anything.
-    pub fn input_desktop(&self, desktop: Option<&str>) {
-        self.reach
-            .lock()
-            .expect("not poisoned")
-            .input_desktop(desktop);
+    /// Where the worker last said the input was, if one has said.
+    pub fn input_is_on(&self) -> Option<String> {
+        self.said_input_is_on.lock().expect("not poisoned").clone()
     }
 
     /// Is input reaching a screen, and if not, why not -- in words.
@@ -209,6 +212,16 @@ impl Link {
             FromWorker::Monitors(monitors) => {
                 self.answers.lock().expect("not poisoned").monitors = Some(monitors);
                 self.answered.notify_all();
+            }
+            FromWorker::InputDesktop(name) => {
+                // Both halves of the same fact: what the minding thread
+                // decides about, and what the reach compares the
+                // worker's own desktop against.
+                *self.said_input_is_on.lock().expect("not poisoned") = name.clone();
+                self.reach
+                    .lock()
+                    .expect("not poisoned")
+                    .input_desktop(name.as_deref());
             }
             FromWorker::Refused(why) => {
                 tracing::warn!("the worker's injection was refused: {why}");

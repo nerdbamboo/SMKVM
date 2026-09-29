@@ -96,3 +96,30 @@ pub fn ours() -> Option<String> {
     let ours = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
     name_of(HANDLE(ours.0))
 }
+
+/// The name of the desktop that currently has the input, asked plainly.
+///
+/// [`current`] answers a different question -- whether that desktop is
+/// this thread's -- and its `Elsewhere` carries this name only as a
+/// by-product. This is the question a process that is watching on
+/// somebody else's behalf actually has.
+///
+/// **Only meaningful from inside the interactive session.** The call is
+/// per window station, and a service lives in session 0 on
+/// `Service-0x0-3e7$`, which is not the station the screens are on. Asked
+/// from there it reports session 0's own idea of the input desktop, or
+/// nothing at all -- never session 1's. That cost a hardware round: the
+/// service polled this from session 0, got nothing, treated it as "no
+/// news", and held still for ever without starting a single worker.
+pub fn input_name() -> Option<String> {
+    // SAFETY: opening the input desktop takes no pointers; the handle is
+    // closed below on every path that obtains one.
+    let input = unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, Default::default()) };
+    let Ok(input) = input else {
+        return None;
+    };
+    let name = name_of(HANDLE(input.0));
+    // SAFETY: the handle came from OpenInputDesktop and is not used after.
+    let _ = unsafe { CloseDesktop(input) };
+    name
+}

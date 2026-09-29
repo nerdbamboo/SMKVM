@@ -451,6 +451,8 @@ fn reachable_says(path: &Path, strangers: &[String]) -> String {
 
 /// What happened, for the person watching.
 pub struct Carried {
+    /// Whose files were carried, for saying so.
+    pub from: PathBuf,
     pub steps: Vec<Step>,
     pub missing: Vec<&'static str>,
     pub differing: Vec<&'static str>,
@@ -463,7 +465,7 @@ pub struct Carried {
 /// Run as the person, from an administrator prompt, before the service is
 /// registered -- so that a machine which cannot be prepared is one that
 /// never gets a service pointed at it.
-pub fn prepare() -> Result<Carried> {
+pub fn prepare(from_profile: Option<&Path>) -> Result<Carried> {
     let dir = paths::machine_config_dir();
     if dir == paths::config_dir() {
         bail!(
@@ -481,13 +483,20 @@ pub fn prepare() -> Result<Carried> {
     // file somebody else can read.
     confirm_directory_hands_nothing_down(&dir)?;
 
-    // Out of this account's own places, whatever they are -- the person
-    // running the install is the one whose machine this is paired as.
-    let from = vec![
-        (paths::CONFIG_NAME, paths::config_file()),
-        (paths::IDENTITY_NAME, paths::identity_file()),
-        (paths::PEERS_NAME, paths::peers_file()),
-    ];
+    // Out of whichever profile holds this machine's pairing. Not
+    // necessarily the installing account's: these machines are
+    // administered over ssh by an account that is not the one at the
+    // desk, and read from that account's profile there is nothing to
+    // find -- which is correct, honest, and leaves `--system`
+    // uninstallable remotely.
+    let from: Vec<(&'static str, PathBuf)> = match from_profile {
+        Some(profile) => paths::person_files_under(profile).to_vec(),
+        None => vec![
+            (paths::CONFIG_NAME, paths::config_file()),
+            (paths::IDENTITY_NAME, paths::identity_file()),
+            (paths::PEERS_NAME, paths::peers_file()),
+        ],
+    };
     let steps = carry::plan(&from, &dir, &|path| path.exists(), &|a, b| match (
         std::fs::read(a),
         std::fs::read(b),
@@ -525,6 +534,9 @@ pub fn prepare() -> Result<Carried> {
     let missing = carry::what_is_missing(&steps);
     let differing = carry::differing(&steps);
     Ok(Carried {
+        from: from_profile
+            .map(Path::to_path_buf)
+            .unwrap_or_else(paths::config_dir),
         steps,
         missing,
         differing,

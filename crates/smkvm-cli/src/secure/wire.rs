@@ -72,6 +72,17 @@ pub enum FromWorker {
     /// Something the local keyboard or mouse did.
     Saw(Saw),
     Monitors(Vec<Monitor>),
+    /// Which desktop has the input, as seen from inside the session.
+    ///
+    /// The service cannot find this out for itself. `OpenInputDesktop`
+    /// is per window station, and a service lives in session 0 on
+    /// `Service-0x0-3e7$`, which is not the station the screens are on;
+    /// asked from there it reports session 0's own answer or nothing.
+    /// The worker is on `WinSta0`, so it can simply look -- which is why
+    /// the watching was inverted and this frame exists.
+    ///
+    /// `None` when the worker looked and could not tell.
+    InputDesktop(Option<String>),
     /// An injection the system turned down, with whatever it said. The
     /// service treats this exactly as the daemon treats a local refusal.
     Refused(String),
@@ -253,6 +264,8 @@ mod tests {
         });
         round_trip(FromWorker::Saw(Saw::PointerBy { dx: 3, dy: -4 }));
         round_trip(FromWorker::Monitors(Vec::new()));
+        round_trip(FromWorker::InputDesktop(Some("Winlogon".into())));
+        round_trip(FromWorker::InputDesktop(None));
         round_trip(FromWorker::Refused("SendInput returned 0".into()));
     }
 

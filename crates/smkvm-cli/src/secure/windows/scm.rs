@@ -523,21 +523,27 @@ fn serve() -> Result<()> {
     outcome
 }
 
-/// What a look at the input desktop turned into.
-enum Looked {
-    /// A name, which is both what `watch` decides on and what `reach`
-    /// compares the worker's desktop against.
-    Named(String),
-    /// It would not say. For the system account this should not happen.
-    Unreadable,
-}
-
-/// Poll the input desktop and keep a worker on it.
+/// Poll what the worker has told us, and keep a worker where the input is.
+///
+/// The service does not look at the input desktop itself, and cannot:
+/// `OpenInputDesktop` is per window station and a service is in session
+/// 0 on `Service-0x0-3e7$`, which is not where the screens are. The
+/// first version did look, from out there, got nothing every time, and
+/// treated nothing as "no news" -- so it held still for ever and never
+/// started a worker, with not one line in the log to say so. That is
+/// this loop's whole history and the reason it is shaped this way now:
+/// a worker goes into the session first, on the desktop that always
+/// exists, and from then on the worker is the one that can see.
 fn mind_workers(exe: &Path, link: Arc<link::Link>) {
     let mut watch = Watch::new();
     let mut running: Option<token::Started> = None;
     // Whether "nobody is logged in yet" has already been said once.
     let mut said_no_session = false;
+    // And whether "nothing has told me where the input is" has. Latched
+    // the same way, because a loop that silently does nothing is the
+    // same failure as the silent refused injection this project started
+    // with, and it has now cost a hardware round.
+    let mut said_nobody_is_watching = false;
 
     while !STOPPING.load(Ordering::SeqCst) {
         std::thread::sleep(watch::LOOK_EVERY);
@@ -555,45 +561,15 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
             }
         }
 
-        let looked = match smkvm_input::platform::windows::desktop::current() {
-            smkvm_input::platform::windows::desktop::InputDesktop::Ours => {
-                match smkvm_input::platform::windows::desktop::ours() {
-                    Some(name) => Looked::Named(name),
-                    None => Looked::Unreadable,
-                }
-            }
-            smkvm_input::platform::windows::desktop::InputDesktop::Elsewhere(name) => {
-                Looked::Named(name)
-            }
-            smkvm_input::platform::windows::desktop::InputDesktop::OutOfReach => Looked::Unreadable,
-        };
-
-        // Told to the daemon's side on every look, whether or not the
-        // worker moves. This is what stops the client injecting into a
-        // worker that is still on the desktop the input has just left --
-        // for up to a quarter of a second, which is long enough for the
-        // first characters of a password typed at a consent prompt to
-        // land in a window behind it.
-        let seen = match &looked {
-            Looked::Named(name) => {
-                link.input_desktop(Some(name));
-                Seen::Desktop(name.clone())
-            }
-            Looked::Unreadable => {
-                link.input_desktop(None);
-                Seen::Unreadable
-            }
-        };
-
         // Only now, once what is true has been recorded. This check used
-        // to sit at the top of the loop and `continue` past both the
-        // liveness check above and the desktop update just made, which
-        // meant that logging off while a worker was running left `Reach`
-        // holding a worker and a matching desktop for a screen that no
-        // longer had a session on it -- claiming input was landing, and
-        // only unstuck when the next injection timed out a second later.
-        // A stale reach claiming reach is the whole subject of this
-        // module, so the wait goes after the observing, not before it.
+        // to sit at the top of the loop and `continue` past the liveness
+        // check above, which meant that logging off while a worker was
+        // running left `Reach` holding a worker and a matching desktop
+        // for a screen that no longer had a session on it -- claiming
+        // input was landing, and only unstuck when the next injection
+        // timed out a second later. A stale reach claiming reach is the
+        // whole subject of this module, so the wait goes after the
+        // observing, not before it.
         if token::console_session().is_none() {
             if !said_no_session {
                 tracing::info!(
@@ -602,9 +578,6 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
                 );
                 said_no_session = true;
             }
-            // And nothing is reachable meanwhile. Said plainly rather
-            // than left to be discovered by a write that fails: without
-            // a session there is no screen for anything to land on.
             link.detach();
             continue;
         }
@@ -612,6 +585,28 @@ fn mind_workers(exe: &Path, link: Arc<link::Link>) {
             tracing::info!("a session is at the screen now");
             said_no_session = false;
         }
+
+        let seen = match link.input_is_on() {
+            Some(name) => {
+                if said_nobody_is_watching {
+                    tracing::info!(desktop = %name, "a worker is reporting where the input is");
+                    said_nobody_is_watching = false;
+                }
+                Seen::Desktop(name)
+            }
+            None => {
+                if !said_nobody_is_watching {
+                    tracing::info!(
+                        "nothing has said which desktop has the input yet. Only something \
+                         inside the session can tell -- a service cannot see session 1's \
+                         window station from session 0 -- so a worker is being put on the \
+                         desktop that always exists, and it will say"
+                    );
+                    said_nobody_is_watching = true;
+                }
+                Seen::Unreadable
+            }
+        };
 
         match watch.saw(seen) {
             Step::Stay => {}
