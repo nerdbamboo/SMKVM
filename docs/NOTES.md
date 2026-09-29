@@ -462,7 +462,12 @@ and they are the ones to keep if this is ever touched again:
   hid `XA` and `ZA`, and would hide whatever Windows adds next.
 - **Every uncertainty resolves towards "somebody can read it."** An entry
   that cannot be read is an offender, a list that says it does not exist
-  is the worst answer rather than an empty one.
+  is the worst answer rather than an empty one, and a descriptor
+  carrying two discretionary lists is refused rather than resolved to
+  the first. That last one is not reachable -- the system function that
+  writes this text serialises exactly one list -- but taking the first
+  and discarding the rest is the shape of every bypass above, so it is
+  refused on principle rather than reasoned about.
 
 `NO_ACCESS_CONTROL` deserves its own sentence, because there was already a
 test for a null list and it did not catch it: the test covered a
@@ -490,6 +495,40 @@ down over the parser's own ignorance is the same shape as the outage this
 hardware round began with. The log says `KEY PRIVATE`, `KEY READABLE` or
 `KEY UNPROVEN`, so which of the three it was is one glance.
 
+And `smkvm status` says so too, every time it is run. A startup line is
+one line, weeks ago, in a file nobody re-reads, so a key that could not
+be proven private would quietly stay that way. The status command does
+not echo the service's verdict, it measures again and by the most direct
+means there is: it opens the file. That is `type
+%ProgramData%\smkvm\device.toml` made into code -- no access list
+parsed, no agreement with `icacls` about anything, and whether the open
+succeeds is not an opinion. What it cannot know is whether the account
+asking is an administrator, who may legitimately read it, so it reports
+what it found and who that would be a fault for rather than pronouncing.
+
+**The three shapes of "this did not work", which must not read alike.**
+Standing at the machine, these are three different situations and only
+one of them is an access list that is wrong:
+
+- `icacls itself would not answer` -- the tool did not run, or what it
+  wrote could not be read back. Nothing was examined and nothing is
+  claimed.
+- `icacls answered, but this build found no entry for …` -- a
+  disagreement about the format of `icacls /save`, not a fault in any
+  list. It names what it did find, because the difference between "I
+  cannot see it" and "it is wrong" is the difference between a minute
+  and an afternoon.
+- `the access list is wrong: … can be reached by …` -- the real thing,
+  naming the trustee.
+
+The `/save` carries `/T`, so one call covers the directory and
+everything beneath it. Without it, `/save` is documented as storing the
+lists of a directory's contents and is often observed to store the
+directory itself -- and this one call has to answer both questions, so
+whichever shape a given Windows returns, the other lookup would find
+nothing and refuse the install. Fail-closed and loud, but an entirely
+avoidable way to spend a deployment.
+
 The check somebody will actually run is `type
 %ProgramData%\smkvm\device.toml` from an ordinary account, which must be
 refused. That one command would have caught all three of the faults above,
@@ -507,7 +546,8 @@ an administrator one:
 
     type %ProgramData%\smkvm\device.toml
 
-It must be refused. That single command would have caught all three of the
+It must be refused. `smkvm status` run from that same account says the
+same thing in one line, and is the way to keep checking afterwards. That single command would have caught all three of the
 access-list faults, and it is worth running before the service is started
 for the first time. The install refuses by itself if the list is wrong, and
 so does the service at startup, but neither is a substitute for looking.
