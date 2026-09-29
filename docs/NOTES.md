@@ -294,9 +294,10 @@ account; whether carrying the three files across leaves an already-paired
 machine paired; whether a worker
 ever in fact fails to read its own desktop name, which is now a refusal
 to start rather than a loop; whether a paste now
-lands inside the budget, and if not whether the second paste is
-instant as designed -- the offer and the fetch are both proven, and
-what remains untested is only the timing; whether a copy made while a consent prompt is up behaves as
+lands inside the budget, and if not whether the promise is renewed and
+the second paste is instant as designed -- the offer, the ownership and
+the fetch are all proven on the machine, and what remains untested is
+the renewal and the timing; whether a copy made while a consent prompt is up behaves as
 described; whether `WTSQueryUserToken` plus `CreateEnvironmentBlock`
 answers with the person's profile;
 whether the quarter-second desktop comparison is in fact quick enough that
@@ -321,6 +322,51 @@ and is the thing to chase. `a worker cannot be started on this desktop`
 means it gave up after five tries, and the cursor is being handed back
 exactly as it was before any of this -- which is the fallback working, not
 a regression.
+
+**Returning from a render without supplying data does not defer the
+question -- it answers it, with nothing.** This is the single most
+important thing in this file about the clipboard, and it was learnt by
+making the previous fault worse.
+
+Delayed rendering works by promising: `SetClipboardData(format, NULL)`
+says "ask me when somebody pastes". When the ask comes as
+`WM_RENDERFORMAT`, the handler must call `SetClipboardData` with real
+data *before it returns*. A handler that returns without doing so has
+not postponed anything. Windows records empty data for that format,
+and **never asks again**. The clipboard then sits there listing the
+right formats, owned by the right process, serving emptiness for ever.
+
+So bounding the render -- which was the right fix for the sixty-second
+hang -- turned a slow paste into a permanently broken one, because the
+slow version at least got asked a second time. The signature on the
+machine was unmistakable once looked for: `EnumClipboardFormats` showed
+`CF_UNICODETEXT` and friends, `GetClipboardOwner` was the worker's own
+process id, and `Get-Clipboard` returned nothing at all, instantly,
+with no render line in the log for any attempt.
+
+The cure is that a render which cannot supply the data **renews the
+promise** rather than abandoning it: it posts itself a message and
+re-takes the clipboard once the handler has returned and the clipboard
+is closed again. The next paste is then asked for afresh, and by then
+the contents that arrived too late are in hand, so it is instant. After
+three renewals with nothing ever served, the clipboard is released
+altogether -- because holding a promise that cannot be kept is worse
+for the person than holding nothing: their own last copy is gone *and*
+every paste yields emptiness. Giving it back at least makes the machine
+work on its own again.
+
+**How to tell any of this from outside.** Two checks, neither
+replaceable by a log line, both run inside the person's session through
+a throwaway scheduled task as their account:
+
+- `Get-Clipboard` -- the verdict on whether a paste *works*.
+- `EnumClipboardFormats` plus `GetClipboardOwner` -- the verdict on
+  whether the offer was *made*, and comparing that owner's process id
+  against the worker's is what proves the delegation itself is sound.
+
+The difference between them is the difference between the three
+clipboard faults in this file, and the log could not distinguish them
+in any of the three rounds.
 
 **The paste that took sixty seconds and then produced nothing.** With
 the worker's voice in place this was one deployment to isolate, with a
@@ -1043,6 +1089,14 @@ worker's desktop and the last polled input desktop and reports no reach
 when they differ, and `mind_workers` tells it what it saw on every look
 rather than only when the worker moves. The comparison is free because the
 service is the system account, so its poll already succeeds.
+
+**Giving up faster is not automatically safer.** Bounding the render
+was correct and made things worse, because the thing being bounded had
+a side effect on being abandoned: the promise was consumed. Before
+shortening any wait, ask what the caller does with the abandonment --
+if it records the absence as an answer, a fast failure is a permanent
+one and the slow version was doing something useful by still being
+there to be asked again.
 
 **Nested deadlines must shrink inwards, and equal is as bad as
 inverted.** Two hops each given thirty seconds is not "thirty seconds
