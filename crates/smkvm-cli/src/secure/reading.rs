@@ -85,6 +85,42 @@ pub enum FromReader {
     Said { level: Level, text: String },
 }
 
+/// Longest a line from the reader may be before it is cut short.
+///
+/// The log is the one artefact every diagnosis in this project has
+/// turned on, and `Said` is the one thing in either direction that is
+/// not a read: unsolicited, arbitrary, and chosen in severity by the
+/// sender. Anything running as the person could connect and fill the
+/// disk, or -- worse, because it is quiet -- embed newlines and
+/// reproduce whole log lines of its own with no `reader:` prefix on
+/// them.
+///
+/// Nothing is escalated by that. It is a diagnostics-integrity
+/// problem, which in this codebase is not a small category.
+pub const LONGEST_SAID: usize = 400;
+
+/// What a line from the reader may be written as.
+///
+/// Control characters go, including the newlines that would let a
+/// line forge others, and the whole thing is cut to something a log
+/// can hold. The cut is announced, so a truncated line cannot be
+/// mistaken for a complete one.
+pub fn tidy(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(LONGEST_SAID)
+        .collect();
+    // Counted in characters, not bytes, because the cut above is in
+    // characters: by bytes, a line of Korean would be reported as
+    // truncated when nothing had been removed, on exactly the
+    // machines this runs on.
+    if text.chars().count() > LONGEST_SAID {
+        out.push_str(" [cut short]");
+    }
+    out
+}
+
 /// Who the reader says it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Who {
@@ -281,5 +317,38 @@ mod tests {
         // service gets written by accident.
         const { assert!(LONGEST_READ > 1024 * 1024, "an image would not fit") };
         const { assert!(LONGEST_READ <= 128 * 1024 * 1024, "no bound worth the name") };
+    }
+
+    #[test]
+    fn a_line_from_the_reader_cannot_forge_another() {
+        // Newlines are the whole of it: `reader: {text}` prefixes the
+        // first line only, so everything after a newline would appear
+        // unprefixed and indistinguishable from the service's own.
+        let forged = tidy("ordinary\nclipboard: KEY PRIVATE\r\nmore");
+        assert!(!forged.contains('\n'), "{forged}");
+        assert!(!forged.contains('\r'), "{forged}");
+        assert_eq!(forged, "ordinary clipboard: KEY PRIVATE  more");
+    }
+
+    #[test]
+    fn a_very_long_line_is_cut_and_says_so() {
+        let said = tidy(&"x".repeat(LONGEST_SAID * 4));
+        assert!(said.chars().count() <= LONGEST_SAID + " [cut short]".len());
+        assert!(said.ends_with("[cut short]"), "{said}");
+    }
+
+    #[test]
+    fn an_ordinary_line_is_left_alone() {
+        let said = tidy("read Uris in 3 ms: 114 bytes");
+        assert_eq!(said, "read Uris in 3 ms: 114 bytes");
+    }
+
+    #[test]
+    fn counting_is_in_characters_not_bytes() {
+        // Three bytes each in UTF-8. Cut by byte length this would be
+        // called truncated when nothing was removed.
+        let korean = "\u{d55c}".repeat(LONGEST_SAID);
+        let said = tidy(&korean);
+        assert!(!said.contains("[cut short]"), "{said}");
     }
 }

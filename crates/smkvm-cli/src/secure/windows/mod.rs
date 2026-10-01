@@ -19,6 +19,25 @@
 /// worked. Backing the bytes with `u64` gives eight-byte alignment, which
 /// is what a pointer on this target wants, and costs a rounding-up of the
 /// length.
+///
+/// **Every `GetTokenInformation` and `QueryServiceConfigW` read in this
+/// program goes through here.** That sentence is in the imperative
+/// because the alternative has been tried: this was found in review,
+/// fixed at the two call sites that existed, and then written again
+/// from scratch in a third -- `token::whoami` -- while the type sat
+/// in this file being used correctly a few hundred lines away. A fix
+/// that lives as a type somewhere else is only applied by somebody
+/// remembering the type exists, and the fourth person to write one of
+/// these calls will not. If you are adding one, the shape you want is
+///
+/// ```ignore
+/// let mut buffer = Aligned::new(wanted as usize);
+/// GetTokenInformation(token, What, Some(buffer.as_mut_ptr().cast()), ..);
+/// let thing = &*buffer.as_ptr().cast::<WHATEVER>();
+/// ```
+///
+/// and the shape that is wrong, compiles, passes every test and is
+/// undefined behaviour is `vec![0u8; n]` in place of the first line.
 pub(crate) struct Aligned(Vec<u64>);
 
 impl Aligned {

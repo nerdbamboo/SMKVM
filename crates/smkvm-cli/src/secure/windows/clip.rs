@@ -53,7 +53,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use smkvm_clipboard::{Available, CatchDrag, ClipboardError, Drive, Fetch, Read, Watch, Write};
+use smkvm_clipboard::{CatchDrag, ClipboardError, Drive, Fetch, Read, Write};
 use smkvm_proto::ClipFormat;
 
 use crate::secure::windows::link::Link;
@@ -143,22 +143,6 @@ fn no_worker() -> ClipboardError {
     ClipboardError::Display(
         "no worker holds the clipboard on the desktop the person is using".into(),
     )
-}
-
-/// Changes the worker noticed, arriving as they happen.
-pub struct WatchThroughWorker {
-    pub changes: Receiver<Available>,
-}
-
-impl Watch for WatchThroughWorker {
-    fn next_change(&mut self) -> Option<Available> {
-        // Blocks until the worker says something or the link goes, which
-        // is exactly the contract: `None` means this can no longer be
-        // watched. A worker being replaced does not end it -- the sender
-        // lives on the link, not on the worker -- so a copy made after
-        // a consent prompt closes is still noticed.
-        self.changes.recv().ok()
-    }
 }
 
 /// Reading what is on the person's clipboard.

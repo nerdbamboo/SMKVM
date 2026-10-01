@@ -368,7 +368,19 @@ that runs as the person; `secure::windows::readers` is the service's
 end of it. Offering, rendering and injection did not move and run as
 the system account exactly as before.
 
-Four things about it that are decisions rather than details:
+Five things about it that are decisions rather than details:
+
+- **Nothing chooses a source once.** The backends are built at the
+  top of the daemon, outside the reconnect loop, because the
+  clipboard outlives any one session -- and the service starts at
+  boot, before anybody has logged in. So asking "is there a reader?"
+  at that moment answers no for the life of the process. The first
+  version did exactly that: it latched the worker, logged that a
+  reader was running, and consulted nothing. Copies now arrive on one
+  channel that both halves feed, and a read asks who can answer at
+  the time it is made. **The line that proves it is working is
+  `the reader says something was copied`**, because that one comes
+  from the consuming end and appears only if something is consuming.
 
 - **The reader's pipe admits interactive users, and the worker's
   still admits nobody but the system account.** Two pipes, because
@@ -388,7 +400,17 @@ Four things about it that are decisions rather than details:
 - **The reader follows the session; the worker follows the desktop.**
   They are minded by separate loops because they change on different
   occasions -- a worker several times a minute while consent prompts
-  come and go, a reader at logon and logoff.
+  come and go, a reader at logon and logoff. Starting one is tried
+  five times and then given up on until the next logon, because the
+  failure that matters is somebody else on the desktop winning the
+  race to the pipe, and retrying that for ever costs a process
+  started as the system account every five seconds.
+- **`FromReader::Said` is the one message in either direction that is
+  not a read**, so it is capped, stripped of control characters and
+  rate-limited. The security argument was written over `ToReader` and
+  has to cover both directions: newlines in a line from the reader
+  would otherwise reproduce whole log lines with no `reader:` prefix
+  on them, in the one artefact every diagnosis here has turned on.
 
 ### Taking the two measurements
 
@@ -2173,6 +2195,18 @@ write. It stays and says so instead, once when it starts failing and
 once when it recovers, through `tracing` rather than through the
 outbox, which would be the line trying to report its own failure to
 be reported.
+
+**A fix that lives as a type is only applied by somebody remembering
+the type exists.** `Aligned` was added after a review found an
+unaligned `TOKEN_USER` read, applied at the two call sites that
+existed -- and then the same mistake was written from scratch in a
+third, `token::whoami`, while the type sat a few hundred lines away
+being used correctly. `vec![0u8; n]` compiles, passes every test and
+is undefined behaviour. The note on `Aligned` now says in the
+imperative that every `TOKEN_*` and `QueryServiceConfigW` read goes
+through it, and shows both the right shape and the wrong one, which
+is the most that can be done short of making the wrong form
+impossible to write.
 
 **A limit should count only the thing it is named for, and say what
 that thing was.** `renewed 4 of 3 times` is a limit working

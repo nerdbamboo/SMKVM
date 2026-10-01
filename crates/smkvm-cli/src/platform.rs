@@ -192,9 +192,7 @@ pub fn clipboard() -> Result<Backends> {
         // The person's clipboard belongs to their session, so the
         // worker holds it and this is a way of asking.
         if let Some(link) = crate::secure::windows::link::worker() {
-            use crate::secure::windows::clip::{
-                ReadThroughWorker, WatchThroughWorker, WriteThroughWorker,
-            };
+            use crate::secure::windows::clip::WriteThroughWorker;
             use crate::secure::windows::readers;
 
             // The two halves have different identity requirements and
@@ -206,35 +204,24 @@ pub fn clipboard() -> Result<Backends> {
             // the worker exactly as it did. Watching and reading do
             // not: a process running as the system account sees one
             // format where the person sees five, measured three ways
-            // including a thread impersonating them. So those two
-            // come from a reader running as the person, when there is
-            // a person to be.
+            // including a thread impersonating them.
             //
-            // When there is not -- between logoff and logon -- the
-            // worker's own watch and read are used instead. They see
-            // nothing, which is the truth: there is no clipboard,
-            // because there is nobody whose clipboard it would be. It
-            // is not an error and is not written as one.
-            let (watch, read): (
-                Box<dyn smkvm_clipboard::Watch + Send>,
-                Box<dyn smkvm_clipboard::Read + Send>,
-            ) = match readers::reader() {
-                Some(reader) => (
-                    Box::new(readers::WatchThroughReader {
-                        copies: reader.watch(),
-                    }),
-                    Box::new(readers::ReadThroughReader),
-                ),
-                None => (
-                    Box::new(WatchThroughWorker {
-                        changes: link.watch_clipboard(),
-                    }),
-                    Box::new(ReadThroughWorker(link.clone())),
-                ),
-            };
+            // Which half answers is decided per call and per copy,
+            // never here. This runs once, at the top of the daemon,
+            // outside the reconnect loop -- the clipboard outlives
+            // any one session, as `client.rs` says. The service
+            // starts at boot, so asking "is there a reader?" at this
+            // moment answers no for the life of the process, and the
+            // first version of this did exactly that: it latched the
+            // worker, logged that a reader was running, and consulted
+            // nothing. Copies arrive on one channel that both halves
+            // feed, and a read asks who can answer at the time it is
+            // made.
+            let (copies_tx, copies_rx) = std::sync::mpsc::channel();
+            readers::copies_go_to(copies_tx);
             return Ok(Backends {
-                watch,
-                read,
+                watch: Box::new(readers::WatchWhoeverSees { copies: copies_rx }),
+                read: Box::new(readers::ReadWhoeverCan(link.clone())),
                 write: Box::new(WriteThroughWorker(link)),
             });
         }

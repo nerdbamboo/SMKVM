@@ -563,6 +563,22 @@ fn serve() -> Result<()> {
 /// could not be started.
 const READER_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How many times a reader may fail to start for one session before
+/// this stops trying.
+///
+/// There is no point retrying for ever. The failure that matters is
+/// somebody else on the desktop winning the race to the pipe:
+/// `client_is` catches it and nothing is read from the impostor, but
+/// retrying every five seconds until logoff costs a warning and a
+/// process started as the system account each time, and the rest of
+/// this codebase does not leave unbounded loops. `watch` has
+/// `GIVE_UP_AFTER` for the same shape.
+///
+/// Giving up is not silent, and what it costs is small and
+/// recoverable: the clipboard stops going out from this machine
+/// until the person logs out and in, and nothing else changes.
+const READER_TRIES: u32 = 5;
+
 /// Keep a reader running as whoever is at the screen, and nothing
 /// running when nobody is.
 ///
@@ -588,6 +604,10 @@ fn mind_readers(exe: &Path) {
     // cannot be started is worth retrying -- the session may be
     // mid-logon -- but not four times a second.
     let mut not_before = Instant::now();
+    // Counted per session, so logging out and in again is a fresh
+    // start rather than a machine that has given up for ever.
+    let mut failures = 0u32;
+    let mut given_up_on: Option<u32> = None;
 
     while !STOPPING.load(Ordering::SeqCst) {
         std::thread::sleep(watch::LOOK_EVERY);
@@ -602,6 +622,8 @@ fn mind_readers(exe: &Path) {
                 if serving.take().is_some() {
                     readers::let_go("nobody is at the screen any more");
                 }
+                given_up_on = None;
+                failures = 0;
                 if !said_nobody {
                     tracing::info!(
                         "clipboard: nobody is logged in, so there is nothing to read here. \
@@ -620,18 +642,39 @@ fn mind_readers(exe: &Path) {
                     readers::let_go("somebody else is at the screen now");
                     serving = None;
                 }
-                if Instant::now() < not_before {
+                // A different session is a different question, so
+                // whatever was given up on does not count against it.
+                if given_up_on.is_some_and(|was| was != now) {
+                    given_up_on = None;
+                    failures = 0;
+                }
+                if given_up_on == Some(now) || Instant::now() < not_before {
                     continue;
                 }
                 match readers::start(exe, now) {
-                    Ok(_) => serving = Some(now),
+                    Ok(_) => {
+                        serving = Some(now);
+                        failures = 0;
+                    }
                     Err(e) => {
-                        tracing::warn!(
-                            "clipboard: could not start a reader in session {now}: {e:#}. \
-                             What this machine copies will not reach another until one \
-                             starts; everything else is unaffected"
-                        );
+                        failures += 1;
                         not_before = Instant::now() + READER_RETRY_AFTER;
+                        if failures >= READER_TRIES {
+                            given_up_on = Some(now);
+                            tracing::warn!(
+                                "clipboard: a reader could not be started in session \
+                                 {now} after {failures} tries, the last because {e:#}. \
+                                 Not trying again until somebody logs in again. What \
+                                 this machine copies will not reach another until then; \
+                                 the keyboard, the mouse and what other machines copy \
+                                 are all unaffected"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "clipboard: could not start a reader in session {now} \
+                                 (try {failures} of {READER_TRIES}): {e:#}"
+                            );
+                        }
                     }
                 }
             }

@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use smkvm_clipboard::{Available, Fetch};
+use smkvm_clipboard::Fetch;
 use smkvm_input::{Inject, InputError, Monitors};
 use smkvm_layout::Monitor;
 use smkvm_proto::{ClipFormat, Key, MouseButton, Scroll};
@@ -90,7 +90,6 @@ pub struct Link {
     clipboard_reads: Waiting<Result<Vec<u8>, String>>,
     drags: Waiting<Vec<PathBuf>>,
     /// Where noticed copies go, while anything is listening.
-    clipboard_changes: Mutex<Option<std::sync::mpsc::Sender<Available>>>,
     /// What this machine is currently announcing on the person's
     /// clipboard, and where to get it.
     ///
@@ -121,7 +120,6 @@ impl Link {
             said_input_is_on: Mutex::new(None),
             clipboard_reads: Waiting::new(),
             drags: Waiting::new(),
-            clipboard_changes: Mutex::new(None),
             offer: Mutex::new(None),
             clipboard_is_the_workers: Mutex::new(false),
         })
@@ -172,13 +170,6 @@ impl Link {
 
     pub fn drags(&self) -> &Waiting<Vec<PathBuf>> {
         &self.drags
-    }
-
-    /// Where to send copies the worker notices.
-    pub fn watch_clipboard(&self) -> std::sync::mpsc::Receiver<Available> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        *self.clipboard_changes.lock().expect("not poisoned") = Some(tx);
-        rx
     }
 
     /// Remember what is being announced, so a new worker can be told.
@@ -323,31 +314,12 @@ impl Link {
                     .expect("not poisoned")
                     .refused(Instant::now());
             }
+            // Into the same one channel the reader's copies go
+            // to. Which half noticed is a fact about this machine's
+            // arrangement, not about the copy, and nothing
+            // downstream should have to know it.
             FromWorker::ClipboardChanged(formats) => {
-                let held = self.clipboard_changes.lock().expect("not poisoned");
-                match held.as_ref() {
-                    Some(changes) => {
-                        tracing::info!(
-                            ?formats,
-                            "clipboard: the worker says something was copied on the desktop"
-                        );
-                        if changes.send(Available { formats }).is_err() {
-                            tracing::warn!(
-                                "clipboard: nothing is listening for copies any more, so what \
-                                 this machine copies will not reach another"
-                            );
-                        }
-                    }
-                    // Dropped in silence until now. This is the far
-                    // end of the only path by which a copy made here
-                    // reaches another machine, and an unwired
-                    // receiver here loses every copy without a word.
-                    None => tracing::warn!(
-                        ?formats,
-                        "clipboard: the worker says something was copied, but nothing on this \
-                         side is listening for copies, so it goes nowhere"
-                    ),
-                }
+                crate::secure::windows::readers::copied(formats, "worker")
             }
             FromWorker::ClipboardRead { id, bytes } => {
                 self.clipboard_reads.answer(id, bytes);

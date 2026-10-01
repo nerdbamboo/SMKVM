@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use smkvm_clipboard::{Available, ClipboardError, Read, Watch};
@@ -17,6 +17,7 @@ use crate::secure::reading::{self, FromReader, ToReader, LONGEST_READ};
 use crate::secure::windows::clip::Waiting;
 use crate::secure::windows::{pipe, secret, token};
 use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
+use smkvm_clipboard::{Say, Throttle};
 
 /// How long to wait for a reader to answer.
 ///
@@ -27,6 +28,9 @@ use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
 /// budget of its own.
 pub const READER_ANSWERS_WITHIN: Duration = Duration::from_secs(3);
 
+/// How long a reader is given to stop politely before it is ended.
+const LET_GO_GRACE: Duration = Duration::from_millis(500);
+
 /// How long to wait for a started reader to connect.
 const READER_CONNECTS_WITHIN: Duration = Duration::from_secs(10);
 
@@ -35,11 +39,9 @@ pub struct Reader {
     write: Mutex<pipe::Pipe>,
     answers: Waiting<Result<Vec<u8>, String>>,
     listed: Waiting<Vec<ClipFormat>>,
-    /// Where copies the reader notices are sent.
-    copies: Mutex<Option<std::sync::mpsc::Sender<Available>>>,
     /// Kept so the process is not reaped while its id is being
     /// checked, and so it can be ended.
-    _running: token::Started,
+    running: token::Started,
     pub who: String,
 }
 
@@ -59,61 +61,106 @@ impl Reader {
         self.listed.nobody_is_answering();
     }
 
-    /// Where to send copies this reader notices.
-    pub fn watch(&self) -> std::sync::mpsc::Receiver<Available> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        *self.copies.lock().expect("not poisoned") = Some(tx);
-        rx
-    }
-
     fn heard(&self, said: FromReader) {
         match said {
-            FromReader::Copied(formats) => {
-                let held = self.copies.lock().expect("not poisoned");
-                match held.as_ref() {
-                    Some(copies) => {
-                        tracing::info!(
-                            ?formats,
-                            "clipboard: the reader says something was copied on the desktop"
-                        );
-                        if copies.send(Available { formats }).is_err() {
-                            tracing::warn!(
-                                "clipboard: nothing is listening for copies, so what this \
-                                 machine copies will not reach another"
-                            );
-                        }
-                    }
-                    // Said rather than discarded, for the same reason
-                    // the worker's version of this is: the far end of
-                    // the only path outward losing everything in
-                    // silence is how a broken half came to look like
-                    // an absent one.
-                    None => tracing::warn!(
-                        ?formats,
-                        "clipboard: the reader says something was copied, but nothing on \
-                         this side is listening"
-                    ),
-                }
-            }
+            FromReader::Copied(formats) => copied(formats, "reader"),
             FromReader::OnIt { id, formats } => {
                 self.listed.answer(id, formats);
             }
             FromReader::Read { id, bytes } => {
                 self.answers.answer(id, bytes);
             }
-            FromReader::Said { level, text } => match level {
-                Level::Debug => tracing::debug!("reader: {text}"),
-                Level::Info => tracing::info!("reader: {text}"),
-                Level::Warn => tracing::warn!("reader: {text}"),
-                Level::Error => tracing::error!("reader: {text}"),
-            },
+            // Tidied and rate-limited, because this is the one
+            // message in either direction that is not a read.
+            // Unsolicited, arbitrary, and chosen in severity by
+            // whatever is at the other end of a pipe the person can
+            // reach -- and the log is the artefact every diagnosis
+            // in this project has turned on.
+            FromReader::Said { level, text } => {
+                let text = reading::tidy(&text);
+                match SAID
+                    .get_or_init(Throttle::new)
+                    .asked_at(&text, Instant::now())
+                {
+                    Say::No => {}
+                    Say::Yes => say_it(level, &text),
+                    Say::YesAfter(held_back) => say_it(
+                        level,
+                        &format!("{text} [and {held_back} more like it in the last second]"),
+                    ),
+                }
+            }
             FromReader::Ready { .. } => {}
         }
     }
 }
 
+/// What the reader has said lately, so that a flood is a line and a
+/// count rather than a log nobody can read.
+static SAID: std::sync::OnceLock<Throttle> = std::sync::OnceLock::new();
+
+fn say_it(level: Level, text: &str) {
+    match level {
+        Level::Debug => tracing::debug!("reader: {text}"),
+        Level::Info => tracing::info!("reader: {text}"),
+        Level::Warn => tracing::warn!("reader: {text}"),
+        Level::Error => tracing::error!("reader: {text}"),
+    }
+}
+
 /// The reader this service is using, if it has one.
 static READER: Mutex<Option<Arc<Reader>>> = Mutex::new(None);
+
+/// Where copies go, whichever half noticed them.
+///
+/// One channel for the life of the daemon, rather than one per
+/// reader, and that is the fix for the fault that made the first
+/// version of this a no-op.
+///
+/// The backends are built once, at the top of the daemon, outside the
+/// reconnect loop -- `client.rs` says so in its own comment, because
+/// the clipboard outlives any one session. The service starts at
+/// boot, before anybody has logged in, so asking "is there a reader?"
+/// at that moment answers no for the life of the process. A person
+/// logging in an hour later got a reader that nothing consulted, and
+/// a log line saying it was working.
+///
+/// So nothing chooses a source once. Copies arrive here from the
+/// reader when there is one and from the worker when there is not,
+/// and whoever is watching is watching this.
+static COPIES: Mutex<Option<std::sync::mpsc::Sender<Available>>> = Mutex::new(None);
+
+/// Watch here for copies, from whichever half can see them.
+pub fn copies_go_to(send: std::sync::mpsc::Sender<Available>) {
+    *COPIES.lock().expect("not poisoned") = Some(send);
+}
+
+/// Somebody copied something. Called by both halves.
+pub fn copied(formats: Vec<ClipFormat>, noticed_by: &str) {
+    let held = COPIES.lock().expect("not poisoned");
+    match held.as_ref() {
+        Some(copies) => {
+            tracing::info!(
+                ?formats,
+                "clipboard: the {noticed_by} says something was copied on the desktop"
+            );
+            if copies.send(Available { formats }).is_err() {
+                tracing::warn!(
+                    "clipboard: nothing is listening for copies, so what this machine \
+                     copies will not reach another"
+                );
+            }
+        }
+        // Said rather than discarded. The far end of the only path
+        // outward losing everything in silence is how a broken half
+        // came to look like an absent one.
+        None => tracing::warn!(
+            ?formats,
+            "clipboard: the {noticed_by} says something was copied, but nothing on this \
+             side is listening"
+        ),
+    }
+}
 
 /// The reader now, or nothing if there is nobody logged in.
 pub fn reader() -> Option<Arc<Reader>> {
@@ -134,6 +181,14 @@ pub fn let_go(why: &str) {
         );
         reader.say(&ToReader::Stop);
         reader.nobody_is_answering();
+        // Asked first, then ended. `Stop` is a courtesy that lets it
+        // put the clipboard down tidily; it is not a guarantee, and
+        // a reader that ignores it would otherwise go on running as
+        // the person with a watch open and nothing holding its
+        // handle. The grace is short because nothing it does on the
+        // way out takes longer.
+        std::thread::sleep(LET_GO_GRACE);
+        reader.running.kill();
     }
 }
 
@@ -169,27 +224,43 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
     )
     .context("starting the reader as the person at the desk")?;
 
-    pipe::accept(&listening, READER_CONNECTS_WITHIN)
-        .context("waiting for the reader to connect")?;
-    listening.client_is(running.pid)?;
-
-    let mut reading = listening.share()?;
-    let first: FromReader = read_frame_up_to(&mut reading, LONGEST_READ)
-        .map_err(|e| anyhow::anyhow!("the reader said nothing we could read: {e}"))?;
-    let who = reading::welcome(first).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if who.session != session {
-        bail!(
-            "the reader says it is in session {} and it was started in {session}",
-            who.session
-        );
-    }
+    // Every failure from here ends the process it started.
+    //
+    // Dropping `listening` does break the pipe, and the reader does
+    // exit when its next read fails -- but that makes this
+    // function's cleanup depend on the helper behaving, which is
+    // exactly the conclusion an earlier review reached about the
+    // worker and exactly what `start_worker` was changed to stop
+    // doing. A function that starts a process as somebody cleans up
+    // after itself.
+    let settled = (|| -> Result<(pipe::Pipe, reading::Who)> {
+        pipe::accept(&listening, READER_CONNECTS_WITHIN).context("waiting for the reader")?;
+        listening.client_is(running.pid)?;
+        let mut reading = listening.share()?;
+        let first: FromReader = read_frame_up_to(&mut reading, LONGEST_READ)
+            .map_err(|e| anyhow::anyhow!("the reader said nothing we could read: {e}"))?;
+        let who = reading::welcome(first).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if who.session != session {
+            bail!(
+                "the reader says it is in session {} and it was started in {session}",
+                who.session
+            );
+        }
+        Ok((reading, who))
+    })();
+    let (mut reading, who) = match settled {
+        Ok(settled) => settled,
+        Err(e) => {
+            running.kill();
+            return Err(e);
+        }
+    };
 
     let reader = Arc::new(Reader {
         write: Mutex::new(listening),
         answers: Waiting::new(),
         listed: Waiting::new(),
-        copies: Mutex::new(None),
-        _running: running,
+        running,
         who: who.who.clone(),
     });
     tracing::info!(
@@ -216,7 +287,22 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
             // "nobody is logged in" at once instead of waiting out
             // three seconds against a process that has gone.
             listener.nobody_is_answering();
-            *READER.lock().expect("not poisoned") = None;
+            // Only if it is still this reader's slot.
+            //
+            // On a plain death this is simply true. On a user
+            // switch it is not: `mind_readers` lets the old reader
+            // go and starts a new one in the same breath, and the
+            // old listener thread wakes *after* the new one has been
+            // installed. Clearing unconditionally nulled a healthy
+            // reader, after which the minding loop saw no reader,
+            // believed it was still serving that session, and
+            // started a third -- leaving the second running as the
+            // person, unreferenced, with a clipboard watch open and
+            // nothing holding its handle.
+            let mut held = READER.lock().expect("not poisoned");
+            if held.as_ref().is_some_and(|now| Arc::ptr_eq(now, &listener)) {
+                *held = None;
+            }
         })
         .context("listening to the reader")?;
 
@@ -224,33 +310,34 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
     Ok(reader)
 }
 
-/// Watching the person's clipboard, through the reader.
-pub struct WatchThroughReader {
+/// Copies, from whichever half noticed them.
+pub struct WatchWhoeverSees {
     pub copies: std::sync::mpsc::Receiver<Available>,
 }
 
-impl Watch for WatchThroughReader {
+impl Watch for WatchWhoeverSees {
     fn next_change(&mut self) -> Option<Available> {
         self.copies.recv().ok()
     }
 }
 
-/// Reading the person's clipboard, through the reader.
-pub struct ReadThroughReader;
+/// Reading the person's clipboard: through the reader when there is
+/// one, and through the worker when there is not.
+///
+/// Asked on every call rather than chosen once. There is no moment at
+/// which this can be decided: the backends are built before anybody
+/// has logged in, and the reader appears later.
+pub struct ReadWhoeverCan(pub Arc<crate::secure::windows::link::Link>);
 
-impl Read for ReadThroughReader {
+impl Read for ReadWhoeverCan {
     fn read(&mut self, format: &ClipFormat) -> smkvm_clipboard::Result<Vec<u8>> {
-        // Absence is answered at once and by name.
-        //
-        // Between logoff and logon there is nobody to be, so there is
-        // no reader; the same is true for the moment after one has
-        // died and before another is started. Waiting out a deadline
-        // to say so would turn an ordinary state of the machine into
-        // something that looks like a hang.
         let Some(reader) = reader() else {
-            return Err(ClipboardError::Display(
-                "nobody is logged in here, so this machine has no clipboard to read".into(),
-            ));
+            // No reader, so the worker answers. It will see nothing a
+            // person copied -- that is the whole finding -- but when
+            // nobody is logged in there is nothing to see, and when
+            // somebody is and the reader has died, the worker's
+            // refusal is a better answer than a refusal of ours.
+            return crate::secure::windows::clip::ReadThroughWorker(self.0.clone()).read(format);
         };
         let (id, answer) = reader.answers.ask();
         if !reader.say(&ToReader::Read {

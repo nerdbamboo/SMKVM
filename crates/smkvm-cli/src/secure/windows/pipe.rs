@@ -271,6 +271,35 @@ impl Pipe {
         }
     }
 
+    /// Is the process at the other end the one we started?
+    ///
+    /// The mirror of [`Pipe::server_is_the_system`], and needed for
+    /// the same reason pointing the other way. The reader's pipe
+    /// admits the person at the desk, so it admits every process
+    /// they are running, and the name being unguessable only means
+    /// an impostor has to be lucky rather than that it cannot
+    /// happen. The process that answers must be the one that was
+    /// started.
+    ///
+    /// Asked while the handle to the started process is still
+    /// held open, so its id cannot have been given to anything
+    /// else in the meantime; the reuse hazard described on the
+    /// check below does not arise here for that reason.
+    pub fn client_is(&self, expected: u32) -> Result<()> {
+        let mut pid = 0u32;
+        // SAFETY: a valid pipe handle and a place for the id.
+        unsafe { GetNamedPipeClientProcessId(self.handle, &mut pid) }
+            .context("asking which process connected to this pipe")?;
+        if pid != expected {
+            bail!(
+                "process {pid} answered the reader's pipe, and the reader that was \
+                 started is process {expected}. Something else on this desktop got there \
+                 first; nothing has been read from it"
+            );
+        }
+        Ok(())
+    }
+
     /// Which process is on the other end, and is it the system account?
     ///
     /// Asked by the worker, of the service, before the worker says
@@ -287,35 +316,6 @@ impl Pipe {
     /// window. It is written down here so the next reader does not
     /// rediscover it and wonder whether anybody noticed; it is not worth
     /// code.
-    /// Is the process at the other end the one we started?
-    ///
-    /// The mirror of [`Pipe::server_is_the_system`], and needed for
-    /// the same reason pointing the other way. The reader's pipe
-    /// admits the person at the desk, so it admits every process
-    /// they are running, and the name being unguessable only means
-    /// an impostor has to be lucky rather than that it cannot
-    /// happen. The process that answers must be the one that was
-    /// started.
-    ///
-    /// A process id can be reused after the process exits, which is
-    /// why this is checked at the moment of connecting, while the
-    /// handle to the started process is still held open and its id
-    /// therefore cannot be given to anything else.
-    pub fn client_is(&self, expected: u32) -> Result<()> {
-        let mut pid = 0u32;
-        // SAFETY: a valid pipe handle and a place for the id.
-        unsafe { GetNamedPipeClientProcessId(self.handle, &mut pid) }
-            .context("asking which process connected to this pipe")?;
-        if pid != expected {
-            bail!(
-                "process {pid} answered the reader's pipe, and the reader that was \
-                 started is process {expected}. Something else on this desktop got there \
-                 first; nothing has been read from it"
-            );
-        }
-        Ok(())
-    }
-
     pub fn server_is_the_system(&self) -> Result<()> {
         let mut pid = 0u32;
         // SAFETY: a valid pipe handle and a place for the id.

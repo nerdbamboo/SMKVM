@@ -62,6 +62,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use windows::core::{PCWSTR, PWSTR};
+
+use crate::secure::windows::Aligned;
 use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW,
@@ -389,8 +391,14 @@ pub fn whoami() -> String {
     if wanted == 0 {
         return "(could not be read)".into();
     }
-    let mut buffer = vec![0u8; wanted as usize];
-    // SAFETY: the buffer is the size the call just asked for.
+    // `Aligned`, not `vec![0u8; ..]`. A `TOKEN_USER` holds a pointer
+    // and needs eight-byte alignment; a byte vector promises one, and
+    // taking a reference to a structure inside it is undefined
+    // behaviour however well the hardware tolerates the read. This
+    // exact mistake was found in review, fixed elsewhere, and then
+    // written again here -- see the note on `Aligned` itself.
+    let mut buffer = Aligned::new(wanted as usize);
+    // SAFETY: the buffer is at least the size the call just asked for.
     if unsafe {
         GetTokenInformation(
             token.0,
@@ -405,7 +413,7 @@ pub fn whoami() -> String {
         return "(could not be read)".into();
     }
     // SAFETY: the buffer holds a TOKEN_USER, which is what was asked
-    // for, and it outlives the borrow.
+    // for; it is aligned for one, and it outlives the borrow.
     let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
     let mut name = [0u16; 256];
