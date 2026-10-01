@@ -33,6 +33,7 @@ use anyhow::{Context, Result};
 use smkvm_clipboard::platform::windows::WindowsClipboard;
 use smkvm_clipboard::{Read as _, Watch as _};
 
+use crate::secure::outbox::Outbox;
 use crate::secure::reading::{FromReader, ToReader, LONGEST_READ, READER_PROTOCOL};
 use crate::secure::windows::pipe;
 use crate::secure::windows::token;
@@ -41,6 +42,11 @@ use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
 /// One way of speaking to the service, shared by the thread
 /// answering questions and the thread noticing copies.
 type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
+
+/// How many messages may be waiting to go to the service before the
+/// rest are refused. Generous, because a burst is the moment they
+/// matter; bounded, because a queue nobody drains must not grow.
+const OUTBOX_ROOM: usize = 256;
 
 /// How often to look at the sequence number, and how long to let a
 /// copy settle once it has moved.
@@ -67,13 +73,25 @@ const SETTLE_FOR: Duration = Duration::from_millis(400);
 /// leaves what it had said.
 ///
 /// It is temporary. When the reader is reliable it goes.
+#[derive(Clone)]
 struct Trace(Option<std::path::PathBuf>);
+
+/// One appender at a time.
+///
+/// Four threads write here and two lines ran together mid-word in
+/// the first run that mattered. An append is not atomic across
+/// processes either, but there is only one process writing this
+/// file, and within it a lock is the whole fix. This is the file
+/// that gets read first when nothing else speaks, so it is the last
+/// place to tolerate a line that cannot be trusted.
+static APPENDING: Mutex<()> = Mutex::new(());
 
 impl Trace {
     fn say(&self, line: &str) {
         let Some(path) = &self.0 else {
             return;
         };
+        let _one_at_a_time = APPENDING.lock().expect("not poisoned");
         use std::io::Write as _;
         let since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -123,15 +141,59 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
     let mut from_service = to_service.share()?;
     trace.say("sharing the pipe worked");
 
-    // One writer, shared. There are two threads that speak: this one
-    // answering questions, and the watch noticing copies.
-    let speaking = Arc::new(Mutex::new(to_service.share()?));
+    // Nothing writes to the pipe from a thread that must not stop.
+    //
+    // This was a shared `Mutex<Pipe>` and an unbounded `write_all`,
+    // which is the exact pattern that wedged the worker three times
+    // and which `secure::outbox` was written to end. It was
+    // harmless here until the clipboard's own lines were relayed
+    // down the pipe -- and then the window thread began calling it
+    // from inside `WM_CLIPBOARDUPDATE`, which is the one thread in
+    // this process that may never wait.
+    //
+    // The symptom was exact: the first notification arrived, the
+    // handler said so, the write did not come back, and after that
+    // there was no settle, no second notification -- the message was
+    // posted and never collected -- and no word from the sequence
+    // watch either, because its first `tell` queued behind the same
+    // lock. Two independent paths stopping together, sharing one
+    // thing.
+    //
+    // So everything is posted, and one thread does the waiting.
+    let (outbox, collect) = Outbox::with_room_for(OUTBOX_ROOM);
+    let outbox = Arc::new(outbox);
+    {
+        let mut writing = to_service.share()?;
+        std::thread::Builder::new()
+            .name("smkvm-reader-outbox".into())
+            .spawn(move || {
+                let mut failing = false;
+                while let Ok(message) = collect.recv() {
+                    match say(&mut writing, &message) {
+                        Ok(()) => failing = false,
+                        Err(e) => {
+                            if !failing {
+                                // Through `tracing`, never through
+                                // the outbox: this line would
+                                // otherwise be the outbox trying to
+                                // report its own failure to report.
+                                tracing::warn!("the reader cannot reach the service: {e}");
+                                failing = true;
+                            }
+                            // Deliberately still draining. Ending
+                            // here drops the receiver and refuses
+                            // every later message for the life of
+                            // the process on the strength of one
+                            // failed write.
+                        }
+                    }
+                }
+            })
+            .context("starting the reader's outbox")?;
+    }
     let speak: Saying = {
-        let speaking = speaking.clone();
-        Arc::new(move |message: &FromReader| {
-            let mut held = speaking.lock().expect("not poisoned");
-            say(&mut *held, message).is_ok()
-        })
+        let outbox = outbox.clone();
+        Arc::new(move |message: &FromReader| outbox.post(message.clone()).arrived())
     };
 
     // The first thing, before the clipboard and before anything that
@@ -272,50 +334,63 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
     let asking = handle.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-sequence".into())
-        .spawn(move || loop {
-            std::thread::sleep(LOOK_EVERY);
-            let now = smkvm_clipboard::platform::windows::sequence_number();
-            if now == claimed.load(Ordering::Relaxed) {
-                continue;
-            }
-            // Settle first: a copy arrives as several changes, and
-            // the shell's file copy assembles itself over a second
-            // or so.
-            std::thread::sleep(SETTLE_FOR);
-            let settled = smkvm_clipboard::platform::windows::sequence_number();
-            if claimed.swap(settled, Ordering::Relaxed) == settled {
-                continue;
-            }
-            match asking.available() {
-                Ok(there) if there.formats.is_empty() => tell(
-                    &polling,
-                    Level::Info,
-                    format!(
-                        "the clipboard changed (sequence {settled}) but holds none of the \
-                         formats we share"
-                    ),
+        .spawn(move || {
+            tell(
+                &polling,
+                Level::Info,
+                format!(
+                    "watching the sequence number as well, every {} ms; it is at {} now",
+                    LOOK_EVERY.as_millis(),
+                    smkvm_clipboard::platform::windows::sequence_number()
                 ),
-                Ok(there) => {
-                    tell(
+            );
+            loop {
+                std::thread::sleep(LOOK_EVERY);
+                let now = smkvm_clipboard::platform::windows::sequence_number();
+                if now == claimed.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // Settle first: a copy arrives as several changes, and
+                // the shell's file copy assembles itself over a second
+                // or so.
+                std::thread::sleep(SETTLE_FOR);
+                let settled = smkvm_clipboard::platform::windows::sequence_number();
+                if claimed.swap(settled, Ordering::Relaxed) == settled {
+                    continue;
+                }
+                match asking.available() {
+                    Ok(there) if there.formats.is_empty() => tell(
                         &polling,
                         Level::Info,
                         format!(
-                            "something was copied here: {:?} -- noticed by watching the \
+                            "the clipboard changed (sequence {settled}) but holds none of the \
+                         formats we share"
+                        ),
+                    ),
+                    Ok(there) => {
+                        tell(
+                            &polling,
+                            Level::Info,
+                            format!(
+                                "something was copied here: {:?} -- noticed by watching the \
                              sequence number ({settled}), not by being told. This process \
                              has been told of {} changes since it started",
-                            there.formats,
-                            smkvm_clipboard::platform::windows::NOTICED.load(Ordering::Relaxed)
-                        ),
-                    );
-                    if !polling(&FromReader::Copied(there.formats)) {
-                        return;
+                                there.formats,
+                                smkvm_clipboard::platform::windows::NOTICED.load(Ordering::Relaxed)
+                            ),
+                        );
+                        if !polling(&FromReader::Copied(there.formats)) {
+                            return;
+                        }
                     }
+                    Err(e) => tell(
+                        &polling,
+                        Level::Warn,
+                        format!(
+                            "the clipboard changed (sequence {settled}) but would not open: {e}"
+                        ),
+                    ),
                 }
-                Err(e) => tell(
-                    &polling,
-                    Level::Warn,
-                    format!("the clipboard changed (sequence {settled}) but would not open: {e}"),
-                ),
             }
         })
         .context("starting the reader's watch on the sequence number")?;

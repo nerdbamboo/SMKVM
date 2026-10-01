@@ -2249,6 +2249,31 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**The same wedge, in the newest process, put there by the fix for
+the last one.** The reader's writer was a shared `Mutex<Pipe>` and
+an unbounded `write_all` -- the pattern `secure::outbox` exists to
+end, and which had already cost the worker three rounds. It was
+harmless in the reader until its clipboard lines were relayed down
+the pipe, and then the *window thread* began calling it from inside
+`WM_CLIPBOARDUPDATE`, which is the one thread in that process that
+may never wait.
+
+The symptom was exact and worth keeping, because it will recur in
+some other shape: the first notification arrived and the handler
+said so; the write did not come back; after that there was no
+settle, no second notification -- the message was posted and never
+collected, so the counter stayed at one -- and nothing from the
+sequence watch either, because its first line queued behind the same
+lock. Two independent paths stopping together is a shared
+dependency, and the dependency was the act of speaking.
+
+The rule the outbox encodes is worth saying without reference to any
+particular thread: **a process that has one writer and more than one
+thread needs the writing to be somebody's whole job.** Adding a new
+line to an existing logger is enough to break it, which is what
+happened here -- the change that caused this was one call added to a
+function that had been fine for a week.
+
 **One copy, two ways of noticing it, each saying which it was.** The
 reader's window registers as a format listener, the registration is
 accepted, the window pumps -- and `WM_CLIPBOARDUPDATE` never arrives
