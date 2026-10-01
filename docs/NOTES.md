@@ -1728,6 +1728,26 @@ write the bug. (This was found while adding the lines above, and is
 not the fault those lines were added to find: `NothingOffered` does
 not renew, so this path was not the one firing.)
 
+**A file copy does not arrive on the clipboard all at once.** The
+shell puts its OLE data object there first, and the standard formats
+that object stands for -- `CF_HDROP` among them -- appear around it
+afterwards. The settle timer looked once, sixty milliseconds after
+the first notice, and found a clipboard holding nothing but
+`49161=DataObject`; a probe in the same session, two seconds later,
+found five formats including `15`. One look cannot tell a copy still
+being assembled from a copy of something we do not share.
+
+So it looks again: up to eight times, a quarter-second apart, giving
+up after two seconds. The first look ends it whenever the copy is
+already complete, so the common case costs nothing. Giving up reports
+*both* enumerations -- what was there at the first look and at the
+last -- because which of them is bare is the diagnosis. A full second
+one means the first was early. Two bare ones mean this process cannot
+see what a process in the session can, which would be about OLE and
+not about timing, and the enumeration itself would have to change.
+Finding the formats after more than one look says so too, since
+whether this re-looking is load-bearing is worth knowing.
+
 **There is one `available_now`, not two.** It is tempting, when the
 scheduled task works and the service does not, to look for the list
 the service got wrong. For clipboard formats there is no such list:

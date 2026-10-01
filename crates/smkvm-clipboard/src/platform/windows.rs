@@ -128,6 +128,25 @@ fn why_released(reason: usize) -> &'static str {
     }
 }
 
+/// How long to wait before looking at a copy again, and how many
+/// times.
+///
+/// A file copy does not arrive on the clipboard all at once. The
+/// shell puts its OLE data object there first and the standard
+/// formats the object stands for -- `CF_HDROP` among them -- appear
+/// around it afterwards. Looking once, sixty milliseconds after the
+/// first notice, caught a clipboard holding nothing but
+/// `49161=DataObject`: a copy still being assembled, which is
+/// indistinguishable from a copy of something we do not share unless
+/// you look again.
+///
+/// Eight looks a quarter-second apart is two seconds, which is what
+/// a probe in the session needed to see all five formats. It costs
+/// nothing when the copy is complete first time, because the first
+/// look ends it.
+const LOOK_AGAIN_AFTER: u32 = 250;
+const LOOK_AT_MOST: u32 = 8;
+
 /// The timer that lets a burst of change notices settle into one report.
 const SETTLE_TIMER: usize = 1;
 /// How long to wait for the burst to end. The steps of one copy are a few
@@ -413,6 +432,12 @@ struct State {
     offer: Option<Offer>,
     /// Anything already fetched, so a second paste does not fetch again.
     cache: HashMap<ClipFormat, Vec<u8>>,
+    /// How many times the copy now settling has been looked at.
+    looks: u32,
+    /// What the clipboard held the first time this copy was looked
+    /// at, kept so that giving up can show the before and the after
+    /// rather than only the after.
+    first_look: Option<String>,
 }
 
 /// What the far machine has copied, and how many chances are left to
@@ -646,6 +671,11 @@ unsafe extern "system" fn window_proc(
                 };
                 state.offer = None;
                 state.cache.clear();
+                // A fresh notice is a fresh copy to be looked at, and
+                // whatever we were part-way through examining is no
+                // longer the thing in front of us.
+                state.looks = 0;
+                state.first_look = None;
             });
             witness(&format!(
                 "somebody else copied something (owner is {:?}, this window is {:?}), so the \
@@ -715,14 +745,72 @@ unsafe extern "system" fn window_proc(
                     Ok(_open) => (available_now(formats), everything_on_it()),
                 };
                 if found.formats.is_empty() {
+                    // Not a conclusion yet. A copy still being
+                    // assembled looks exactly like a copy of
+                    // something we do not share, and the only way to
+                    // tell them apart is to look again.
+                    let (looks, first) = STATE.with(|cell| {
+                        let mut slot = cell.borrow_mut();
+                        let Some(state) = slot.as_mut() else {
+                            return (LOOK_AT_MOST, None);
+                        };
+                        state.looks += 1;
+                        if state.first_look.is_none() {
+                            state.first_look = Some(on_it.join(", "));
+                        }
+                        (state.looks, state.first_look.clone())
+                    });
+                    if looks < LOOK_AT_MOST {
+                        step(&format!(
+                            "look {looks} of {LOOK_AT_MOST} at this copy found only [{}]; \
+                             looking again in {LOOK_AGAIN_AFTER} ms",
+                            on_it.join(", ")
+                        ));
+                        // SAFETY: a timer on this thread's own window;
+                        // re-setting an existing timer restarts it.
+                        unsafe {
+                            SetTimer(window, SETTLE_TIMER, LOOK_AGAIN_AFTER, None);
+                        }
+                        return LRESULT(0);
+                    }
+                    // Both enumerations, because which of them is
+                    // bare is the whole question: a full second one
+                    // means the first was early, and two bare ones
+                    // mean this process cannot see what a process in
+                    // the session can.
                     witness(&format!(
-                        "a copy settled here, but none of the formats we share were on it, so \
-                         the other machines were not told. On the clipboard: [{}]. Looking \
-                         for: {:?}",
+                        "a copy settled here and none of the formats we share were on it \
+                         after {looks} looks over {} ms, so the other machines were not \
+                         told. At first: [{}]. At last: [{}]. Looking for: {:?}",
+                        LOOK_AGAIN_AFTER * (LOOK_AT_MOST - 1),
+                        first.unwrap_or_default(),
                         on_it.join(", "),
                         what_we_look_for(formats)
                     ));
                     return LRESULT(0);
+                }
+                // Found. Say how long it took to appear, because "the
+                // first look was enough" and "it took seven more"
+                // are different facts about the shell, and only one
+                // of them means this re-looking is load-bearing.
+                let looks = STATE.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    match slot.as_mut() {
+                        Some(state) => {
+                            let looks = state.looks + 1;
+                            state.looks = 0;
+                            state.first_look = None;
+                            looks
+                        }
+                        None => 1,
+                    }
+                });
+                if looks > 1 {
+                    witness(&format!(
+                        "the copy was still being assembled and took {looks} looks over \
+                         {} ms to show what it was",
+                        LOOK_AGAIN_AFTER * (looks - 1)
+                    ));
                 }
                 step(&format!("the clipboard now holds [{}]", on_it.join(", ")));
                 let announced = format!("{:?}", found.formats);
@@ -736,7 +824,7 @@ unsafe extern "system" fn window_proc(
                     // another one again, and that is worth more than
                     // a discarded `Result`.
                     Err(_) => witness(&format!(
-                        "something was copied here: {announced}, but NOBODY IS LISTENING      \
+                        "something was copied here: {announced}, but NOBODY IS LISTENING \
                          for copies any more, so no other machine will be told. Nothing \
                          copied on this machine will reach another until it is restarted"
                     )),
@@ -1459,6 +1547,8 @@ fn clipboard_thread(
 
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(State {
+            looks: 0,
+            first_look: None,
             formats,
             changes,
             offer: None,
