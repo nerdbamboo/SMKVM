@@ -368,7 +368,21 @@ that runs as the person; `secure::windows::readers` is the service's
 end of it. Offering, rendering and injection did not move and run as
 the system account exactly as before.
 
-Five things about it that are decisions rather than details:
+Six things about it that are decisions rather than details:
+
+- **The reader gets the person's environment; the worker gets the
+  service's.** The two calls look identical and want opposite
+  answers, which is why `token::Environment` names the choice rather
+  than taking a `bool`. Removing `CreateEnvironmentBlock` for the
+  worker was right -- with a *system* token it builds LocalSystem's
+  environment, which is what the worker already has. Passing `None`
+  for the reader is not: it runs *as the person*, so it inherited
+  `APPDATA` and `LOCALAPPDATA` pointing into the system profile, a
+  place that account cannot write, and its first act is to open a log
+  there. It died before a line reached disk anywhere and the service
+  saw only a broken pipe. `CREATE_UNICODE_ENVIRONMENT` goes with the
+  block, or the wide strings are read as ANSI and the child gets an
+  environment of mojibake.
 
 - **Nothing chooses a source once.** The backends are built at the
   top of the daemon, outside the reconnect loop, because the
@@ -2234,6 +2248,20 @@ mean opposite things: a fresh announcement is the far machine
 offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
+
+**A process whose first act can kill it silently cannot be
+diagnosed.** The reader has no console, no terminal and a parent that
+can only see a pipe, and `start_logging` was the first thing it did.
+When that failed it returned from `main` with nowhere to say so. For
+the reader alone, a log that cannot be opened is now carried rather
+than raised: the complaint goes down the pipe in `FromReader::Ready`,
+alongside who it is running as, its session, and the path it is
+logging to. Saying where you are has to come before anything that
+could stop you saying it.
+
+The service reports the child's **exit code** when a handshake fails,
+taken before the kill because afterwards the code is ours. A broken
+pipe says only that a process is not there.
 
 **A line that must exist is said by a drop, not by a statement.**
 `WM_RENDERFORMAT for format N returned after ... ms` is the most

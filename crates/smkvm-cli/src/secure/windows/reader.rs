@@ -40,7 +40,7 @@ use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
 type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
 
 /// Run as the reader until the pipe closes or the service says stop.
-pub fn run(pipe_name: &str) -> Result<()> {
+pub fn run(pipe_name: &str, no_log: Option<String>) -> Result<()> {
     // `connect` checks that the process serving this pipe is the
     // system account before a byte is sent. That guard matters more
     // here than it does for the worker: this process runs as the
@@ -61,13 +61,45 @@ pub fn run(pipe_name: &str) -> Result<()> {
         })
     };
 
+    // The first thing, before the clipboard and before anything that
+    // can fail. Who this is, where it is, and where it is writing --
+    // or why it is not.
+    //
+    // This process has no console and nothing can ask it anything.
+    // When it could not open its log it exited here, before a line
+    // reached disk anywhere, and the only evidence was a pipe that
+    // broke. Saying where it is has to come before anything that
+    // could stop it saying so.
     let who = token::whoami();
+    let session = token::console_session().unwrap_or_default();
+    let log = match &no_log {
+        None => Ok(smkvm_config::paths::log_file().display().to_string()),
+        Some(why) => Err(why.clone()),
+    };
     speak(&FromReader::Ready {
         protocol: READER_PROTOCOL,
         who: who.clone(),
-        session: token::console_session().unwrap_or_default(),
+        session,
+        log: log.clone(),
     });
-    tell(&speak, Level::Info, format!("reading as {who}"));
+    match &log {
+        Ok(path) => tell(
+            &speak,
+            Level::Info,
+            format!("reading as {who} in session {session}, logging to {path}"),
+        ),
+        // Not fatal, and said down the pipe because it cannot be
+        // said anywhere else. A reader with no log of its own is
+        // worth having; a reader that exits because of it is not.
+        Err(why) => tell(
+            &speak,
+            Level::Warn,
+            format!(
+                "reading as {who} in session {session}, with no log of its own: {why}. \
+                 Everything it would have written is going down this pipe instead"
+            ),
+        ),
+    }
 
     let mut clipboard = WindowsClipboard::start().context("watching the person's clipboard")?;
     let mut handle = clipboard.handle();

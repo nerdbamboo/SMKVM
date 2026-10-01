@@ -216,11 +216,21 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
     // desktop a consent prompt is on: the person cannot copy anything
     // there, and the worker is already there for the half that
     // matters.
-    let running = token::start_on_desktop(
+    let running = token::start_on_desktop_as(
         &theirs,
         exe,
         &format!("clipboard-reader --pipe {name}"),
         r"WinSta0\Default",
+        // The person's own environment, built from their token.
+        //
+        // Not the service's, which is what the worker gets and what
+        // this had. The reader runs *as the person*, so the
+        // service's `APPDATA` and `LOCALAPPDATA` point it into the
+        // system profile -- a place that account cannot write -- and
+        // its first act is to open a log under `LOCALAPPDATA`. It
+        // died there, before a line reached disk anywhere, and all
+        // this end saw was a broken pipe.
+        token::Environment::ThePersons,
     )
     .context("starting the reader as the person at the desk")?;
 
@@ -251,8 +261,16 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
     let (mut reading, who) = match settled {
         Ok(settled) => settled,
         Err(e) => {
+            // The exit code before the kill, because after it the
+            // code is ours and says nothing. A broken pipe only says
+            // the process is not there; the code says something
+            // about why, and not having it cost a deployment.
+            let said = match running.exit_code() {
+                Some(code) => format!("{e:#} (the reader had already exited, code {code})"),
+                None => format!("{e:#} (the reader was still running, and has been ended)"),
+            };
             running.kill();
-            return Err(e);
+            bail!("{said}");
         }
     };
 
@@ -263,11 +281,19 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
         running,
         who: who.who.clone(),
     });
-    tracing::info!(
-        who = %who.who,
-        session,
-        "clipboard: a reader is running as the person at the desk"
-    );
+    match &who.log {
+        Ok(path) => tracing::info!(
+            who = %who.who,
+            session,
+            "clipboard: a reader is running as the person at the desk, logging to {path}"
+        ),
+        Err(why) => tracing::warn!(
+            who = %who.who,
+            session,
+            "clipboard: a reader is running as the person at the desk but has no log of \
+             its own ({why}); everything it says arrives here instead"
+        ),
+    }
 
     let listener = reader.clone();
     std::thread::Builder::new()

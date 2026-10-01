@@ -34,7 +34,7 @@ use smkvm_proto::ClipFormat;
 use crate::secure::wire::Level;
 
 /// Bumped when either side's messages change meaning.
-pub const READER_PROTOCOL: u32 = 1;
+pub const READER_PROTOCOL: u32 = 2;
 
 /// Longest frame either side will send or accept.
 ///
@@ -70,6 +70,14 @@ pub enum FromReader {
         /// which needs to be the person really is.
         who: String,
         session: u32,
+        /// Where it is writing its own log, or why it has none.
+        ///
+        /// Said here, in the first thing it ever sends, because this
+        /// process has no console and nothing else can ask it. It
+        /// once died opening that log and the only evidence was a
+        /// pipe that broke; a process that can fail before saying
+        /// where it is cannot be diagnosed at all.
+        log: Result<String, String>,
     },
     /// Somebody copied something here. Unasked: this is the whole
     /// point of the reader existing.
@@ -126,6 +134,7 @@ pub fn tidy(text: &str) -> String {
 pub struct Who {
     pub who: String,
     pub session: u32,
+    pub log: Result<String, String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -162,6 +171,7 @@ pub fn welcome(first: FromReader) -> Result<Who, NotWelcome> {
         protocol,
         who,
         session,
+        log,
     } = first
     else {
         return Err(NotWelcome::SpokeOutOfTurn);
@@ -188,6 +198,7 @@ pub fn welcome(first: FromReader) -> Result<Who, NotWelcome> {
     Ok(Who {
         who: named.to_string(),
         session,
+        log,
     })
 }
 
@@ -236,6 +247,7 @@ mod tests {
             protocol: READER_PROTOCOL + 1,
             who: "SOMEWHERE\\someone".into(),
             session: 1,
+            log: Ok("C:\\somewhere\\smkvm.log".into()),
         });
         assert_eq!(
             said,
@@ -261,6 +273,7 @@ mod tests {
                 protocol: READER_PROTOCOL,
                 who: named.into(),
                 session: 1,
+                log: Ok(String::new()),
             });
             assert!(
                 matches!(said, Err(NotWelcome::TheSystemAccountAgain(_))),
@@ -275,12 +288,14 @@ mod tests {
             protocol: READER_PROTOCOL,
             who: "  SOMEWHERE\\someone  ".into(),
             session: 7,
+            log: Ok("C:\\somewhere\\smkvm.log".into()),
         });
         assert_eq!(
             said,
             Ok(Who {
                 who: "SOMEWHERE\\someone".into(),
-                session: 7
+                session: 7,
+                log: Ok("C:\\somewhere\\smkvm.log".into()),
             })
         );
     }
@@ -291,6 +306,7 @@ mod tests {
             protocol: READER_PROTOCOL,
             who: "   ".into(),
             session: 1,
+            log: Ok(String::new()),
         });
         assert_eq!(said, Err(NotWelcome::Nameless));
     }

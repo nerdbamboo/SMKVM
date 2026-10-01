@@ -221,7 +221,27 @@ fn main() -> Result<()> {
         // and no right to.
         paths::use_machine_scope();
     }
-    start_logging(cli.verbose, cli.log_file.clone(), cli.unattended)?;
+    // The reader is the one command for which a log that cannot be
+    // opened is not a reason to stop.
+    //
+    // Every other command here either has a console to complain to or
+    // is started by something that will notice. The reader has
+    // neither: no console, no terminal, and a parent that can only
+    // see a pipe. When its log could not be opened -- which happened,
+    // because it was being given the service's environment and
+    // pointed at a profile it cannot write -- it exited before saying
+    // anything, anywhere, and all the service learned was that the
+    // pipe had broken. A process whose first act can kill it silently
+    // is the shape this file has spent days removing, and this was
+    // the newest instance of it.
+    //
+    // So for the reader the complaint is carried instead of raised,
+    // and goes down the pipe as soon as there is one.
+    let no_log = match start_logging(cli.verbose, cli.log_file.clone(), cli.unattended) {
+        Ok(()) => None,
+        Err(e) if matches!(cli.command, Command::ClipboardReader { .. }) => Some(format!("{e:#}")),
+        Err(e) => return Err(e),
+    };
     log_panics_too();
 
     let result = match cli.command {
@@ -248,7 +268,7 @@ fn main() -> Result<()> {
         Command::ServiceMain => service_main(),
         Command::DesktopWorker { pipe } => desktop_worker(&pipe),
         Command::ClipboardProbe { report_to } => clipboard_probe(report_to),
-        Command::ClipboardReader { pipe } => clipboard_reader(&pipe),
+        Command::ClipboardReader { pipe } => clipboard_reader(&pipe, no_log),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -515,14 +535,14 @@ fn desktop_worker(pipe: &str) -> Result<()> {
 }
 
 /// Read the person's clipboard for the service, as the person.
-fn clipboard_reader(pipe: &str) -> Result<()> {
+fn clipboard_reader(pipe: &str, no_log: Option<String>) -> Result<()> {
     #[cfg(windows)]
     {
-        secure::windows::reader::run(pipe)
+        secure::windows::reader::run(pipe, no_log)
     }
     #[cfg(not(windows))]
     {
-        let _ = pipe;
+        let _ = (pipe, no_log);
         bail!("the clipboard reader is a Windows arrangement")
     }
 }

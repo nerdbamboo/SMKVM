@@ -64,7 +64,7 @@ use anyhow::{bail, Context, Result};
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::secure::windows::Aligned;
-use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE, STILL_ACTIVE};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW,
     SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId, TokenUser,
@@ -75,8 +75,9 @@ use windows::Win32::Security::{
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess,
-    WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// A handle that is closed when it goes out of scope.
@@ -279,6 +280,21 @@ pub fn home_in_session(session: u32) -> Result<std::path::PathBuf> {
     found.context("that person's environment does not say where their profile is")
 }
 
+/// An environment block, freed when it goes out of scope.
+struct Block(*mut std::ffi::c_void);
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: built by `CreateEnvironmentBlock` above and not
+            // used again.
+            unsafe {
+                let _ = DestroyEnvironmentBlock(self.0);
+            }
+        }
+    }
+}
+
 /// A process started in the interactive session, on a named desktop.
 pub struct Started {
     process: Owned,
@@ -295,6 +311,21 @@ impl Started {
         // SAFETY: a valid process handle; zero means do not wait at all.
         let waited = unsafe { WaitForSingleObject(self.process.0, 0) };
         waited == windows::Win32::Foundation::WAIT_OBJECT_0
+    }
+
+    /// Why it went, if it has.
+    ///
+    /// A broken pipe says a process is not there; an exit code says
+    /// something about why. The difference cost a deployment: the
+    /// reader died before it could write a line anywhere and all the
+    /// service had to report was that the pipe had broken.
+    pub fn exit_code(&self) -> Option<u32> {
+        let mut code = 0u32;
+        // SAFETY: a valid process handle and a place for the code.
+        unsafe { GetExitCodeProcess(self.process.0, &mut code) }.ok()?;
+        // The documented sentinel for "still running", and the reason
+        // a process must never exit with it.
+        (code != STILL_ACTIVE.0 as u32).then_some(code)
     }
 
     /// End it.
@@ -321,13 +352,65 @@ pub fn start_on_desktop(
     arguments: &str,
     desktop: &str,
 ) -> Result<Started> {
-    // No environment block, and none built. `CreateEnvironmentBlock` from
-    // here would build LocalSystem's environment, so TEMP and APPDATA would
-    // point into the system profile -- which is the hazard worth avoiding
-    // only if the worker read any of it. It does not: it opens one pipe
-    // whose name is on its command line, reads no configuration and touches
-    // no file. A null block means it inherits the service's, which is the
-    // same environment, honestly labelled.
+    start_on_desktop_as(token, exe, arguments, desktop, Environment::TheServices)
+}
+
+/// Whose environment a started process gets.
+///
+/// The two helpers want opposite answers and the calls look identical
+/// without this, which is why it is a named choice rather than a
+/// `bool` or an `Option`.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Environment {
+    /// Inherit the service's, which is the system account's.
+    ///
+    /// Right for the worker. It is started with a *system* token and
+    /// reads no per-user path at all -- it opens one pipe whose name
+    /// is on its command line and touches no file -- so the service's
+    /// environment is the same environment, honestly labelled.
+    /// Building one from `CreateEnvironmentBlock` here would produce
+    /// LocalSystem's, which is what it already has.
+    TheServices,
+    /// Build the person's, from their token.
+    ///
+    /// Required for the reader, and the distinction is not cosmetic.
+    /// The reader runs *as the person*, so inheriting the service's
+    /// environment gives it `APPDATA` and `LOCALAPPDATA` pointing
+    /// into the system profile -- a place that account cannot write.
+    /// Its first act is to open a log under `LOCALAPPDATA`, so it
+    /// died before writing a line anywhere, and all the service saw
+    /// was a pipe that broke. Nothing in the person's profile,
+    /// nothing in the system profile, and no exit code: a silent
+    /// death, which is the shape this file has spent two days
+    /// removing.
+    ThePersons,
+}
+
+/// Start a process in the interactive session, on a named desktop,
+/// with a chosen environment.
+pub fn start_on_desktop_as(
+    token: &Owned,
+    exe: &Path,
+    arguments: &str,
+    desktop: &str,
+    environment: Environment,
+) -> Result<Started> {
+    // Which environment, and why, is on `Environment` above. The
+    // short of it: the worker is the system account and inheriting
+    // the service's is honest; the reader is the person and
+    // inheriting it points their profile at a directory they cannot
+    // write.
+    let built = match environment {
+        Environment::TheServices => None,
+        Environment::ThePersons => {
+            let mut block = std::ptr::null_mut();
+            // SAFETY: a valid token and a place for the block, freed
+            // by the guard below.
+            unsafe { CreateEnvironmentBlock(&mut block, token.0, false) }
+                .context("building the environment of the person at the desk")?;
+            Some(Block(block))
+        }
+    };
     //
     // Quoted, always. An unquoted path with a space in it lets anything
     // called `C:\Program.exe` be started instead of what was meant, and this
@@ -356,8 +439,16 @@ pub fn start_on_desktop(
             None,
             None,
             false,
-            CREATE_NO_WINDOW,
-            None,
+            // `CREATE_UNICODE_ENVIRONMENT` whenever a block is
+            // given: `CreateEnvironmentBlock` produces wide strings,
+            // and without the flag Windows reads them as ANSI and the
+            // child gets an environment of mojibake.
+            if built.is_some() {
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
+            } else {
+                CREATE_NO_WINDOW
+            },
+            built.as_ref().map(|block| block.0 as *const _),
             None,
             &startup,
             &mut information,
