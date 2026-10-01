@@ -62,6 +62,13 @@ type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
 /// matter; bounded, because a queue nobody drains must not grow.
 const OUTBOX_ROOM: usize = 256;
 
+/// How often the sequence watch says it is still there.
+///
+/// Rare enough to be no burden on a file somebody reads by eye,
+/// often enough that thirty seconds of silence is a fact rather than
+/// an absence.
+const HEARTBEAT_EVERY: u64 = 5;
+
 /// How long a single write may be outstanding before it is worth
 /// saying so.
 ///
@@ -118,11 +125,43 @@ struct Trace(Option<std::path::PathBuf>);
 static APPENDING: Mutex<()> = Mutex::new(());
 
 impl Trace {
+    /// Say something that must be said even if everything else in
+    /// this process is stuck.
+    ///
+    /// A report about a stuck writer cannot travel through the stuck
+    /// writer, and it cannot share a lock with it either. That is the
+    /// same trap three times now: the first version of this warning
+    /// went through the outbox, which was the thing it was reporting
+    /// on; the second went through the trace's own lock, which the
+    /// drain also takes.
+    ///
+    /// So this one takes the lock only if it is free, and writes
+    /// anyway if it is not. Two lines running together is a cost
+    /// worth paying for a line that cannot be prevented from being
+    /// written; the alternative is what we have had, which is no
+    /// line at all.
+    fn say_whatever_happens(&self, line: &str) {
+        let held = APPENDING.try_lock();
+        let mark = if held.is_ok() {
+            ""
+        } else {
+            " [written without the lock]"
+        };
+        self.append(&format!("{line}{mark}"));
+    }
+
     fn say(&self, line: &str) {
+        if self.0.is_none() {
+            return;
+        }
+        let _one_at_a_time = APPENDING.lock().expect("not poisoned");
+        self.append(line);
+    }
+
+    fn append(&self, line: &str) {
         let Some(path) = &self.0 else {
             return;
         };
-        let _one_at_a_time = APPENDING.lock().expect("not poisoned");
         use std::io::Write as _;
         let since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -482,17 +521,23 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
             );
             // Said once per stall rather than once per tick.
             let mut complained = false;
+            let mut last_beat = now_in_seconds();
             loop {
                 std::thread::sleep(LOOK_EVERY);
 
                 // The drain's watchdog rides on this thread because
                 // it is already ticking and has nothing else to do.
                 let since = stalled.load(Ordering::Relaxed);
-                let waiting =
-                    posted_so_far.load(Ordering::Relaxed) - handed_over.load(Ordering::Relaxed);
+                // `saturating_sub`: the post is counted after the
+                // post returns, and the drain can have sent the
+                // message before that happens, so for an instant
+                // the two can cross.
+                let waiting = posted_so_far
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(handed_over.load(Ordering::Relaxed));
                 if since != 0 && now_in_seconds().saturating_sub(since) >= WRITE_IS_STUCK {
                     if !complained {
-                        looking.say(&format!(
+                        looking.say_whatever_happens(&format!(
                             "the write to the service has been outstanding for {} s, with \
                              {waiting} more waiting behind it. Nothing this machine copies \
                              is reaching the service, and the service is not collecting",
@@ -501,10 +546,29 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                         complained = true;
                     }
                 } else if complained && since == 0 {
-                    looking.say(&format!(
+                    looking.say_whatever_happens(&format!(
                         "the write to the service got through; {waiting} still waiting"
                     ));
                     complained = false;
+                }
+
+                // A heartbeat, so that silence means something.
+                //
+                // This thread ticks four times a second and said
+                // nothing for thirty of them, and there was no way
+                // to tell that from its having stopped. A watch that
+                // only speaks on change cannot be used to prove it
+                // is still watching.
+                if now_in_seconds().saturating_sub(last_beat) >= HEARTBEAT_EVERY {
+                    last_beat = now_in_seconds();
+                    looking.say_whatever_happens(&format!(
+                        "still watching: sequence {}, {} posted, {} sent, {waiting} waiting, \
+                         told of {} changes",
+                        smkvm_clipboard::platform::windows::sequence_number(),
+                        posted_so_far.load(Ordering::Relaxed),
+                        handed_over.load(Ordering::Relaxed),
+                        smkvm_clipboard::platform::windows::NOTICED.load(Ordering::Relaxed)
+                    ));
                 }
 
                 let now = smkvm_clipboard::platform::windows::sequence_number();

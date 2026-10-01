@@ -2249,6 +2249,29 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**A report about a stuck writer cannot travel through the stuck
+writer, and it cannot share a lock with it either.** The same trap
+three times. The first version of the stall warning went through the
+outbox -- the thing it was reporting on. The second went to the
+trace file under a lock the drain also takes. Both are silent in
+exactly the case they exist for, which is worse than having no
+warning at all, because an absent warning is read as an absent
+problem.
+
+`Trace::say_whatever_happens` takes the lock only if it is free and
+writes anyway if it is not, marking the line when it did. Two lines
+running together is a cost worth paying for a line that cannot be
+prevented from being written; the alternative was thirty seconds of
+nothing.
+
+**A watch that only speaks on change cannot be used to prove it is
+still watching.** The sequence watch ticks four times a second and
+said nothing for thirty of them, and there was no way to tell that
+from its having stopped. It beats every five seconds now with the
+numbers that matter -- sequence, posted, sent, waiting, and how many
+notifications the window has been given -- so silence is a fact
+rather than an absence.
+
 **A path that waits by design has to say what it is waiting on.**
 The twin of the rule about diagnostics, and the harder half to
 remember. The reader's outbox drain is the one thread allowed to
