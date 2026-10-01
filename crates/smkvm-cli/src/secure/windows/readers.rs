@@ -256,6 +256,24 @@ pub fn reader() -> Option<Arc<Reader>> {
 /// Said rather than done quietly, because from outside a clipboard
 /// that has stopped reporting copies looks identical whether it was
 /// let go on purpose or died.
+/// Warn the reader that the next change to the clipboard is ours.
+///
+/// Called just before the worker is told to take the clipboard to
+/// hold out what another machine copied, and before it is told to
+/// give it back. Both are changes the reader will see, and a reader
+/// that reports them sends the far machine's own clipboard straight
+/// back to it.
+///
+/// Best effort on purpose. If there is no reader there is nothing
+/// to warn, and if the warning does not get through the worst case
+/// is one spurious notice -- which the exchange already guards
+/// against by sequence -- rather than anything that waits.
+pub fn a_change_of_ours_is_coming() {
+    if let Some(reader) = reader() {
+        reader.say(&ToReader::OurOwnChangeComing);
+    }
+}
+
 /// Tell the worker whether it still needs to watch for copies.
 ///
 /// With a reader attached it does not, and this is not an

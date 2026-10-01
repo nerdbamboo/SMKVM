@@ -79,6 +79,13 @@ fn what_that_means(doing: u8) -> &'static str {
     }
 }
 
+/// How long after being told to treat one change as ours.
+///
+/// Long enough to cover the worker taking the clipboard and the
+/// notice arriving; short enough that a mispaired instruction does
+/// not swallow a copy the person makes a moment later.
+const OURS_FOR: u64 = 2;
+
 /// How often the sequence watch says it is still there.
 ///
 /// Rare enough to be no burden on a file somebody reads by eye,
@@ -93,6 +100,20 @@ const HEARTBEAT_EVERY: u64 = 5;
 /// microseconds. Two seconds is not a slow service; it is one that
 /// has stopped reading.
 const WRITE_IS_STUCK: u64 = 2;
+
+/// Is the change happening now one we caused?
+///
+/// Used once: a second change inside the window is the person's
+/// until the service says otherwise, because the alternative is a
+/// single instruction swallowing everything that follows it.
+fn ours_now(until: &Arc<AtomicU64>) -> bool {
+    let when = until.load(Ordering::Relaxed);
+    if when == 0 {
+        return false;
+    }
+    until.store(0, Ordering::Relaxed);
+    now_in_seconds() <= when
+}
 
 /// Seconds since the epoch, for comparing two moments and nothing
 /// else.
@@ -529,11 +550,26 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     let announced = Arc::new(AtomicU32::new(
         smkvm_clipboard::platform::windows::sequence_number(),
     ));
+    // Until when a change is ours rather than the person's.
+    //
+    // Zero means none expected. The service sets it by telling us
+    // just before it has the worker take the clipboard to hold out
+    // what another machine copied. That is a change this process
+    // sees, and reporting it sends the far machine's own clipboard
+    // back to it -- the collision already fought once in a single
+    // process, where comparing the owner against our own window was
+    // enough. The writer is in another process now, so that
+    // comparison cannot see it, and only the service knows both.
+    //
+    // Bounded, because an instruction and a change that fail to
+    // pair up must not silence the person's next copy for ever.
+    let ours_until = Arc::new(AtomicU64::new(0));
 
     let polling = speak.clone();
     let claimed = announced.clone();
     let asking = handle.clone();
     let looking = trace.clone();
+    let ours = ours_until.clone();
     let stalled = writing_since.clone();
     let posted_so_far = posted.clone();
     let handed_over = delivered.clone();
@@ -618,6 +654,25 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                 // or so.
                 std::thread::sleep(SETTLE_FOR);
                 let settled = smkvm_clipboard::platform::windows::sequence_number();
+                if ours_now(&ours) {
+                    claimed.store(settled, Ordering::Relaxed);
+                    looking.say(
+                        "that change was ours -- the worker holding out what another \
+                         machine copied -- so it is not reported back",
+                    );
+                    continue;
+                }
+                // Looked at *before* claiming. A clipboard that will
+                // not open is not a copy that did not happen, and
+                // claiming the sequence first threw the change away:
+                // a conclusion drawn from a failure to look.
+                if let Err(e) = asking.available() {
+                    looking.say(&format!(
+                        "the clipboard changed (sequence {settled}) and would not open \
+                         ({e}); looking again shortly rather than deciding anything"
+                    ));
+                    continue;
+                }
                 if claimed.swap(settled, Ordering::Relaxed) == settled {
                     looking.say(&format!(
                         "the copy at sequence {settled} was already announced by the window"
@@ -669,11 +724,18 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     let noticing = speak.clone();
     let claimed = announced.clone();
     let watching = trace.clone();
+    let mine = ours_until.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-watch".into())
         .spawn(move || {
             while let Some(copied) = clipboard.next_change() {
                 let settled = smkvm_clipboard::platform::windows::sequence_number();
+                if ours_now(&mine) {
+                    claimed.store(settled, Ordering::Relaxed);
+                    watching
+                        .say("that change was ours, not the person's, so it is not reported back");
+                    continue;
+                }
                 if claimed.swap(settled, Ordering::Relaxed) == settled {
                     // The sequence watch got there first. One copy,
                     // one notice -- but said, because "this path
@@ -747,6 +809,10 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                     ),
                 );
                 speak(&FromReader::Read { id, bytes });
+            }
+            ToReader::OurOwnChangeComing => {
+                ours_until.store(now_in_seconds() + OURS_FOR, Ordering::Relaxed);
+                trace.say("told that the next change is ours, not the person's");
             }
             ToReader::Stop => {
                 tell(&speak, Level::Info, "the service says to stop");

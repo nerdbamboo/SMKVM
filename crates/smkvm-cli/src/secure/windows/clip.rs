@@ -188,6 +188,13 @@ impl Write for WriteThroughWorker {
         // stopped being available because a prompt had appeared in the
         // meantime. `Link::attach` re-offers.
         self.0.hold_offer(formats.to_vec(), source);
+        // Before the worker takes it, not after.
+        //
+        // Taking the clipboard changes it, the reader sees the
+        // change, and without being warned it reports the far
+        // machine's own clipboard back to it. Told first so the
+        // warning cannot arrive after the thing it warns about.
+        crate::secure::windows::readers::a_change_of_ours_is_coming();
         if !self.0.say(&ToWorker::OfferClipboard {
             formats: formats.to_vec(),
         }) {
@@ -201,6 +208,8 @@ impl Write for WriteThroughWorker {
 
     fn release(&mut self) -> smkvm_clipboard::Result<()> {
         self.0.drop_offer();
+        // Giving it back is a change too.
+        crate::secure::windows::readers::a_change_of_ours_is_coming();
         if !self.0.say(&ToWorker::ReleaseClipboard) {
             // Nothing is holding it, which is what release wanted.
             return Ok(());

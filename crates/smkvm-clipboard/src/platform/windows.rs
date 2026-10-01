@@ -1028,11 +1028,43 @@ unsafe extern "system" fn window_proc(
                 // client copies and nobody hears" looked like a
                 // missing feature rather than a broken one.
                 let (found, on_it) = match Opened::take(HWND::default()) {
+                    // Not a conclusion. A clipboard that will not
+                    // open is a clipboard that has not been looked
+                    // at, and "the other machines were not told" is
+                    // a decision drawn from a failure to look. With
+                    // two halves on one machine -- one holding the
+                    // clipboard out, one trying to see it -- a
+                    // refusal is ordinary and momentary, and the
+                    // right answer is to look again.
                     Err(e) => {
-                        witness(&format!(
-                            "a copy settled here, but the clipboard would not open to see \
-                             what it was ({e}), so the other machines were not told"
-                        ));
+                        let again = STATE.with(|cell| {
+                            let mut slot = cell.borrow_mut();
+                            match slot.as_mut() {
+                                Some(state) => {
+                                    state.looks += 1;
+                                    state.looks < LOOK_AT_MOST
+                                }
+                                None => false,
+                            }
+                        });
+                        if again {
+                            step(&format!(
+                                "a copy settled here and the clipboard would not open \
+                                 ({e}); looking again in {LOOK_AGAIN_AFTER} ms"
+                            ));
+                            // SAFETY: a timer on this thread's own
+                            // window; re-setting restarts it.
+                            unsafe {
+                                SetTimer(window, SETTLE_TIMER, LOOK_AGAIN_AFTER, None);
+                            }
+                        } else {
+                            witness(&format!(
+                                "a copy settled here and the clipboard would not open \
+                                 ({e}) in any of {LOOK_AT_MOST} attempts, so what was \
+                                 copied here is not known -- which is not the same as \
+                                 nothing having been copied"
+                            ));
+                        }
                         return LRESULT(0);
                     }
                     // Both gathered inside the arm: the guard lives

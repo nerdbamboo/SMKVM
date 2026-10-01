@@ -2249,6 +2249,42 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**Two halves on one machine contend for one clipboard.** The worker
+holds it out to offer what another machine copied; the reader tries
+to open it to see what changed. Once the reader was the only one
+watching, its failures stopped being redundant and became the
+feature: `the clipboard would not open` ended in *the other
+machines were not told*, which is a conclusion drawn from a failure
+to look, and the render that followed timed out and gave the offer
+back.
+
+Two separate things were wrong and both are worth keeping apart.
+
+**A clipboard that will not open has not been looked at.** Both the
+settle timer and the sequence watch now look again instead of
+deciding, and the sequence is not claimed until the look succeeded
+-- claiming first threw the change away. When the attempts run out
+the line says what was copied here *is not known*, which is not the
+same as nothing having been copied.
+
+**A change we caused is not a copy.** When the worker takes the
+clipboard to hold out the far machine's formats, the reader sees
+that change, and reporting it sends the far machine's own clipboard
+straight back -- the collision already fought once in a single
+process, where comparing the owner against our own window sufficed.
+The writer is in another process now, so that comparison cannot see
+it and only the service knows both ends. It warns the reader before
+the worker takes the clipboard and before it gives it back.
+
+That warning is the one message in `ToReader` that is not a read,
+and the test that guards the protocol now says why it was admitted:
+an impostor could use it to suppress a notice of a copy, which is a
+denial of this feature by something already running as the person,
+who could as easily end the reader. It cannot inject, write a
+clipboard, or reach a file. The exception is bounded in time as
+well, so an instruction and a change that fail to pair up cannot
+silence the next copy for ever.
+
 **`offering copied files to the other machines` is not the
 announcement.** It is printed when a peer *fetches* the file list,
 several steps after the copy is announced -- so its absence says

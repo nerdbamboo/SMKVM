@@ -34,7 +34,7 @@ use smkvm_proto::ClipFormat;
 use crate::secure::wire::Level;
 
 /// Bumped when either side's messages change meaning.
-pub const READER_PROTOCOL: u32 = 2;
+pub const READER_PROTOCOL: u32 = 3;
 
 /// Longest frame either side will send or accept.
 ///
@@ -56,6 +56,27 @@ pub enum ToReader {
     WhatIsOnIt { id: u64 },
     /// Hand over one of them.
     Read { id: u64, format: ClipFormat },
+    /// A change to the clipboard is about to be caused by us.
+    ///
+    /// Not a read, and the only message here that is not. It is
+    /// worth the exception and worth saying why.
+    ///
+    /// When another machine copies something, the worker takes this
+    /// clipboard to hold the formats out. That is a change, the
+    /// reader sees it, and without being told it reports the far
+    /// machine's own clipboard straight back to it -- the collision
+    /// this project has already fought once in a single process,
+    /// where comparing the clipboard's owner against our own window
+    /// was enough. Here the writer is in another process, so the
+    /// reader's window is not the owner and the comparison cannot
+    /// see it. The service knows both ends and says so.
+    ///
+    /// What an impostor on this pipe could do with it is suppress
+    /// one notice of a copy, or, repeated, keep suppressing them.
+    /// That is a denial of this feature by something already
+    /// running as the person, who could as easily end the reader;
+    /// it cannot inject, write a clipboard, or reach a file.
+    OurOwnChangeComing,
     /// Let go and exit.
     Stop,
 }
@@ -218,8 +239,25 @@ mod tests {
         match asked {
             ToReader::WhatIsOnIt { .. } => "read: what is on it",
             ToReader::Read { .. } => "read: one format",
+            ToReader::OurOwnChangeComing => "a change of ours is coming",
             ToReader::Stop => "stop",
         }
+    }
+
+    /// The one message here that is not a read, and the reasoning
+    /// that admitted it.
+    ///
+    /// If a fifth is added, the question is the same: can anything
+    /// running as the person at the desk now make this program do
+    /// something other than read? Telling the reader to ignore one
+    /// change cannot. Telling it to *write* one could, and would be
+    /// refused.
+    #[test]
+    fn the_only_thing_that_is_not_a_read_cannot_write_anything() {
+        assert_eq!(
+            what_it_is(&ToReader::OurOwnChangeComing),
+            "a change of ours is coming"
+        );
     }
 
     #[test]
@@ -230,12 +268,18 @@ mod tests {
                 id: 2,
                 format: ClipFormat::Text,
             },
+            ToReader::OurOwnChangeComing,
             ToReader::Stop,
         ];
         let named: Vec<&str> = every.iter().map(what_it_is).collect();
         assert_eq!(
             named,
-            vec!["read: what is on it", "read: one format", "stop"],
+            vec![
+                "read: what is on it",
+                "read: one format",
+                "a change of ours is coming",
+                "stop"
+            ],
             "the reader's endpoint is reachable by anything running as the person at the \
              desk; everything it accepts must be a read"
         );
