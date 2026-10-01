@@ -80,7 +80,8 @@ pub fn install(user: Option<String>, limited: bool, system: bool) -> Result<()> 
         }
         if system {
             bail!(
-                "--system is for Windows, where the secure desktop is a thing a service has                  to reach on the daemon's behalf"
+                "--system is for Windows, where the secure desktop is a thing a service has \
+                 to reach on the daemon's behalf"
             );
         }
         if limited {

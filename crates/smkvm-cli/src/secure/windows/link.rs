@@ -333,7 +333,8 @@ impl Link {
                         );
                         if changes.send(Available { formats }).is_err() {
                             tracing::warn!(
-                                "clipboard: nothing is listening for copies any more, so                                  what this machine copies will not reach another"
+                                "clipboard: nothing is listening for copies any more, so what \
+                                 this machine copies will not reach another"
                             );
                         }
                     }
@@ -343,7 +344,8 @@ impl Link {
                     // receiver here loses every copy without a word.
                     None => tracing::warn!(
                         ?formats,
-                        "clipboard: the worker says something was copied, but nothing on                          this side is listening for copies, so it goes nowhere"
+                        "clipboard: the worker says something was copied, but nothing on this \
+                         side is listening for copies, so it goes nowhere"
                     ),
                 }
             }

@@ -30,14 +30,15 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
-    GetClipboardData, GetClipboardOwner, GetOpenClipboardWindow, IsClipboardFormatAvailable,
-    OpenClipboard, RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
+    GetClipboardData, GetClipboardFormatNameW, GetClipboardOwner, GetOpenClipboardWindow,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -310,13 +311,69 @@ fn available_now(formats: Formats) -> Available {
     if has(formats.html) {
         out.push(ClipFormat::Html);
     }
-    if has(formats.png) || has(CF_DIB.0 as u32) {
+    // Every way an application may offer a picture, not only the two
+    // that were here. `CF_DIBV5` carries alpha and some applications
+    // offer it alone; `CF_BITMAP` is what the oldest ones offer, and
+    // Windows synthesises the rest from it only once something asks.
+    // An image offered in a way this list does not name is an image
+    // nobody is told about, and the failure is silent at both ends.
+    if has(formats.png) || has(CF_DIB.0 as u32) || has(CF_DIBV5.0 as u32) || has(CF_BITMAP.0 as u32)
+    {
         out.push(ClipFormat::Png);
     }
     if has(CF_HDROP.0 as u32) {
         out.push(ClipFormat::Uris);
     }
     Available { formats: out }
+}
+
+/// Which native identifiers [`available_now`] looks at, so that
+/// finding none of them can say which it was looking for.
+fn what_we_look_for(formats: Formats) -> Vec<u32> {
+    vec![
+        CF_UNICODETEXT.0 as u32,
+        formats.html,
+        formats.png,
+        CF_DIB.0 as u32,
+        CF_DIBV5.0 as u32,
+        CF_BITMAP.0 as u32,
+        CF_HDROP.0 as u32,
+    ]
+}
+
+/// Everything on the clipboard right now, with whatever name Windows
+/// has for each. The clipboard must already be open.
+///
+/// For one line in one place: a copy noticed here with none of the
+/// formats we share on it. "None of the formats we share were on it"
+/// is a true statement that cost a round, because it named neither
+/// what was there nor what was wanted, and settling that took
+/// somebody sitting in the session with a Win32 enumerator. A
+/// diagnostic that reports a mismatch should name both sides of it.
+fn everything_on_it() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut next = 0u32;
+    loop {
+        // SAFETY: the clipboard is open, which is what this requires.
+        next = unsafe { EnumClipboardFormats(next) };
+        if next == 0 || out.len() > 32 {
+            break;
+        }
+        let mut name = [0u16; 128];
+        // SAFETY: the buffer is valid for its own length. A standard
+        // format has no registered name and returns zero, which is
+        // not an error.
+        let len = unsafe { GetClipboardFormatNameW(next, &mut name) };
+        if len > 0 {
+            out.push(format!(
+                "{next}={}",
+                String::from_utf16_lossy(&name[..len as usize])
+            ));
+        } else {
+            out.push(format!("{next}=(standard)"));
+        }
+    }
+    out
 }
 
 /// Read one of our formats, converting from whatever Windows keeps it as.
@@ -621,7 +678,8 @@ unsafe extern "system" fn window_proc(
             });
             let Some((formats, sender)) = report else {
                 witness(
-                    "a copy settled, but there is no state on this thread to report it                      with, so nothing was told about it",
+                    "a copy settled, but there is no state on this thread to report it with, \
+                     so nothing was told about it",
                 );
                 return LRESULT(0);
             };
@@ -643,25 +701,34 @@ unsafe extern "system" fn window_proc(
                 // and this half for none, which is most of why "the
                 // client copies and nobody hears" looked like a
                 // missing feature rather than a broken one.
-                let found = match Opened::take(HWND::default()) {
+                let (found, on_it) = match Opened::take(HWND::default()) {
                     Err(e) => {
                         witness(&format!(
-                            "a copy settled here, but the clipboard would not open to see                              what it was ({e}), so the other machines were not told"
+                            "a copy settled here, but the clipboard would not open to see \
+                             what it was ({e}), so the other machines were not told"
                         ));
                         return LRESULT(0);
                     }
-                    Ok(_open) => available_now(formats),
+                    // Both gathered inside the arm: the guard lives
+                    // only as long as it, and both need the clipboard
+                    // open.
+                    Ok(_open) => (available_now(formats), everything_on_it()),
                 };
                 if found.formats.is_empty() {
-                    witness(
-                        "a copy settled here, but none of the formats we share were on it,                          so the other machines were not told",
-                    );
+                    witness(&format!(
+                        "a copy settled here, but none of the formats we share were on it, so \
+                         the other machines were not told. On the clipboard: [{}]. Looking \
+                         for: {:?}",
+                        on_it.join(", "),
+                        what_we_look_for(formats)
+                    ));
                     return LRESULT(0);
                 }
+                step(&format!("the clipboard now holds [{}]", on_it.join(", ")));
                 let announced = format!("{:?}", found.formats);
                 match sender.send(found) {
                     Ok(()) => witness(&format!(
-                        "something was copied here: {announced}; telling whoever is                          listening"
+                        "something was copied here: {announced}; telling whoever is listening"
                     )),
                     // The receiver is the watch, which lives on
                     // another thread in this process. If it has gone,
@@ -669,7 +736,9 @@ unsafe extern "system" fn window_proc(
                     // another one again, and that is worth more than
                     // a discarded `Result`.
                     Err(_) => witness(&format!(
-                        "something was copied here: {announced}, but NOBODY IS LISTENING                          for copies any more, so no other machine will be told. Nothing                          copied on this machine will reach another until it is restarted"
+                        "something was copied here: {announced}, but NOBODY IS LISTENING      \
+                         for copies any more, so no other machine will be told. Nothing \
+                         copied on this machine will reach another until it is restarted"
                     )),
                 }
             }

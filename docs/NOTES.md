@@ -1728,6 +1728,42 @@ write the bug. (This was found while adding the lines above, and is
 not the fault those lines were added to find: `NothingOffered` does
 not renew, so this path was not the one firing.)
 
+**There is one `available_now`, not two.** It is tempting, when the
+scheduled task works and the service does not, to look for the list
+the service got wrong. For clipboard formats there is no such list:
+`available_now` is the only place that decides which formats are
+worth telling another machine about, and both arrangements call it --
+the settle timer calls it in whichever process holds the clipboard
+window, and `WindowsClipboard::available` calls it for a poll. A
+difference in behaviour between the two arrangements therefore cannot
+be a difference in that list, and reasoning that starts "the worker's
+set must be a subset" starts from something that does not exist.
+
+What the list *was* missing, independently: an image offered only as
+`CF_DIBV5` or only as `CF_BITMAP` was not noticed at all. Windows
+synthesises the others from `CF_BITMAP` only once something asks, so
+`IsClipboardFormatAvailable(CF_DIB)` is false until then. Both are
+checked now.
+
+**A diagnostic that reports a mismatch must name both sides of it.**
+"None of the formats we share were on it" is true, and it cost a
+round, because settling what was actually there took somebody sitting
+in the session with a Win32 enumerator. It now lists every format on
+the clipboard with the name Windows has for it, and the identifiers
+it was looking for. The same class of slip in any other list is a
+single line from now on.
+
+**Line continuations written by a script.** Several messages shipped
+with long runs of spaces inside them, because a `\` at the end of a
+line inside a *Python* string is Python's own continuation: it eats
+the newline and bakes the Rust indentation into the literal. Thirteen
+of them. Rust needs the backslash to survive into the source, which
+means a raw string or a doubled backslash on the way. `cargo fmt`
+cannot see it, clippy cannot see it, and the only symptom is an ugly
+log line -- so it is worth a grep for `"[^"]*[a-z,.)]   +[a-z]` after
+any scripted edit, allowing for the handful of deliberately aligned
+columns in `smkvm status`.
+
 **The outbound half had no instrumentation at all.** Four rounds
 were spent making the inbound path -- another machine's copy arriving
 here -- say what it was doing, and in all that time the path by which

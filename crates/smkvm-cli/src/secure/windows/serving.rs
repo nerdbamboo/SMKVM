@@ -329,7 +329,8 @@ impl Serving {
                         // outbox, which would be this line trying to
                         // report its own failure to be reported.
                         tracing::warn!(
-                            "the worker's outbox cannot reach the service; messages are                              being posted and going nowhere"
+                            "the worker's outbox cannot reach the service; messages are being \
+                             posted and going nowhere"
                         );
                         failing = true;
                     }
@@ -407,7 +408,8 @@ impl Serving {
                             &telling,
                             Level::Warn,
                             format!(
-                                "could not tell the service about {formats} being copied                                  here; no further copies will be reported either"
+                                "could not tell the service about {formats} being copied \
+                                 here; no further copies will be reported either"
                             ),
                         );
                         return;
@@ -419,7 +421,8 @@ impl Serving {
                 tell(
                     &telling,
                     Level::Warn,
-                    "no longer watching this desktop's clipboard; copies made here will                      not reach another machine",
+                    "no longer watching this desktop's clipboard; copies made here will not \
+                     reach another machine",
                 );
             })
             .context("starting the worker's clipboard watch")?;
@@ -605,7 +608,8 @@ impl Clipboard {
                 None => tell(
                     speak,
                     Level::Warn,
-                    "asked to announce the far machine's clipboard, but this worker does                      not hold one -- nothing will appear on the person's clipboard",
+                    "asked to announce the far machine's clipboard, but this worker does not \
+                     hold one -- nothing will appear on the person's clipboard",
                 ),
             },
             ToWorker::ReleaseClipboard => {

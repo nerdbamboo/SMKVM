@@ -151,7 +151,8 @@ impl std::fmt::Display for Unacceptable {
             Unacceptable::TooMany(n) => write!(f, "it names {n} files, more than can be taken"),
             Unacceptable::BadPath(p) => write!(
                 f,
-                "{p:?} could land outside the directory it was meant for, so none of these                  files were taken"
+                "{p:?} could land outside the directory it was meant for, so none of these \
+                 files were taken"
             ),
         }
     }
