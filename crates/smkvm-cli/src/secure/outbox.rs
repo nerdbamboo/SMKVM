@@ -27,6 +27,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 
 /// What became of a message handed to an [`Outbox`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,19 @@ impl Posted {
 pub struct Outbox<T> {
     send: SyncSender<T>,
     dropped: AtomicUsize,
+    /// How many are in the channel and not yet taken out of it.
+    ///
+    /// Kept here, and changed by both ends through this type, rather
+    /// than inferred by subtracting one counter from another at the
+    /// call sites. The derived number was reported as seventeen
+    /// waiting while the drain sat idle, which is a state that
+    /// cannot exist -- and because the two counters were
+    /// independent, there was no way to tell a real backlog from
+    /// arithmetic about two things that were not the same queue.
+    ///
+    /// A depth maintained by the queue itself cannot disagree with
+    /// the queue.
+    waiting: Arc<AtomicUsize>,
 }
 
 impl<T> Outbox<T> {
@@ -60,15 +74,22 @@ impl<T> Outbox<T> {
     /// generous, because a burst is exactly the moment the messages
     /// matter, and bounded, because an outbox nobody drains must not
     /// grow without limit.
-    pub fn with_room_for(room: usize) -> (Outbox<T>, Receiver<T>) {
+    pub fn with_room_for(room: usize) -> (Outbox<T>, Drain<T>) {
         let (send, receive) = sync_channel(room);
+        let waiting = Arc::new(AtomicUsize::new(0));
         (
             Outbox {
                 send,
                 dropped: AtomicUsize::new(0),
+                waiting: waiting.clone(),
             },
-            receive,
+            Drain { receive, waiting },
         )
+    }
+
+    /// How many are waiting to be taken out.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
     }
 
     /// Hand over a message. Never waits, whatever the drain is doing.
@@ -77,7 +98,10 @@ impl<T> Outbox<T> {
     /// whole purpose of this type.
     pub fn post(&self, message: T) -> Posted {
         match self.send.try_send(message) {
-            Ok(()) => Posted::Sent,
+            Ok(()) => {
+                self.waiting.fetch_add(1, Ordering::Relaxed);
+                Posted::Sent
+            }
             Err(TrySendError::Full(_)) => {
                 Posted::NoRoom(self.dropped.fetch_add(1, Ordering::Relaxed) + 1)
             }
@@ -105,6 +129,27 @@ impl<T> Outbox<T> {
     /// quietly does not.
     pub fn put_back(&self, n: usize) {
         self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// The other end, which is the only way to take a message out.
+///
+/// A plain `Receiver` would do the job, and then the depth would be
+/// maintained in one place and decremented in another, which is the
+/// arrangement that produced a number nobody could trust. Taking a
+/// message out goes through here so that the count and the queue
+/// cannot come apart.
+pub struct Drain<T> {
+    receive: Receiver<T>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl<T> Drain<T> {
+    /// The next message, waiting until there is one.
+    pub fn next(&self) -> Option<T> {
+        let message = self.receive.recv().ok()?;
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        Some(message)
     }
 }
 
@@ -142,8 +187,8 @@ mod tests {
 
     #[test]
     fn an_outbox_nobody_is_draining_says_so_instead_of_waiting() {
-        let (out, receive) = Outbox::with_room_for(4);
-        drop(receive);
+        let (out, drain) = Outbox::with_room_for(4);
+        drop(drain);
         let began = Instant::now();
         assert_eq!(out.post(1), Posted::Gone);
         assert!(began.elapsed() < Duration::from_millis(100));
@@ -171,20 +216,45 @@ mod tests {
         // One drain, in order. Two writers interleaving frames is what
         // the shared lock was protecting against, and an outbox keeps
         // that guarantee while giving up the waiting.
-        let (out, receive) = Outbox::with_room_for(8);
+        let (out, drain) = Outbox::with_room_for(8);
         for i in 0..5 {
             assert!(out.post(i).arrived());
         }
-        let seen: Vec<i32> = (0..5).map(|_| receive.recv().unwrap()).collect();
+        let seen: Vec<i32> = (0..5).map(|_| drain.next().unwrap()).collect();
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn room_frees_up_again_once_the_drain_moves() {
-        let (out, receive) = Outbox::with_room_for(1);
+        let (out, drain) = Outbox::with_room_for(1);
         assert!(out.post(1).arrived());
         assert!(!out.post(2).arrived());
-        assert_eq!(receive.recv().unwrap(), 1);
+        assert_eq!(drain.next().unwrap(), 1);
         assert!(out.post(3).arrived());
+    }
+
+    #[test]
+    fn the_queue_keeps_its_own_count() {
+        let (out, drain) = Outbox::with_room_for(8);
+        assert_eq!(out.waiting(), 0);
+        out.post(1);
+        out.post(2);
+        assert_eq!(out.waiting(), 2);
+        drain.next();
+        assert_eq!(out.waiting(), 1);
+        drain.next();
+        assert_eq!(out.waiting(), 0);
+    }
+
+    #[test]
+    fn a_refused_message_is_not_counted_as_waiting() {
+        // The number has to mean "in the queue", not "handed over at
+        // some point", or an idle drain beside a non-zero count is
+        // unreadable -- which is exactly how it was read.
+        let (out, _keep) = Outbox::with_room_for(1);
+        out.post(1);
+        out.post(2);
+        out.post(3);
+        assert_eq!(out.waiting(), 1);
     }
 }

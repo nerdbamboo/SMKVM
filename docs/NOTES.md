@@ -2249,6 +2249,28 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**A queue's depth belongs to the queue.** "Seventeen waiting" was
+arithmetic on two independent atomics, one incremented after a post
+returned and one after a send succeeded, and it was reported beside
+a drain that was idle -- a state that cannot exist. Because the two
+counters were not the queue, there was no way to tell a real backlog
+from a number about two things that were not the same queue.
+`Outbox` keeps its own count now, changed at both ends through the
+type: posting raises it, and taking a message out goes through
+`Drain::next` rather than a bare `Receiver`, so the count and the
+queue cannot come apart. A refused message is not counted, because
+the number has to mean "in the queue" and not "handed over at some
+point".
+
+**"Idle" was an inference from the absence of a warning.** Which is
+the same mistake as every other absence here: it is equally what a
+watchdog that never fires looks like. The drain stores what it is in
+the middle of -- not started, waiting for a message, writing to the
+service, writing its own log line, finished -- and the heartbeat
+says it. Note the fourth of those: a drain blocked while writing its
+*own* diagnostic would have looked idle to a watchdog that only
+knows about writes to the pipe.
+
 **A report about a stuck writer cannot travel through the stuck
 writer, and it cannot share a lock with it either.** The same trap
 three times. The first version of the stall warning went through the

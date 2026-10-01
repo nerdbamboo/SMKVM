@@ -316,7 +316,7 @@ impl Serving {
                 // order, so nothing is torn in half; what changed is
                 // only *who* waits for it.
                 let mut failing = false;
-                while let Ok(message) = receive.recv() {
+                while let Some(message) = receive.next() {
                     if speak(&message) {
                         if failing {
                             tracing::info!("the worker's outbox is reaching the service again");

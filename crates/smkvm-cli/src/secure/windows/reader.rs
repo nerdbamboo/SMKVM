@@ -25,7 +25,7 @@
 //! to reason about whether one can be smuggled through.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,23 @@ type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
 /// rest are refused. Generous, because a burst is the moment they
 /// matter; bounded, because a queue nobody drains must not grow.
 const OUTBOX_ROOM: usize = 256;
+
+/// What the drain is in the middle of.
+const DRAIN_STARTING: u8 = 0;
+const DRAIN_WAITING: u8 = 1;
+const DRAIN_WRITING: u8 = 2;
+const DRAIN_REPORTING: u8 = 3;
+const DRAIN_FINISHED: u8 = 4;
+
+fn what_that_means(doing: u8) -> &'static str {
+    match doing {
+        DRAIN_STARTING => "not started",
+        DRAIN_WAITING => "waiting for a message",
+        DRAIN_WRITING => "writing to the service",
+        DRAIN_REPORTING => "writing its own log line",
+        _ => "finished",
+    }
+}
 
 /// How often the sequence watch says it is still there.
 ///
@@ -275,6 +292,12 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     // Zero means idle. Anything else is the second the current write
     // began.
     let writing_since = Arc::new(AtomicU64::new(0));
+    // What the drain is in the middle of, said rather than inferred.
+    //
+    // "Idle" was an inference from the absence of a stall warning,
+    // which is the same mistake as every other absence in this file:
+    // it is equally what a watchdog that never fires looks like.
+    let what_the_drain_is_doing = Arc::new(AtomicU8::new(DRAIN_STARTING));
     let posted = Arc::new(AtomicUsize::new(0));
     let delivered = Arc::new(AtomicUsize::new(0));
     {
@@ -282,15 +305,21 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
         let draining = trace.clone();
         let began = writing_since.clone();
         let done = delivered.clone();
+        let doing = what_the_drain_is_doing.clone();
         std::thread::Builder::new()
             .name("smkvm-reader-outbox".into())
             .spawn(move || {
                 let mut failing = false;
                 let mut sent = 0usize;
-                while let Ok(message) = collect.recv() {
+                while let Some(message) = {
+                    doing.store(DRAIN_WAITING, Ordering::Relaxed);
+                    collect.next()
+                } {
+                    doing.store(DRAIN_WRITING, Ordering::Relaxed);
                     began.store(now_in_seconds().max(1), Ordering::Relaxed);
                     let outcome = say(&mut writing, &message);
                     began.store(0, Ordering::Relaxed);
+                    doing.store(DRAIN_REPORTING, Ordering::Relaxed);
                     match outcome {
                         Ok(()) => {
                             sent += 1;
@@ -331,6 +360,7 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                 }
                 // Only when every sender has gone, which in this
                 // process means it is ending.
+                doing.store(DRAIN_FINISHED, Ordering::Relaxed);
                 draining.say(&format!("outbox: nothing more to send; {sent} sent in all"));
             })
             .context("starting the reader's outbox")?;
@@ -507,6 +537,8 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     let stalled = writing_since.clone();
     let posted_so_far = posted.clone();
     let handed_over = delivered.clone();
+    let drain_state = what_the_drain_is_doing.clone();
+    let queue = outbox.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-sequence".into())
         .spawn(move || {
@@ -562,12 +594,15 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                 if now_in_seconds().saturating_sub(last_beat) >= HEARTBEAT_EVERY {
                     last_beat = now_in_seconds();
                     looking.say_whatever_happens(&format!(
-                        "still watching: sequence {}, {} posted, {} sent, {waiting} waiting, \
-                         told of {} changes",
+                        "still watching: sequence {}, {} posted, {} sent, told of {} \
+                         changes. The queue itself says {} waiting (by subtraction, \
+                         {waiting}); the drain is {}",
                         smkvm_clipboard::platform::windows::sequence_number(),
                         posted_so_far.load(Ordering::Relaxed),
                         handed_over.load(Ordering::Relaxed),
-                        smkvm_clipboard::platform::windows::NOTICED.load(Ordering::Relaxed)
+                        smkvm_clipboard::platform::windows::NOTICED.load(Ordering::Relaxed),
+                        queue.waiting(),
+                        what_that_means(drain_state.load(Ordering::Relaxed))
                     ));
                 }
 
