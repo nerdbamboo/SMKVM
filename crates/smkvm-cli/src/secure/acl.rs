@@ -50,6 +50,30 @@
 /// token and this string have to be read as one decision.
 pub const PIPE_SDDL: &str = "O:SYD:P(A;;GA;;;SY)";
 
+/// The access list on the reader's pipe.
+///
+/// The reader runs as the person at the desk, so it cannot open a
+/// pipe that admits the system account alone, and this one admits
+/// interactive users as well. That is not a weakening of the
+/// consent-prompt boundary -- a pipe is not a desktop, and the worker
+/// that reaches the secure desktop keeps its own pipe, which still
+/// admits nobody but the system account.
+///
+/// Two deliberate choices in these fourteen characters.
+///
+/// `IU` rather than the person's own SID, because the SID is not
+/// known until a session exists and the pipe is made before the
+/// reader is started -- made first on purpose, so that nothing can
+/// be sitting on the name when the reader goes looking for it.
+/// Interactive users is the set that contains exactly the person at
+/// the screen.
+///
+/// `GRGW` rather than `GA`, which is the difference that matters.
+/// Generic all includes `WRITE_DAC`, so a process running as that
+/// person could rewrite this list and let anything at all in. Read
+/// and write is what talking down a pipe needs and is all they get.
+pub const READER_PIPE_SDDL: &str = "O:SYD:P(A;;GA;;;SY)(A;;GRGW;;;IU)";
+
 /// How many bytes of unguessable name each run gets.
 ///
 /// Sixteen, because the name has to be one nobody can create before the
@@ -721,5 +745,29 @@ mod tests {
     fn the_worker_side_is_three_checks_and_deleting_one_is_visible() {
         assert_eq!(Guard::ALL.len(), 3);
         assert!(Guard::ALL.contains(&Guard::ServerIsSystem));
+    }
+
+    #[test]
+    fn the_readers_pipe_lets_the_person_in_and_no_further() {
+        // The person at the desk must be able to open it, or the
+        // reader cannot exist. They must not be able to rewrite who
+        // else can, which is what generic all would give them.
+        assert!(
+            READER_PIPE_SDDL.contains("(A;;GRGW;;;IU)"),
+            "the person at the desk cannot open the reader's pipe"
+        );
+        assert!(
+            !READER_PIPE_SDDL.contains("(A;;GA;;;IU)"),
+            "generic all includes WRITE_DAC, which would let the person rewrite this list"
+        );
+    }
+
+    #[test]
+    fn the_workers_pipe_still_admits_nobody_but_the_system_account() {
+        // The reader's pipe being open to the person must not have
+        // quietly opened the worker's. The worker is the half that
+        // reaches a consent prompt.
+        assert_eq!(PIPE_SDDL, "O:SYD:P(A;;GA;;;SY)");
+        assert!(granted_to_anyone_but(PIPE_SDDL, &MAY_HOLD_THE_KEY).is_empty());
     }
 }

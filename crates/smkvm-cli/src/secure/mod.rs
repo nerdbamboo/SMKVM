@@ -80,6 +80,7 @@ pub mod carry;
 pub mod outbox;
 pub mod plan;
 pub mod reach;
+pub mod reading;
 pub mod watch;
 pub mod wire;
 

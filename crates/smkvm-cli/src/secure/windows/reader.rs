@@ -1,0 +1,183 @@
+//! The half that runs as the person, and only reads.
+//!
+//! Measured three ways before it was written. A process running as
+//! the system account sees one format on the clipboard after a file
+//! is copied; a thread of that process impersonating the logged-on
+//! user sees the same one; a child started with `WTSQueryUserToken`
+//! and `CreateProcessAsUserW`, as that user, sees all five and reads
+//! real bytes out of every one of them. So impersonation is not the
+//! answer and identity is, and the identity has to belong to a
+//! process rather than a thread.
+//!
+//! What it does **not** do is as deliberate as what it does. It does
+//! not own the clipboard, offer anything, serve a render, or inject.
+//! Those all work today from the system account, because they are
+//! about a clipboard we put something on ourselves; only reading what
+//! another process put there needs to be the person. Moving a working
+//! path into a new process to fix a broken one is a mistake this
+//! codebase has already made in a smaller form, so nothing that works
+//! has moved.
+//!
+//! That restraint is also the security argument. This process is
+//! reached down a pipe that admits the person at the desk, which
+//! means it admits everything they are running; because
+//! [`crate::secure::reading`] cannot express an injection, nobody has
+//! to reason about whether one can be smuggled through.
+
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use smkvm_clipboard::platform::windows::WindowsClipboard;
+use smkvm_clipboard::{Read as _, Watch as _};
+
+use crate::secure::reading::{FromReader, ToReader, LONGEST_READ, READER_PROTOCOL};
+use crate::secure::windows::pipe;
+use crate::secure::windows::token;
+use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
+
+/// One way of speaking to the service, shared by the thread
+/// answering questions and the thread noticing copies.
+type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
+
+/// Run as the reader until the pipe closes or the service says stop.
+pub fn run(pipe_name: &str) -> Result<()> {
+    // `connect` checks that the process serving this pipe is the
+    // system account before a byte is sent. That guard matters more
+    // here than it does for the worker: this process runs as the
+    // person, so without it anything else running as them could put
+    // up a pipe of that name and be told what they copy.
+    let to_service = pipe::connect(pipe_name)
+        .context("reaching the service, which must be the system account")?;
+    let mut from_service = to_service.share()?;
+
+    // One writer, shared. There are two threads that speak: this one
+    // answering questions, and the watch noticing copies.
+    let speaking = Arc::new(Mutex::new(to_service.share()?));
+    let speak: Saying = {
+        let speaking = speaking.clone();
+        Arc::new(move |message: &FromReader| {
+            let mut held = speaking.lock().expect("not poisoned");
+            say(&mut *held, message).is_ok()
+        })
+    };
+
+    let who = token::whoami();
+    speak(&FromReader::Ready {
+        protocol: READER_PROTOCOL,
+        who: who.clone(),
+        session: token::console_session().unwrap_or_default(),
+    });
+    tell(&speak, Level::Info, format!("reading as {who}"));
+
+    let mut clipboard = WindowsClipboard::start().context("watching the person's clipboard")?;
+    let mut handle = clipboard.handle();
+
+    // What is already there, before any change is reported.
+    //
+    // Without this, a copy made before this process started -- during
+    // a logon, or while a dead reader was being replaced -- stays
+    // invisible until the person copies something again, which reads
+    // as the feature not working rather than as a gap.
+    match clipboard.available() {
+        Ok(already) => {
+            tell(
+                &speak,
+                Level::Info,
+                format!("what is already on the clipboard: {:?}", already.formats),
+            );
+            if !already.formats.is_empty() {
+                speak(&FromReader::Copied(already.formats));
+            }
+        }
+        Err(e) => tell(
+            &speak,
+            Level::Warn,
+            format!("could not see what is already on the clipboard: {e}"),
+        ),
+    }
+
+    // Copies are noticed on their own thread, because `next_change`
+    // blocks until one happens and this one has questions to answer
+    // meanwhile.
+    let noticing = speak.clone();
+    std::thread::Builder::new()
+        .name("smkvm-reader-watch".into())
+        .spawn(move || {
+            while let Some(copied) = clipboard.next_change() {
+                tell(
+                    &noticing,
+                    Level::Info,
+                    format!("something was copied here: {:?}", copied.formats),
+                );
+                if !noticing(&FromReader::Copied(copied.formats)) {
+                    return;
+                }
+            }
+            tell(
+                &noticing,
+                Level::Warn,
+                "no longer watching this clipboard; copies made here will not reach \
+                 another machine",
+            );
+        })
+        .context("starting the reader's watch")?;
+
+    loop {
+        let asked: ToReader = match read_frame_up_to(&mut from_service, LONGEST_READ) {
+            Ok(asked) => asked,
+            Err(e) => {
+                tracing::info!("the service stopped talking to this reader: {e}");
+                return Ok(());
+            }
+        };
+        match asked {
+            ToReader::WhatIsOnIt { id } => {
+                let formats = handle.available().map(|a| a.formats).unwrap_or_default();
+                speak(&FromReader::OnIt { id, formats });
+            }
+            ToReader::Read { id, format } => {
+                let began = std::time::Instant::now();
+                let bytes = handle.read(&format).map_err(|e| e.to_string());
+                tell(
+                    &speak,
+                    Level::Debug,
+                    format!(
+                        "read {format:?} in {} ms: {}",
+                        began.elapsed().as_millis(),
+                        match &bytes {
+                            Ok(b) => format!("{} bytes", b.len()),
+                            Err(e) => e.clone(),
+                        }
+                    ),
+                );
+                speak(&FromReader::Read { id, bytes });
+            }
+            ToReader::Stop => {
+                tell(&speak, Level::Info, "the service says to stop");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Say something into this process's log and the service's.
+///
+/// Both, for the same reason the worker does it: which of the two a
+/// line arrives in is itself part of the diagnosis, and this
+/// process's own log has been the less reliable of them.
+fn tell(speak: &Saying, level: Level, text: impl Into<String>) {
+    let text = text.into();
+    match level {
+        Level::Debug => tracing::debug!("{text}"),
+        Level::Info => tracing::info!("{text}"),
+        Level::Warn => tracing::warn!("{text}"),
+        Level::Error => tracing::error!("{text}"),
+    }
+    speak(&FromReader::Said { level, text });
+}
+
+fn say<W: std::io::Write>(to: &mut W, message: &FromReader) -> Result<()> {
+    let bytes = frame_up_to(message, LONGEST_READ)?;
+    to.write_all(&bytes).context("writing to the service")?;
+    Ok(())
+}

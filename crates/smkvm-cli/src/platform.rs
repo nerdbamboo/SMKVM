@@ -195,11 +195,46 @@ pub fn clipboard() -> Result<Backends> {
             use crate::secure::windows::clip::{
                 ReadThroughWorker, WatchThroughWorker, WriteThroughWorker,
             };
+            use crate::secure::windows::readers;
+
+            // The two halves have different identity requirements and
+            // this is where that shows.
+            //
+            // Offering -- putting another machine's clipboard on this
+            // one -- works from the system account, because it is
+            // about a clipboard we own, and it keeps working through
+            // the worker exactly as it did. Watching and reading do
+            // not: a process running as the system account sees one
+            // format where the person sees five, measured three ways
+            // including a thread impersonating them. So those two
+            // come from a reader running as the person, when there is
+            // a person to be.
+            //
+            // When there is not -- between logoff and logon -- the
+            // worker's own watch and read are used instead. They see
+            // nothing, which is the truth: there is no clipboard,
+            // because there is nobody whose clipboard it would be. It
+            // is not an error and is not written as one.
+            let (watch, read): (
+                Box<dyn smkvm_clipboard::Watch + Send>,
+                Box<dyn smkvm_clipboard::Read + Send>,
+            ) = match readers::reader() {
+                Some(reader) => (
+                    Box::new(readers::WatchThroughReader {
+                        copies: reader.watch(),
+                    }),
+                    Box::new(readers::ReadThroughReader),
+                ),
+                None => (
+                    Box::new(WatchThroughWorker {
+                        changes: link.watch_clipboard(),
+                    }),
+                    Box::new(ReadThroughWorker(link.clone())),
+                ),
+            };
             return Ok(Backends {
-                watch: Box::new(WatchThroughWorker {
-                    changes: link.watch_clipboard(),
-                }),
-                read: Box::new(ReadThroughWorker(link.clone())),
+                watch,
+                read,
                 write: Box::new(WriteThroughWorker(link)),
             });
         }

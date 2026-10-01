@@ -29,7 +29,7 @@ use windows::Win32::System::Services::{
 };
 
 use crate::secure::watch::{self, Seen, Step, Watch};
-use crate::secure::windows::{link, pipe, secret, store, token, Aligned};
+use crate::secure::windows::{link, pipe, readers, secret, store, token, Aligned};
 use crate::secure::{acl, wire};
 
 /// What the service is registered as. The scheduled task is `SMKVM`; this
@@ -521,6 +521,13 @@ fn serve() -> Result<()> {
     link::use_worker(link.clone());
 
     let exe = std::env::current_exe().context("finding this program's own path")?;
+    {
+        let exe = exe.clone();
+        std::thread::Builder::new()
+            .name("smkvm-readers".into())
+            .spawn(move || mind_readers(&exe))
+            .context("starting the thread that minds the reader")?;
+    }
     let minding = {
         let link = link.clone();
         std::thread::Builder::new()
@@ -552,6 +559,87 @@ fn serve() -> Result<()> {
 /// this loop's whole history and the reason it is shaped this way now:
 /// a worker goes into the session first, on the desktop that always
 /// exists, and from then on the worker is the one that can see.
+/// How long to wait before trying to start a reader again after one
+/// could not be started.
+const READER_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keep a reader running as whoever is at the screen, and nothing
+/// running when nobody is.
+///
+/// Separate from minding the worker, because the two follow different
+/// things. A worker follows the *desktop*, and is replaced whenever
+/// the input moves to another one -- several times a minute while
+/// somebody dismisses consent prompts. A reader follows the
+/// *session*, which changes when a person logs on or off, and it has
+/// no business on the desktop a consent prompt is on: there is
+/// nothing to copy there.
+///
+/// Absence is the ordinary state here, not a failure. Between logoff
+/// and logon there is nobody to be, so there is no reader, and the
+/// service goes on running with its link and its reach into the
+/// consent desktop intact. What it loses is the ability to say what
+/// this machine has copied, because this machine has nobody to copy.
+fn mind_readers(exe: &Path) {
+    let mut serving: Option<u32> = None;
+    // Latched, so that a machine sitting at the logon screen does not
+    // write the same line four times a minute until somebody arrives.
+    let mut said_nobody = false;
+    // When to try again after a start that failed. A reader that
+    // cannot be started is worth retrying -- the session may be
+    // mid-logon -- but not four times a second.
+    let mut not_before = Instant::now();
+
+    while !STOPPING.load(Ordering::SeqCst) {
+        std::thread::sleep(watch::LOOK_EVERY);
+
+        let session = token::console_session();
+        let here = readers::reader();
+
+        match (session, &serving) {
+            // Nobody at the screen. If a reader was running for
+            // somebody who has gone, it goes with them.
+            (None, _) => {
+                if serving.take().is_some() {
+                    readers::let_go("nobody is at the screen any more");
+                }
+                if !said_nobody {
+                    tracing::info!(
+                        "clipboard: nobody is logged in, so there is nothing to read here. \
+                         Input is unaffected"
+                    );
+                    said_nobody = true;
+                }
+            }
+            // Somebody is there and a reader is running for them.
+            (Some(now), Some(was)) if now == *was && here.is_some() => {}
+            // Somebody is there and either nothing is running, or
+            // what is running belongs to a session that has gone.
+            (Some(now), _) => {
+                said_nobody = false;
+                if serving.is_some() && serving != Some(now) {
+                    readers::let_go("somebody else is at the screen now");
+                    serving = None;
+                }
+                if Instant::now() < not_before {
+                    continue;
+                }
+                match readers::start(exe, now) {
+                    Ok(_) => serving = Some(now),
+                    Err(e) => {
+                        tracing::warn!(
+                            "clipboard: could not start a reader in session {now}: {e:#}. \
+                             What this machine copies will not reach another until one \
+                             starts; everything else is unaffected"
+                        );
+                        not_before = Instant::now() + READER_RETRY_AFTER;
+                    }
+                }
+            }
+        }
+    }
+    readers::let_go("the service is stopping");
+}
+
 fn mind_workers(exe: &Path, link: Arc<link::Link>) {
     let mut watch = Watch::new();
     let mut running: Option<token::Started> = None;

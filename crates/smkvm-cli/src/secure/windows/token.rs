@@ -61,13 +61,14 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, DuplicateTokenEx, LookupPrivilegeValueW, SecurityImpersonation,
-    SetTokenInformation, TokenPrimary, TokenSessionId, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-    SE_TCB_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW,
+    SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId, TokenUser,
+    LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SE_TCB_NAME, SID_NAME_USE, TOKEN_ACCESS_MASK,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
@@ -369,4 +370,68 @@ pub fn start_on_desktop(
         process: Owned(information.hProcess),
         pid: information.dwProcessId,
     })
+}
+
+/// Who this process is running as, as a name rather than a number.
+pub fn whoami() -> String {
+    let mut token = HANDLE::default();
+    // SAFETY: a place for the token, owned below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return "(could not be read)".into();
+    }
+    let token = Owned(token);
+    let mut wanted = 0u32;
+    // SAFETY: asking for the size first, which is why the buffer is
+    // null and the error is expected.
+    unsafe {
+        let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut wanted);
+    }
+    if wanted == 0 {
+        return "(could not be read)".into();
+    }
+    let mut buffer = vec![0u8; wanted as usize];
+    // SAFETY: the buffer is the size the call just asked for.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            wanted,
+            &mut wanted,
+        )
+    }
+    .is_err()
+    {
+        return "(could not be read)".into();
+    }
+    // SAFETY: the buffer holds a TOKEN_USER, which is what was asked
+    // for, and it outlives the borrow.
+    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+
+    let mut name = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain = [0u16; 256];
+    let mut domain_len = domain.len() as u32;
+    let mut kind = SID_NAME_USE::default();
+    // SAFETY: both buffers are valid for the lengths given, and the
+    // SID came from the token above.
+    let looked_up = unsafe {
+        windows::Win32::Security::LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            PWSTR(name.as_mut_ptr()),
+            &mut name_len,
+            PWSTR(domain.as_mut_ptr()),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    if looked_up.is_err() {
+        return "(a name could not be found for it)".into();
+    }
+    format!(
+        "{}\\{}",
+        String::from_utf16_lossy(&domain[..domain_len as usize]),
+        String::from_utf16_lossy(&name[..name_len as usize])
+    )
 }

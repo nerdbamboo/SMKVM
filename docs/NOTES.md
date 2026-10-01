@@ -347,6 +347,49 @@ sees the five formats. A process started by hand does -- that is the
 second row of the table -- but the token path differs, and that is
 the one thing to confirm before building.
 
+### What the measurements said, and what was built
+
+Three observers, one page, after a file copy in Explorer:
+
+| observer | sees |
+| --- | --- |
+| the service's own process, as the system account | one format |
+| a thread of it impersonating the logged-on user | the same one format |
+| a child started as that user with `WTSQueryUserToken` and `CreateProcessAsUserW` | all five, and reads real bytes from every one -- 114 of `CF_HDROP`, the file list |
+
+**Impersonation is not the answer.** Shape A is closed, and the
+reason is worth keeping: the identity has to belong to a *process*,
+not to a thread of one. Anything built on `ImpersonateLoggedOnUser`
+here would have failed in the same silent way, after the work.
+
+So B-minimal was built. `secure::reading` is a protocol with three
+messages, all of them reads; `secure::windows::reader` is the half
+that runs as the person; `secure::windows::readers` is the service's
+end of it. Offering, rendering and injection did not move and run as
+the system account exactly as before.
+
+Four things about it that are decisions rather than details:
+
+- **The reader's pipe admits interactive users, and the worker's
+  still admits nobody but the system account.** Two pipes, because
+  two identities. `GRGW` and not `GA` on the reader's: generic all
+  includes `WRITE_DAC`, so the person could rewrite who else gets in.
+  A test asserts both.
+- **The protocol cannot express an injection**, so nobody has to
+  reason about whether one can be smuggled through an endpoint every
+  process the person owns can reach. The test that enforces this is a
+  match with no wildcard: adding a fourth message breaks it, and the
+  comment there says what question to answer before changing it.
+- **The reader checks that the service is the system account; the
+  service checks that the reader is the process it started.** The
+  first matters more than its mirror does for the worker: the reader
+  runs as the person, so without it anything else running as them
+  could put up a pipe of that name and be told what they copy.
+- **The reader follows the session; the worker follows the desktop.**
+  They are minded by separate loops because they change on different
+  occasions -- a worker several times a minute while consent prompts
+  come and go, a reader at logon and logoff.
+
 ### Taking the two measurements
 
 `smkvm clipboard-probe` is the instrument, hidden from `--help`

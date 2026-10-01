@@ -286,8 +286,19 @@ pub enum FrameError {
 /// bounds a read by the *reader's* buffer as well, and a short buffer there
 /// loses the rest of the message rather than returning it next time.)
 pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
+    frame_up_to(message, LONGEST_FRAME)
+}
+
+/// The same, for a conversation whose messages are legitimately
+/// larger.
+///
+/// The reader's are: the worker's messages are a handful of integers
+/// and the reader's carry what was copied, which may be a screenshot.
+/// The cap is still a cap, and it is still checked before anything is
+/// allocated against it.
+pub fn frame_up_to<T: Serialize>(message: &T, longest: usize) -> Result<Vec<u8>, FrameError> {
     let body = postcard::to_stdvec(message).map_err(|_| FrameError::Garbled)?;
-    if body.len() > LONGEST_FRAME {
+    if body.len() > longest {
         return Err(FrameError::TooLong(body.len()));
     }
     let mut out = Vec::with_capacity(4 + body.len());
@@ -300,12 +311,20 @@ pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
 pub fn read_frame<T: serde::de::DeserializeOwned, R: std::io::Read>(
     from: &mut R,
 ) -> Result<T, FrameError> {
+    read_frame_up_to(from, LONGEST_FRAME)
+}
+
+/// The same, with the cap the caller's conversation uses.
+pub fn read_frame_up_to<T: serde::de::DeserializeOwned, R: std::io::Read>(
+    from: &mut R,
+    longest: usize,
+) -> Result<T, FrameError> {
     let mut length = [0u8; 4];
     from.read_exact(&mut length)?;
     let length = u32::from_le_bytes(length) as usize;
     // Checked before anything is allocated. A length prefix trusted far
     // enough to reserve against is a length prefix that can exhaust memory.
-    if length > LONGEST_FRAME {
+    if length > longest {
         return Err(FrameError::TooLong(length));
     }
     let mut body = vec![0u8; length];

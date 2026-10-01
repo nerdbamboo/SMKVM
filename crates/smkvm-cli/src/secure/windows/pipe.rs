@@ -78,8 +78,8 @@ use windows::Win32::Storage::FileSystem::{
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, OpenProcess, OpenProcessToken, ResetEvent, WaitForSingleObject,
@@ -287,6 +287,35 @@ impl Pipe {
     /// window. It is written down here so the next reader does not
     /// rediscover it and wonder whether anybody noticed; it is not worth
     /// code.
+    /// Is the process at the other end the one we started?
+    ///
+    /// The mirror of [`Pipe::server_is_the_system`], and needed for
+    /// the same reason pointing the other way. The reader's pipe
+    /// admits the person at the desk, so it admits every process
+    /// they are running, and the name being unguessable only means
+    /// an impostor has to be lucky rather than that it cannot
+    /// happen. The process that answers must be the one that was
+    /// started.
+    ///
+    /// A process id can be reused after the process exits, which is
+    /// why this is checked at the moment of connecting, while the
+    /// handle to the started process is still held open and its id
+    /// therefore cannot be given to anything else.
+    pub fn client_is(&self, expected: u32) -> Result<()> {
+        let mut pid = 0u32;
+        // SAFETY: a valid pipe handle and a place for the id.
+        unsafe { GetNamedPipeClientProcessId(self.handle, &mut pid) }
+            .context("asking which process connected to this pipe")?;
+        if pid != expected {
+            bail!(
+                "process {pid} answered the reader's pipe, and the reader that was \
+                 started is process {expected}. Something else on this desktop got there \
+                 first; nothing has been read from it"
+            );
+        }
+        Ok(())
+    }
+
     pub fn server_is_the_system(&self) -> Result<()> {
         let mut pid = 0u32;
         // SAFETY: a valid pipe handle and a place for the id.
@@ -394,18 +423,18 @@ impl Write for Pipe {
 struct Descriptor(PSECURITY_DESCRIPTOR);
 
 impl Descriptor {
-    fn build() -> Result<Descriptor> {
+    fn build(sddl: &str) -> Result<Descriptor> {
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         // SAFETY: a constant wide string in, a place for the descriptor out.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                &HSTRING::from(acl::PIPE_SDDL),
+                &HSTRING::from(sddl),
                 SDDL_REVISION_1,
                 &mut descriptor,
                 None,
             )
         }
-        .with_context(|| format!("reading the pipe's access list, {}", acl::PIPE_SDDL))?;
+        .with_context(|| format!("reading the pipe's access list, {sddl}"))?;
         Ok(Descriptor(descriptor))
     }
 }
@@ -431,7 +460,18 @@ impl Drop for Descriptor {
 /// it had worked, which meant a squatted name produced a worker talking to
 /// the squatter -- with a comment above it claiming the opposite.
 pub fn create(name: &str) -> Result<Pipe> {
-    let descriptor = Descriptor::build()?;
+    create_with(name, acl::PIPE_SDDL)
+}
+
+/// Make a pipe whose access list is not the worker's.
+///
+/// The reader runs as the person at the desk and cannot open a pipe
+/// that admits the system account alone, so it gets one that admits
+/// them -- which means it admits everything else they are running
+/// too. That is why [`crate::secure::reading`] exists and why its
+/// protocol cannot express anything but a read.
+pub fn create_with(name: &str, sddl: &str) -> Result<Pipe> {
+    let descriptor = Descriptor::build(sddl)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0 .0,

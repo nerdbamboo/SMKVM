@@ -1684,6 +1684,18 @@ impl WindowsHandle {
     }
 }
 
+impl WindowsHandle {
+    /// What is on the clipboard now, asked from a handle rather than
+    /// from the watcher.
+    ///
+    /// The watcher blocks on the next change, so whoever has to
+    /// answer "what is on it right now" cannot be holding it.
+    pub fn available(&self) -> Result<Available> {
+        let _open = Opened::take(HWND::default())?;
+        Ok(available_now(self.formats))
+    }
+}
+
 impl crate::Read for WindowsHandle {
     /// Read through the thread that has a COM apartment.
     ///

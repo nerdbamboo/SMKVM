@@ -130,6 +130,14 @@ enum Command {
         #[arg(long)]
         pipe: String,
     },
+    /// The half the service runs as the person at the desk, so that
+    /// what they copy can be seen at all. Started by the service with
+    /// the pipe it should report to. Not a command to run by hand.
+    #[command(hide = true)]
+    ClipboardReader {
+        #[arg(long)]
+        pipe: String,
+    },
     /// Look at this session's clipboard and say what can be seen,
     /// and -- as the system account -- what two other observers see.
     /// For deciding one design question; not a command to run by
@@ -206,6 +214,11 @@ fn main() -> Result<()> {
         cli.command,
         Command::ServiceMain | Command::DesktopWorker { .. }
     ) {
+        // Deliberately not the reader. It runs as the person at the
+        // desk and reads no configuration at all -- it is handed a
+        // pipe name and nothing else -- so pointing it at the
+        // machine-wide files would give it a scope it has no use for
+        // and no right to.
         paths::use_machine_scope();
     }
     start_logging(cli.verbose, cli.log_file.clone(), cli.unattended)?;
@@ -235,6 +248,7 @@ fn main() -> Result<()> {
         Command::ServiceMain => service_main(),
         Command::DesktopWorker { pipe } => desktop_worker(&pipe),
         Command::ClipboardProbe { report_to } => clipboard_probe(report_to),
+        Command::ClipboardReader { pipe } => clipboard_reader(&pipe),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -497,6 +511,19 @@ fn desktop_worker(pipe: &str) -> Result<()> {
     {
         let _ = pipe;
         bail!("the desktop worker is a Windows arrangement")
+    }
+}
+
+/// Read the person's clipboard for the service, as the person.
+fn clipboard_reader(pipe: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        secure::windows::reader::run(pipe)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pipe;
+        bail!("the clipboard reader is a Windows arrangement")
     }
 }
 
