@@ -186,6 +186,180 @@ say what each one was. What remains:
   its clients or the GUI reads the server's report over the link.
 - **Log lines print `DeviceId` as thirty-two decimal bytes.** Hex, or the
   machine's name, would make the clipboard lines readable.
+- **Under the service, nothing copied on the machine reaches another
+  one.** Inbound works -- what another machine copies can be pasted here,
+  text, images and files. Outbound does not, because a process running as
+  the system account cannot see what the logged-on user copied. This is
+  measured and understood, and fixing it is a choice with real costs
+  rather than a defect to be patched; the next section lays the choice
+  out. Under the scheduled task, outbound works as it always has.
+
+## The clipboard, the account, and a choice nobody has made yet
+
+This section exists to be read before anybody writes code for it. It
+is a decision, not a design, and the measurement behind it is
+finished.
+
+### What was measured, and what it settles
+
+Three observers, the same session, the same desktop, the same copy of
+the same file.
+
+| observer | sees | can fetch |
+| --- | --- | --- |
+| the copying process, as the user | five formats | yes |
+| another process, as the user, plain Win32 only | `49161=DataObject`, `15` (`CF_HDROP`), `49159=FileNameW`, `49158=FileName`, `49171=Ole Private Data` | `GetClipboardData(15)` returns a real handle |
+| the worker, as the system account | `49161=DataObject`, and nothing else | no |
+
+The worker looked eight times across 1750 ms and the list never
+changed, so it is not a copy still being assembled. It then looked
+again from a thread with a COM apartment, both the plain way and by
+asking the data object: plain Win32 saw the same single entry, and
+`IDataObject::EnumFormatEtc` returned an empty list. So an apartment
+is not the difference either, and `available_now` was never at fault
+-- `CF_HDROP` has been in it throughout.
+
+**What this settles: a process running as the system account cannot
+see what the logged-on user copied, however it asks.**
+
+**What it does not settle: why.** Two mechanisms fit everything
+observed -- that the formats past `CF_DATAOBJECT` are produced by OLE
+inside the asking process and cannot be marshalled across a user
+boundary, or that the format list itself is filtered by token. They
+have not been told apart, and for the choice below it does not matter:
+every shape that fixes it fixes it by having a process of the user's
+own identity do the looking. Nobody should spend a round on the
+mechanism before the shape is chosen.
+
+One thing the measurement is silent on, and it is the cheapest open
+question here: **nobody has tested a system process that
+*impersonates* the user.** That single test decides whether the first
+shape below is viable at all, and it is an afternoon.
+
+### Why this is a choice and not a bug
+
+Input must be the system account or it cannot reach a consent prompt.
+The clipboard must be the logged-on user or it cannot see what they
+copied. Those two requirements are not in tension -- they only
+conflict because one process is being asked to satisfy both.
+
+It is also, right now, a trade the person at the desk is living with.
+The client is on the service: it reaches the consent desktop and has
+no outbound clipboard. The server is on the scheduled task: it has
+the clipboard in both directions and cannot reach the consent
+desktop. Both arrangements work; neither does everything. **Doing
+nothing is a real option, and for a machine that rarely sees a
+consent prompt the scheduled task is the better arrangement today.**
+That is worth saying first, because the engineering costs below are
+not small and this one is zero.
+
+### Shape A -- impersonate the user on the clipboard's threads
+
+`WTSQueryUserToken`, then `ImpersonateLoggedOnUser` on the threads
+that touch the clipboard.
+
+*What it costs.* Impersonation is per-thread, and the clipboard
+already spans three: the window thread, the COM thread, and whichever
+thread reads. Every one of them has to impersonate, and any future
+thread handed clipboard work has to as well -- a rule that is
+invisible when broken, which is the category of mistake that has cost
+this file most of its rounds. The clipboard window's identity is
+likely fixed when the window is created, so the window probably has
+to be created while impersonating rather than impersonated
+afterwards. COM and impersonation together need cloaking set
+deliberately (`CoSetProxyBlanket`, `EOAC_STATIC_CLOAKING`), and
+getting that wrong fails silently in exactly the way this has already
+failed eleven times.
+
+*What is unknown.* Whether it works at all. Untested, and testable in
+an afternoon as noted above. Until that test exists this shape should
+not be scoped further.
+
+*What it does not cost.* No second process, no new lifecycle, no new
+pipe, and no window-station or desktop DACL is widened -- which was
+the line drawn at the start of this work and still holds.
+
+### Shape B -- a second helper, running as the logged-on user
+
+The service already knows how to start a process in the interactive
+session as a chosen identity; that is `CreateProcessAsUserW`, and a
+`WTSQueryUserToken` path existed here before it was replaced with the
+system token to make input work. So: two helpers rather than one. The
+desktop worker stays exactly as it is -- the system account, input,
+following the desktop. A second helper runs as the user, on `Default`
+only, and owns the clipboard.
+
+*What it costs.* A second process to supervise: started, noticed when
+it dies, restarted. A second lifecycle to get right around logon,
+logoff, lock, unlock and fast user switching; between logoff and
+logon there is no user, so there is no clipboard helper, which is
+arguably the correct answer rather than a gap. Two things to install
+and uninstall cleanly.
+
+*And one cost that is larger than it looks.* The worker's pipe is
+`O:SYD:P(A;;GA;;;SY)` -- the system account and nobody else, which is
+one of the three guards named in `secure::acl`. A helper running as
+the user cannot connect to it. It would need a pipe of its own whose
+DACL admits the interactive user, and **that endpoint is then
+reachable by anything running as that person.** It must therefore
+carry clipboard messages only and must not be able to drive
+injection, which means splitting `ToWorker` and `FromWorker` rather
+than reusing them whole. Treating the user-side pipe as untrusted
+input is not optional and is the main new piece of security thinking
+this shape requires. It does not weaken the consent-prompt boundary
+-- a pipe is not a desktop -- but it is a new surface and should be
+designed as one.
+
+*What it buys.* The clipboard half becomes ordinary code running as
+an ordinary user, which is the arrangement that demonstrably works on
+three machines today. No impersonation, no cloaking, no per-thread
+rule that is invisible when broken, and each half has exactly the
+identity it needs.
+
+### Shape B-minimal -- a helper that only reads
+
+Worth separating out, because it may be most of shape B's benefit for
+a fraction of its cost.
+
+Note the asymmetry the measurement actually shows. **Inbound works
+today as the system account**: the worker takes the clipboard,
+promises formats and serves renders, and all of that is about a
+clipboard we own. Only *reading what another process put there* needs
+the user's identity. So the helper does not need to own the
+clipboard, offer anything, or handle a single render. It answers two
+questions -- what is on the clipboard now, and give me this format --
+and watches for changes, which is part of reading.
+
+That matters for the cost above in two ways. A read-only endpoint
+cannot drive injection by construction, so the security question
+mostly answers itself. And nothing that works today moves: the
+inbound path, the renders, the promise, the renewal and the whole
+secure-desktop arrangement stay in the process they are in now.
+Moving a working path into a new process to fix a broken one is the
+mistake this file has already made in a smaller form, and this avoids
+it.
+
+The drag catcher reads the shell's data and almost certainly has the
+same problem; it belongs with reading rather than with input.
+
+*What is unknown.* Whether a process the *service* starts as the user
+sees the five formats. A process started by hand does -- that is the
+second row of the table -- but the token path differs, and that is
+the one thing to confirm before building.
+
+### What to do next, in order
+
+1. Confirm the `WTSQueryUserToken` + `CreateProcessAsUserW` path
+   produces a process that sees the five formats. Cheap, and it
+   de-risks both B shapes.
+2. Test whether an impersonating system thread sees them. Cheap, and
+   it either keeps shape A alive or closes it.
+3. Only then choose, and only then scope.
+
+Until one of those is done, the honest position is the one at the top
+of this section: two arrangements exist, each does something the
+other cannot, and a machine can be put on whichever matters more to
+the person using it.
 
 ## The service, and the desktop a UAC prompt is on
 
