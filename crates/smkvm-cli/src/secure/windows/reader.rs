@@ -33,11 +33,25 @@ use anyhow::{Context, Result};
 use smkvm_clipboard::platform::windows::WindowsClipboard;
 use smkvm_clipboard::{Read as _, Watch as _};
 
-use crate::secure::outbox::Outbox;
+use crate::secure::outbox::{Outbox, Posted};
 use crate::secure::reading::{FromReader, ToReader, LONGEST_READ, READER_PROTOCOL};
 use crate::secure::windows::pipe;
 use crate::secure::windows::token;
 use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
+
+/// What a message is, for a log line, without its contents.
+///
+/// Contents can be a whole clipboard; this is for counting and
+/// ordering, not for reading what was copied.
+fn what_it_is(message: &FromReader) -> &'static str {
+    match message {
+        FromReader::Ready { .. } => "hello",
+        FromReader::Copied(_) => "a copy",
+        FromReader::OnIt { .. } => "what is on it",
+        FromReader::Read { .. } => "a read",
+        FromReader::Said { .. } => "a line",
+    }
+}
 
 /// One way of speaking to the service, shared by the thread
 /// answering questions and the thread noticing copies.
@@ -203,9 +217,14 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                     match say(&mut writing, &message) {
                         Ok(()) => {
                             sent += 1;
-                            if failing {
+                            // The first few and then every so often.
+                            // A drain that is working has to leave a
+                            // mark, or its silence cannot be told
+                            // from its absence.
+                            if failing || sent <= 5 || sent % 50 == 0 {
                                 draining.say(&format!(
-                                    "outbox: reaching the service again, {sent} sent in all"
+                                    "outbox: sent {} ({sent} in all)",
+                                    what_it_is(&message)
                                 ));
                             }
                             failing = false;
@@ -240,7 +259,30 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     }
     let speak: Saying = {
         let outbox = outbox.clone();
-        Arc::new(move |message: &FromReader| outbox.post(message.clone()).arrived())
+        let posting = trace.clone();
+        Arc::new(move |message: &FromReader| {
+            let became = outbox.post(message.clone());
+            // Every post, at the moment of posting, with what became
+            // of it.
+            //
+            // This is the line that was missing. "Posted and not
+            // delivered" and "never posted" have shared a symptom
+            // for two rounds, and the round meant to separate them
+            // added tracing only to the drain's *failure* paths --
+            // so a healthy drain and an absent one both produced a
+            // file with no outbox line in it. The same mistake in a
+            // new place: an absence asked to carry evidence.
+            posting.say(&format!(
+                "posted {} -> {}",
+                what_it_is(message),
+                match became {
+                    Posted::Sent => "queued".to_string(),
+                    Posted::NoRoom(n) => format!("REFUSED, {n} in a row; the queue is full"),
+                    Posted::Gone => "REFUSED, nobody is draining".to_string(),
+                }
+            ));
+            became.arrived()
+        })
     };
 
     // The first thing, before the clipboard and before anything that
@@ -379,6 +421,7 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     let polling = speak.clone();
     let claimed = announced.clone();
     let asking = handle.clone();
+    let looking = trace.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-sequence".into())
         .spawn(move || {
@@ -397,12 +440,18 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                 if now == claimed.load(Ordering::Relaxed) {
                     continue;
                 }
+                looking.say(&format!(
+                    "the sequence number moved to {now}; letting it settle"
+                ));
                 // Settle first: a copy arrives as several changes, and
                 // the shell's file copy assembles itself over a second
                 // or so.
                 std::thread::sleep(SETTLE_FOR);
                 let settled = smkvm_clipboard::platform::windows::sequence_number();
                 if claimed.swap(settled, Ordering::Relaxed) == settled {
+                    looking.say(&format!(
+                        "the copy at sequence {settled} was already announced by the window"
+                    ));
                     continue;
                 }
                 match asking.available() {
@@ -427,6 +476,8 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                             ),
                         );
                         if !polling(&FromReader::Copied(there.formats)) {
+                            looking
+                                .say("the sequence watch is stopping: a copy could not be posted");
                             return;
                         }
                     }
@@ -455,7 +506,13 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                 let settled = smkvm_clipboard::platform::windows::sequence_number();
                 if claimed.swap(settled, Ordering::Relaxed) == settled {
                     // The sequence watch got there first. One copy,
-                    // one notice.
+                    // one notice -- but said, because "this path
+                    // works and deferred" and "this path never ran"
+                    // were indistinguishable, and that cost a round.
+                    watching.say(&format!(
+                        "told about a copy (sequence {settled}), already announced by the \
+                         sequence watch"
+                    ));
                     continue;
                 }
                 tell(
@@ -468,6 +525,11 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                     ),
                 );
                 if !noticing(&FromReader::Copied(copied.formats)) {
+                    // Said before leaving. This return skipped the
+                    // line below it, so a watch that ended because a
+                    // post was refused ended in silence -- exactly
+                    // the state the trace exists to make impossible.
+                    watching.say("the clipboard watch is stopping: a copy could not be posted");
                     return;
                 }
             }

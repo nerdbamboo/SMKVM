@@ -2249,6 +2249,24 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**An absence must never be asked to carry evidence, and that
+includes the instruments.** The round that was meant to separate
+"posted and not delivered" from "never posted" added tracing only to
+the outbox's *failure* paths -- so a healthy drain and an absent one
+both produced a file with no outbox line in it, and the question
+stayed exactly where it was. Every post is now traced at the moment
+of posting with what became of it, and the drain marks its first few
+sends and every fiftieth after. A working path has to leave a mark,
+or its silence cannot be told from its absence. This is the third
+time that sentence has been the finding.
+
+Two places in the reader could also end a thread in silence: the
+watch and the sequence poll each did `if !post { return; }`, and the
+`return` jumped over the line that would have said so. And when one
+of them won the race to announce a copy, the other `continue`d
+without a word, so "this path works and deferred to the other" was
+indistinguishable from "this path never ran". Both say so now.
+
 **A zero that means two things will be read as the wrong one.**
 `EnumClipboardFormats` answers zero both for "that was the last one"
 and for "that did not work", and the two are told apart only by the
@@ -2256,6 +2274,12 @@ error left behind -- clear for the end of the list. Read naively it
 reports every failure as an empty clipboard, which is how `the
 clipboard now holds []` came to be printed one line above a list of
 formats something else had just found on the same clipboard.
+
+`ERROR_CLIPBOARD_NOT_OPEN` is what it was hiding: the enumeration
+runs with the clipboard not open on that thread, every time, while
+`IsClipboardFormatAvailable` on the line above needs no open
+clipboard and answers correctly. That is a real fault, found only
+because the diagnostic stopped lying about it.
 
 That is the second call in this file with that shape. The first was
 `SetClipboardData`, whose null return meant both "promised" and
