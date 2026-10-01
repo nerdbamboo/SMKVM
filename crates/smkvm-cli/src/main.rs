@@ -130,6 +130,16 @@ enum Command {
         #[arg(long)]
         pipe: String,
     },
+    /// Look at this session's clipboard and say what can be seen,
+    /// and -- as the system account -- what two other observers see.
+    /// For deciding one design question; not a command to run by
+    /// hand once that is decided.
+    #[command(hide = true)]
+    ClipboardProbe {
+        /// Where a child leaves what it saw, for its parent to print.
+        #[arg(long)]
+        report_to: Option<std::path::PathBuf>,
+    },
     /// Write a starting configuration, migrating an existing Barrier setup.
     Import {
         /// Barrier's settings file. Defaults to where it usually lives.
@@ -224,6 +234,7 @@ fn main() -> Result<()> {
         },
         Command::ServiceMain => service_main(),
         Command::DesktopWorker { pipe } => desktop_worker(&pipe),
+        Command::ClipboardProbe { report_to } => clipboard_probe(report_to),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -486,6 +497,20 @@ fn desktop_worker(pipe: &str) -> Result<()> {
     {
         let _ = pipe;
         bail!("the desktop worker is a Windows arrangement")
+    }
+}
+
+/// Take the two measurements that decide how the clipboard gets at
+/// what the person copied.
+fn clipboard_probe(report_to: Option<std::path::PathBuf>) -> Result<()> {
+    #[cfg(windows)]
+    {
+        secure::windows::probe::probe(report_to)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = report_to;
+        bail!("the clipboard probe answers a question that only arises on Windows")
     }
 }
 

@@ -347,6 +347,64 @@ sees the five formats. A process started by hand does -- that is the
 second row of the table -- but the token path differs, and that is
 the one thing to confirm before building.
 
+### Taking the two measurements
+
+`smkvm clipboard-probe` is the instrument, hidden from `--help`
+because it exists to answer one question and should be deleted when
+that is answered. Run as the person it shows one observer. Run as the
+system account it shows three, which is the point: the same code
+looking the same way, three identities, one page.
+
+Getting it to run as the system account, with somewhere for the
+output to go, since a service account has no console:
+
+```
+schtasks /create /tn smkvm-probe /ru SYSTEM /sc once /st 00:00 /f \
+  /tr "cmd /c \"C:\smkvm\smkvm.exe\" clipboard-probe > C:\smkvm\probe.txt 2>&1"
+schtasks /run /tn smkvm-probe
+schtasks /delete /tn smkvm-probe /f
+```
+
+Copy a **file** in Explorer first; a text copy proves nothing here,
+because text was never the thing that went missing.
+
+What the three rows mean, written down before the run rather than
+after it:
+
+| child as the user | impersonating thread | what it means |
+| --- | --- | --- |
+| sees the formats | either | B-minimal is viable; build it |
+| sees the formats | sees them too | shape A is alive and cheaper; the person should get that choice first |
+| bare | bare | both roads are shut and the finding is bigger than the plan -- stop |
+
+### What absence looks like, decided before presence is written
+
+Between logoff and logon there is no user to be, so there is no
+clipboard helper. That is not an error path and must not be written
+as one. The service keeps running, keeps the link and keeps the
+consent-desktop reach; what it loses is the ability to say what this
+machine has copied, because this machine has nobody to copy.
+
+Three things follow, and they are design decisions rather than
+details:
+
+- **A read with no helper fails immediately and says why**, rather
+  than waiting out a deadline. "Nobody is logged in here, so this
+  machine has no clipboard to read" is an answer; three seconds of
+  silence followed by a timeout is a bug report.
+- **Nothing is announced.** The far machine is told nothing at all,
+  which is different from being told this machine's clipboard is
+  empty. Announcing emptiness would let a logoff wipe what another
+  machine is offering.
+- **On logon, the helper reports what is already on the clipboard
+  before it reports any change.** Otherwise a copy made during the
+  gap -- or before the service started -- is invisible until the
+  person copies again, which reads as the feature not working.
+
+The same three apply to a helper that has died and not yet been
+restarted, which is why they are worth settling once rather than
+twice.
+
 ### What to do next, in order
 
 1. Confirm the `WTSQueryUserToken` + `CreateProcessAsUserW` path

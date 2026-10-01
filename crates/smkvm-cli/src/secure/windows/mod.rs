@@ -42,6 +42,7 @@ impl Aligned {
 pub mod clip;
 pub mod link;
 pub mod pipe;
+pub mod probe;
 pub mod scm;
 pub mod secret;
 pub mod serving;
