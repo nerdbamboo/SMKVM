@@ -232,7 +232,7 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     // -- and therefore admits everything else they are running, which
     // is why the protocol it carries cannot express anything but a
     // read.
-    let name = acl::pipe_name(&secret::name_bytes()?);
+    let name = acl::reader_pipe_name(&secret::name_bytes()?);
     let listening =
         pipe::create_with(&name, acl::READER_PIPE_SDDL).context("making a pipe for the reader")?;
 

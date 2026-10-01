@@ -85,8 +85,24 @@ pub const NAME_BYTES: usize = 16;
 /// The pipe's name for one run, from bytes that must come from the
 /// system's random number generator rather than from a counter or a clock.
 pub fn pipe_name(secret: &[u8; NAME_BYTES]) -> String {
-    let mut name = String::with_capacity(13 + NAME_BYTES * 2);
-    name.push_str("smkvm-worker-");
+    named_pipe("smkvm-worker-", secret)
+}
+
+/// The same, for the half that runs as the person.
+///
+/// A separate name because they are separate pipes, with different
+/// access lists and different protocols, and a reader that announced
+/// itself as connecting to `smkvm-worker-…` was read twice as a sign
+/// that the two ends were computing different names. They were not;
+/// the name was simply wrong about what it named. A diagnostic that
+/// has to be explained away once will be explained away again.
+pub fn reader_pipe_name(secret: &[u8; NAME_BYTES]) -> String {
+    named_pipe("smkvm-reader-", secret)
+}
+
+fn named_pipe(prefix: &str, secret: &[u8; NAME_BYTES]) -> String {
+    let mut name = String::with_capacity(prefix.len() + NAME_BYTES * 2);
+    name.push_str(prefix);
     for byte in secret {
         name.push(char::from_digit(u32::from(byte >> 4), 16).expect("a nibble is a hex digit"));
         name.push(char::from_digit(u32::from(byte & 0xf), 16).expect("a nibble is a hex digit"));
@@ -769,5 +785,18 @@ mod tests {
         // reaches a consent prompt.
         assert_eq!(PIPE_SDDL, "O:SYD:P(A;;GA;;;SY)");
         assert!(granted_to_anyone_but(PIPE_SDDL, &MAY_HOLD_THE_KEY).is_empty());
+    }
+
+    #[test]
+    fn the_two_pipes_are_never_the_same_name() {
+        // Not merely different prefixes: the same secret must not
+        // produce a name either end could mistake for the other's.
+        let secret = [7u8; NAME_BYTES];
+        let worker = pipe_name(&secret);
+        let reader = reader_pipe_name(&secret);
+        assert_ne!(worker, reader);
+        assert!(worker.starts_with("smkvm-worker-"), "{worker}");
+        assert!(reader.starts_with("smkvm-reader-"), "{reader}");
+        assert_eq!(worker.len(), reader.len());
     }
 }

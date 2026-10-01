@@ -314,12 +314,27 @@ impl Link {
                     .expect("not poisoned")
                     .refused(Instant::now());
             }
-            // Into the same one channel the reader's copies go
-            // to. Which half noticed is a fact about this machine's
-            // arrangement, not about the copy, and nothing
-            // downstream should have to know it.
+            // Into the same one channel the reader's copies go to,
+            // *unless* there is a reader -- in which case the worker
+            // is answering a question it cannot answer.
+            //
+            // The worker runs as the system account and sees one
+            // format where the person sees five; that is the whole
+            // finding this arrangement exists for. Once a reader is
+            // attached, its answer is the right one and the
+            // worker's is noise that looks like data. Still said at
+            // debug, because the two disagreeing is worth being able
+            // to see on purpose.
             FromWorker::ClipboardChanged(formats) => {
-                crate::secure::windows::readers::copied(formats, "worker")
+                if crate::secure::windows::readers::reader().is_some() {
+                    tracing::debug!(
+                        ?formats,
+                        "clipboard: the worker noticed a copy too; the reader's answer is \
+                         the one being used"
+                    );
+                } else {
+                    crate::secure::windows::readers::copied(formats, "worker")
+                }
             }
             FromWorker::ClipboardRead { id, bytes } => {
                 self.clipboard_reads.answer(id, bytes);

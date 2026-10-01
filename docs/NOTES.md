@@ -2249,6 +2249,15 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**`witness_through` is one slot per process, and only the worker
+ever filled it.** Every line the clipboard crate produced inside the
+*reader* -- the settle timer noticing a copy, the clipboard refusing
+to open, which formats it saw -- went to that process's own log and
+nowhere the service could read. The half whose entire purpose is
+noticing copies was the half whose noticing could not be read from
+the side that cares, which is most of why "the reader said nothing"
+was true of the only place anybody was looking.
+
 **An ordinary account cannot open a service's token.** The reader
 connects by `pipe::connect`, which checks that the process serving
 the pipe runs as the system account -- by opening that process and
@@ -2284,6 +2293,23 @@ most expensive kind of line this codebase produces. `Started::how_it_ended`
 decides by waiting on the handle, which is authoritative, and reads
 the code only once the wait says it has gone. Not yet, a code, and
 could-not-ask are three answers, not one.
+
+**Once a reader exists, the worker's answer about the clipboard is
+noise that looks like data.** The worker sees one format where the
+person sees five; that is the finding the whole arrangement exists
+for. So the service uses the reader's answer and drops the
+worker's -- at debug, not in silence, because the two disagreeing is
+worth being able to look at deliberately.
+
+What has *not* been done, and is the standing hypothesis rather than
+a fact: the worker's clipboard window is still a format listener, so
+two settle timers still run against one clipboard in one session,
+and each opens it -- the worker up to eight times over 1750 ms per
+copy. That may be what stops the reader's open. Removing it means a
+way to stop watching without stopping offering, which is a protocol
+message and a change in the clipboard crate, and it is not worth
+doing on a hypothesis when the relay above will say in one run
+whether the reader's timer fires and fails or never fires at all.
 
 **A process that cannot be trusted to speak gets a file handed to
 it.** The reader's log depends on profile paths and a subscriber;

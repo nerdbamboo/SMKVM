@@ -163,6 +163,37 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
         ),
     }
 
+    // Point the clipboard crate's own lines at the pipe, before the
+    // clipboard is started and so before it has anything to say.
+    //
+    // This was missing, and it is most of why "the reader said
+    // nothing" was true. `witness_through` is a process-wide slot
+    // that only the worker ever filled, so every line the clipboard
+    // crate produced in *this* process -- the settle timer finding a
+    // copy, the clipboard refusing to open, the formats it saw --
+    // went to this process's own log and nowhere else. The half
+    // whose whole purpose is noticing copies was the half whose
+    // noticing could not be read from the side that cares.
+    {
+        let speak = speak.clone();
+        let trace_said = Trace(trace.0.clone());
+        smkvm_clipboard::witness_through(Box::new(move |text, for_a_person| {
+            // Into the trace as well. While the reader is still a
+            // thing being established rather than a thing being
+            // used, the file that survives everything is worth more
+            // than tidiness.
+            trace_said.say(text);
+            speak(&FromReader::Said {
+                level: if for_a_person {
+                    Level::Info
+                } else {
+                    Level::Debug
+                },
+                text: text.to_string(),
+            });
+        }));
+    }
+
     trace.say("starting to watch the clipboard");
     let mut clipboard = match WindowsClipboard::start() {
         Ok(clipboard) => clipboard,
