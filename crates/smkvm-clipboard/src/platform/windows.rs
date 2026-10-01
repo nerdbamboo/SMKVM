@@ -28,6 +28,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     SetLastError, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
 };
+use windows::Win32::System::Com::{CoTaskMemFree, DATADIR_GET, FORMATETC};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
     GetClipboardData, GetClipboardFormatNameW, GetClipboardOwner, GetOpenClipboardWindow,
@@ -38,7 +39,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{
+    OleGetClipboard, OleInitialize, OleUninitialize, CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP,
+    CF_UNICODETEXT,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -223,6 +227,180 @@ impl Formats {
     }
 }
 
+/// A question for the thread that has a COM apartment.
+///
+/// Deliberately a message rather than a call. Everything here can
+/// wait -- `OleGetClipboard` talks to the process that did the
+/// copying, and `GetData` may make it produce the data -- and this
+/// file has produced three separate faults from giving the clipboard
+/// window's thread something that can wait. So the window thread
+/// posts and never looks back; this thread does the waiting, and
+/// reports what it found down the same channel a copy would have
+/// gone down anyway.
+enum Ask {
+    /// Nothing we share was visible the ordinary way. Look with an
+    /// apartment, and say what each way of looking saw.
+    WhatIsOnIt(Formats),
+    /// Read one format, from a thread that has an apartment.
+    Read(Formats, ClipFormat, Sender<Result<Vec<u8>>>),
+}
+
+/// How long a read on the OLE thread may take.
+///
+/// Inside the five seconds the service allows for a read, with room
+/// for the answer to get back, so a reader is told something rather
+/// than left to the outer deadline.
+const OLE_READ_WITHIN: Duration = Duration::from_millis(3000);
+
+/// The one thread in this process with a COM apartment.
+///
+/// It exists because of a measurement. A copy of a file arrives on
+/// the clipboard as an OLE data object; a process in the session sees
+/// `CF_HDROP` beside it and can fetch the file list, and the worker
+/// -- running as the system account, on the same desktop, at the same
+/// instant -- enumerated the data object alone, eight times across
+/// two seconds. Whether that is the account or the missing apartment
+/// could not be told apart from outside, because everything available
+/// to run in that session initialises COM whether it is asked to or
+/// not.
+///
+/// So this thread is both the experiment and, if the experiment comes
+/// out the way the evidence points, the fix. It calls `OleInitialize`
+/// and then looks in the two ways that can disagree: plain
+/// `EnumClipboardFormats`, which is exactly what the window thread
+/// already does and differs only in having an apartment behind it,
+/// and `IDataObject::EnumFormatEtc`, which asks the data object what
+/// it can supply rather than what is registered. Both answers are
+/// said. If the first is full, an apartment was all that was wanted.
+/// If only the second is full, the formats live in the object and
+/// never on the clipboard. If both are bare, it is the account, and
+/// no amount of COM will help.
+fn ole_thread(asks: Receiver<Ask>, changes: Sender<Available>) {
+    // SAFETY: once, on this thread, which exists for nothing else.
+    let apartment = unsafe { OleInitialize(None) };
+    match &apartment {
+        Ok(()) => witness("the clipboard has a thread with a COM apartment"),
+        Err(e) => witness(&format!(
+            "the clipboard's COM thread could not get an apartment ({e}); it will still \
+             look the plain way"
+        )),
+    }
+    while let Ok(ask) = asks.recv() {
+        match ask {
+            Ask::WhatIsOnIt(formats) => look_with_an_apartment(formats, &changes),
+            Ask::Read(formats, format, back) => {
+                let _ = back.send(read_format(formats, &format));
+            }
+        }
+    }
+    if apartment.is_ok() {
+        // SAFETY: balanced against the initialise above.
+        unsafe { OleUninitialize() };
+    }
+}
+
+/// Look at the clipboard both ways, say both answers, and report a
+/// copy if either of them found one.
+fn look_with_an_apartment(formats: Formats, changes: &Sender<Available>) {
+    let plainly = match Opened::take(HWND::default()) {
+        Ok(_open) => Ok((available_now(formats), everything_on_it())),
+        Err(e) => Err(e),
+    };
+    let offered = what_the_data_object_offers();
+
+    witness(&format!(
+        "looked again from a thread with a COM apartment. Plain Win32 sees: {}. The data \
+         object offers: {}",
+        match &plainly {
+            Ok((_, on_it)) => format!("[{}]", on_it.join(", ")),
+            Err(e) => format!("(the clipboard would not open: {e})"),
+        },
+        match &offered {
+            Ok(ids) => format!(
+                "[{}]",
+                ids.iter()
+                    .map(|(_, named)| named.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => format!("(it could not be asked: {e})"),
+        }
+    ));
+
+    // Whichever way saw something, that is what was copied. Both use
+    // the same rule for deciding which formats are ours.
+    let found = match &plainly {
+        Ok((found, _)) if !found.formats.is_empty() => found.clone(),
+        _ => match &offered {
+            Ok(ids) => which_of_ours(formats, |f| ids.iter().any(|(id, _)| *id == f)),
+            Err(_) => Available {
+                formats: Vec::new(),
+            },
+        },
+    };
+    if found.formats.is_empty() {
+        witness(
+            "neither way of looking found a format we share, so the other machines were \
+             not told. If both lists above are bare, this process cannot see what a \
+             process in the session can, and an apartment is not the difference",
+        );
+        return;
+    }
+    let announced = format!("{:?}", found.formats);
+    match changes.send(found) {
+        Ok(()) => witness(&format!(
+            "something was copied here: {announced}; telling whoever is listening (found \
+             only from the thread with an apartment)"
+        )),
+        Err(_) => witness(&format!(
+            "something was copied here: {announced}, but NOBODY IS LISTENING for copies \
+             any more, so no other machine will be told"
+        )),
+    }
+}
+
+/// What the clipboard's data object says it can supply.
+///
+/// A different question from "what formats are on the clipboard", and
+/// the two can disagree: `OleSetClipboard` puts the object there, and
+/// what the object advertises through `EnumFormatEtc` is not
+/// necessarily registered with `SetClipboardData` for everyone to
+/// enumerate.
+fn what_the_data_object_offers() -> Result<Vec<(u32, String)>> {
+    // SAFETY: takes no pointers; the interface is reference counted
+    // by the binding.
+    let object = unsafe { OleGetClipboard() }
+        .map_err(|e| ClipboardError::Display(format!("asking OLE for the clipboard: {e}")))?;
+    // SAFETY: a live interface, and the direction is the documented
+    // constant for "what can be read out of it".
+    let list = unsafe { object.EnumFormatEtc(DATADIR_GET.0 as u32) }
+        .map_err(|e| ClipboardError::Display(format!("asking what it can supply: {e}")))?;
+    let mut out = Vec::new();
+    loop {
+        let mut one = [FORMATETC::default(); 1];
+        let mut got = 0u32;
+        // SAFETY: `one` is valid for the single element asked for,
+        // and `got` for the count written back.
+        let more = unsafe { list.Next(&mut one, Some(&mut got)) };
+        if more.is_err() || got == 0 {
+            break;
+        }
+        let id = one[0].cfFormat as u32;
+        out.push((id, name_of(id)));
+        // The enumerator allocates a target device for some entries
+        // and hands ownership over with it.
+        if !one[0].ptd.is_null() {
+            // SAFETY: allocated by COM, released once, and not read
+            // again.
+            unsafe { CoTaskMemFree(Some(one[0].ptd as *const _)) };
+        }
+        if out.len() > 32 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// Holds the clipboard open for as long as it is alive.
 struct Opened;
 
@@ -322,7 +500,20 @@ fn write_raw(format: u32, bytes: &[u8]) -> Result<()> {
 
 fn available_now(formats: Formats) -> Available {
     // SAFETY: asking whether a format is present takes no pointers.
-    let has = |format: u32| unsafe { IsClipboardFormatAvailable(format) }.is_ok();
+    which_of_ours(formats, |format| {
+        unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+    })
+}
+
+/// Which of the formats we share are among these.
+///
+/// Split out so that the two ways of finding out what has been copied
+/// -- asking Windows which formats are on the clipboard, and asking a
+/// data object which it can supply -- decide by the same rule. There
+/// is one list of formats we share, and keeping it one list is the
+/// reason an earlier round could rule out a whole class of
+/// explanation in a sentence.
+fn which_of_ours(formats: Formats, has: impl Fn(u32) -> bool) -> Available {
     let mut out = Vec::new();
     if has(CF_UNICODETEXT.0 as u32) {
         out.push(ClipFormat::Text);
@@ -378,21 +569,29 @@ fn everything_on_it() -> Vec<String> {
         if next == 0 || out.len() > 32 {
             break;
         }
-        let mut name = [0u16; 128];
-        // SAFETY: the buffer is valid for its own length. A standard
-        // format has no registered name and returns zero, which is
-        // not an error.
-        let len = unsafe { GetClipboardFormatNameW(next, &mut name) };
-        if len > 0 {
-            out.push(format!(
-                "{next}={}",
-                String::from_utf16_lossy(&name[..len as usize])
-            ));
-        } else {
-            out.push(format!("{next}=(standard)"));
-        }
+        out.push(name_of(next));
     }
     out
+}
+
+/// One format, with whatever name Windows has for it.
+///
+/// Needs no clipboard open, which is why it can be used from the
+/// data object's side as well.
+fn name_of(format: u32) -> String {
+    let mut name = [0u16; 128];
+    // SAFETY: the buffer is valid for its own length. A standard
+    // format has no registered name and returns zero, which is not an
+    // error.
+    let len = unsafe { GetClipboardFormatNameW(format, &mut name) };
+    if len > 0 {
+        format!(
+            "{format}={}",
+            String::from_utf16_lossy(&name[..len as usize])
+        )
+    } else {
+        format!("{format}=(standard)")
+    }
 }
 
 /// Read one of our formats, converting from whatever Windows keeps it as.
@@ -438,6 +637,10 @@ struct State {
     /// at, kept so that giving up can show the before and the after
     /// rather than only the after.
     first_look: Option<String>,
+    /// Where to send a question for the thread that has a COM
+    /// apartment. Posting on this cannot wait: the channel is
+    /// unbounded, and that is the point.
+    asks: Sender<Ask>,
 }
 
 /// What the far machine has copied, and how many chances are left to
@@ -780,13 +983,22 @@ unsafe extern "system" fn window_proc(
                     // the session can.
                     witness(&format!(
                         "a copy settled here and none of the formats we share were on it \
-                         after {looks} looks over {} ms, so the other machines were not \
-                         told. At first: [{}]. At last: [{}]. Looking for: {:?}",
+                         after {looks} looks over {} ms. At first: [{}]. At last: [{}]. \
+                         Looking for: {:?}. Asking the thread with a COM apartment to \
+                         look as well",
                         LOOK_AGAIN_AFTER * (LOOK_AT_MOST - 1),
                         first.unwrap_or_default(),
                         on_it.join(", "),
                         what_we_look_for(formats)
                     ));
+                    // Posted, never waited on. Everything that thread
+                    // does can block, and this is the thread that
+                    // must not.
+                    STATE.with(|cell| {
+                        if let Some(state) = cell.borrow().as_ref() {
+                            let _ = state.asks.send(Ask::WhatIsOnIt(formats));
+                        }
+                    });
                     return LRESULT(0);
                 }
                 // Found. Say how long it took to appear, because "the
@@ -1343,6 +1555,7 @@ pub struct WindowsClipboard {
     formats: Formats,
     changes: Receiver<Available>,
     offers: Sender<(Vec<ClipFormat>, Box<dyn Fetch>)>,
+    asks: Sender<Ask>,
     thread_id: u32,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1353,10 +1566,20 @@ impl WindowsClipboard {
         let (changes_tx, changes_rx) = mpsc::channel();
         let (offers_tx, offers_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (asks_tx, asks_rx) = mpsc::channel();
 
+        // Its own thread, owning nothing else, because everything it
+        // does can wait and the window thread may not.
+        let apartment = changes_tx.clone();
+        std::thread::Builder::new()
+            .name("smkvm-clipboard-com".into())
+            .spawn(move || ole_thread(asks_rx, apartment))
+            .map_err(|e| ClipboardError::Display(format!("could not start the COM thread: {e}")))?;
+
+        let asking = asks_tx.clone();
         let handle = std::thread::Builder::new()
             .name("smkvm-clipboard".into())
-            .spawn(move || clipboard_thread(changes_tx, offers_rx, ready_tx))
+            .spawn(move || clipboard_thread(changes_tx, offers_rx, ready_tx, asking))
             .map_err(|e| ClipboardError::Display(format!("could not start a thread: {e}")))?;
 
         match ready_rx.recv() {
@@ -1364,6 +1587,7 @@ impl WindowsClipboard {
                 formats,
                 changes: changes_rx,
                 offers: offers_tx,
+                asks: asks_tx,
                 thread_id,
                 handle: Some(handle),
             }),
@@ -1399,6 +1623,7 @@ impl WindowsClipboard {
         WindowsHandle {
             formats: self.formats,
             offers: self.offers.clone(),
+            asks: self.asks.clone(),
             thread_id: self.thread_id,
         }
     }
@@ -1409,6 +1634,7 @@ impl WindowsClipboard {
 pub struct WindowsHandle {
     formats: Formats,
     offers: Sender<(Vec<ClipFormat>, Box<dyn Fetch>)>,
+    asks: Sender<Ask>,
     thread_id: u32,
 }
 
@@ -1459,8 +1685,63 @@ impl WindowsHandle {
 }
 
 impl crate::Read for WindowsHandle {
+    /// Read through the thread that has a COM apartment.
+    ///
+    /// The same reason as the enumeration: a file copy is an OLE data
+    /// object, and if this process cannot see `CF_HDROP` without an
+    /// apartment then it cannot fetch it either -- one cause, both
+    /// halves. `GetClipboardData` returning nothing for an image is
+    /// the same symptom from the other end.
+    ///
+    /// This waits, which is allowed here: it is called from the
+    /// worker's main loop answering a request, not from the clipboard
+    /// window's thread. It is bounded, so a reader is told something
+    /// rather than left to an outer deadline, and it falls back to
+    /// reading here if that thread has gone -- a clipboard that still
+    /// half works being better than one that does not work at all.
     fn read(&mut self, format: &ClipFormat) -> Result<Vec<u8>> {
-        read_format(self.formats, format)
+        // Here first, always. Under the scheduled task this path
+        // works today on three machines, and a change that routes a
+        // working read through a new thread to fix a different
+        // arrangement is a change that can only lose. So the
+        // apartment is a second chance after a failure, never a
+        // detour before one.
+        let here = read_format(self.formats, format);
+        let Err(why) = here else {
+            return here;
+        };
+        let (back, answer) = mpsc::channel();
+        if self
+            .asks
+            .send(Ask::Read(self.formats, format.clone(), back))
+            .is_err()
+        {
+            return Err(why);
+        }
+        witness(&format!(
+            "could not read {format:?} on this thread ({why}); asking the thread with a \
+             COM apartment"
+        ));
+        match answer.recv_timeout(OLE_READ_WITHIN) {
+            Ok(Ok(bytes)) => {
+                witness(&format!(
+                    "the thread with a COM apartment read {format:?}, {} bytes, where this \
+                     one could not",
+                    bytes.len()
+                ));
+                Ok(bytes)
+            }
+            // Both reasons, because which of them failed is the
+            // difference between an apartment being the answer and
+            // the account being the answer.
+            Ok(Err(there)) => Err(ClipboardError::Display(format!(
+                "{why}; and from a thread with a COM apartment: {there}"
+            ))),
+            Err(_) => Err(ClipboardError::Display(format!(
+                "{why}; and a thread with a COM apartment took longer than {} ms",
+                OLE_READ_WITHIN.as_millis()
+            ))),
+        }
     }
 }
 
@@ -1502,6 +1783,7 @@ fn clipboard_thread(
     changes: Sender<Available>,
     offers: Receiver<(Vec<ClipFormat>, Box<dyn Fetch>)>,
     ready: Sender<Result<(u32, Formats)>>,
+    asks: Sender<Ask>,
 ) {
     let formats = Formats::register();
     let class_name = wide("SmkvmClipboard");
@@ -1549,6 +1831,7 @@ fn clipboard_thread(
         *cell.borrow_mut() = Some(State {
             looks: 0,
             first_look: None,
+            asks,
             formats,
             changes,
             offer: None,

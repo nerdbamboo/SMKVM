@@ -1728,6 +1728,44 @@ write the bug. (This was found while adding the lines above, and is
 not the fault those lines were added to find: `NothingOffered` does
 not renew, so this path was not the one firing.)
 
+**One thread in this process has a COM apartment, and nothing else
+runs on it.** A file copy arrives as an OLE data object. A process in
+the session sees `CF_HDROP` beside it and can fetch the file list;
+the worker, as the system account, on the same desktop, at the same
+instant, enumerated the data object alone -- eight times across two
+seconds. Whether that is the account or the missing apartment could
+not be settled from outside, because everything available to run in
+that session initialises COM whether asked to or not.
+
+So `ole_thread` is both the experiment and, if the evidence holds,
+the fix. It calls `OleInitialize` and looks in the two ways that can
+disagree: plain `EnumClipboardFormats`, which is what the window
+thread already does and differs only in having an apartment behind
+it, and `IDataObject::EnumFormatEtc`, which asks the data object what
+it can supply rather than what is registered. Both answers are
+logged. First list full: an apartment was all that was wanted. Only
+the second full: the formats live in the object and never on the
+clipboard. Both bare: it is the account, and no amount of COM will
+help.
+
+It is a thread of its own because everything it does can wait.
+`OleGetClipboard` talks to the process that did the copying and
+`GetData` may make it produce the data, and three separate faults in
+this file came from giving the clipboard window's thread something
+that can wait. The window thread posts a question and never looks
+back; the apartment thread reports a copy down the same channel the
+settle timer would have used.
+
+Reading has the same cause and the same cure, which is the strongest
+single argument for the apartment: a process that cannot *see*
+`CF_HDROP` cannot *fetch* it either, and `GetClipboardData` returning
+nothing for an image is the same symptom from the other end. But the
+read tries the calling thread **first** and only then the apartment.
+The scheduled task reads correctly on three machines today, and a
+change that routes a working read through a new thread to fix a
+different arrangement can only lose. A second chance after a failure
+is never a detour before one.
+
 **A file copy does not arrive on the clipboard all at once.** The
 shell puts its OLE data object there first, and the standard formats
 that object stands for -- `CF_HDROP` among them -- appear around it
