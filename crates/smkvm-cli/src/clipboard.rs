@@ -439,13 +439,33 @@ impl Sharing {
 
     /// Act on it. Returns what has to go over the link, and to whom.
     pub fn on(&mut self, happened: Happened, now: Instant) -> Vec<(DeviceId, Bulk)> {
+        let announcing = matches!(happened, Happened::Changed(_));
         let input = match happened {
             Happened::Changed(available) => {
-                debug!(formats = ?available.formats, "the clipboard here changed");
+                // Info, not debug. This is once per copy a person
+                // makes -- human pace by definition -- and it is the
+                // one line that says a notice crossed from whatever
+                // noticed it into the part that tells other
+                // machines. With a reader in the picture that
+                // crossing spans two processes and a pipe, and while
+                // it sat at debug the only way to tell "the notice
+                // arrived and was acted on" from "the notice arrived
+                // and stopped" was to notice what did *not* happen
+                // afterwards.
                 let mut formats = available.formats;
+                let files_dropped = !self.files.enabled && formats.contains(&ClipFormat::Uris);
                 if !self.files.enabled {
                     formats.retain(|f| *f != ClipFormat::Uris);
                 }
+                info!(
+                    formats = ?formats,
+                    "the clipboard here changed; telling the other machines{}",
+                    if files_dropped {
+                        " (files are switched off, so the file list is not offered)"
+                    } else {
+                        ""
+                    }
+                );
                 Input::LocalChanged(formats)
             }
             Happened::Wanted(wanted) => {
@@ -479,7 +499,21 @@ impl Sharing {
             }
         };
         let outputs = self.exchange.handle(input, now);
-        self.apply(outputs)
+        let sends = self.apply(outputs);
+        if announcing {
+            // What came of it, either way. An announcement that
+            // reaches nobody and an announcement that was never made
+            // look identical from the far end, and telling those two
+            // apart is the whole of the question this is for.
+            match sends.len() {
+                0 => info!(
+                    "nothing went out about it: either no other machine is connected, or \
+                     the exchange had nothing to announce"
+                ),
+                n => info!("told {n} machine(s) about it"),
+            }
+        }
+        sends
     }
 
     pub fn peer_up(&mut self, peer: DeviceId, now: Instant) -> Vec<(DeviceId, Bulk)> {

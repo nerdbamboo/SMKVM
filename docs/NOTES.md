@@ -2249,6 +2249,23 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**`offering copied files to the other machines` is not the
+announcement.** It is printed when a peer *fetches* the file list,
+several steps after the copy is announced -- so its absence says
+only that something earlier did not happen, not which. The line
+that marks the crossing from "something noticed a copy" into "the
+other machines are being told" is `the clipboard here changed`, and
+it sat at debug. Once per copy a person makes is human pace by
+definition, which is the criterion already used everywhere else
+here, and with a reader in the picture that crossing spans two
+processes and a pipe. It is at info now, and it says when the file
+list was dropped because files are switched off.
+
+What came of it is said too, either way: how many machines were
+told, or that nothing went out. An announcement that reaches nobody
+and an announcement that was never made look identical from the far
+end.
+
 **A wrong answer that arrives second is worse than no answer.** The
 worker's settle timer kept running after a reader was attached, took
 1750 ms over its eight looks, and therefore always reached its
