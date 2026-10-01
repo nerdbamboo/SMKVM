@@ -5,6 +5,7 @@
 //! smaller, because the reader can be asked only two things.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use smkvm_clipboard::{Available, ClipboardError, Read, Watch};
 use smkvm_proto::ClipFormat;
 
 use crate::secure::acl;
+use crate::secure::outbox::Outbox;
 use crate::secure::reading::{self, FromReader, ToReader, LONGEST_READ};
 use crate::secure::windows::clip::Waiting;
 use crate::secure::windows::{pipe, secret, token};
@@ -28,9 +30,39 @@ use smkvm_clipboard::{Say, Throttle};
 /// budget of its own.
 pub const READER_ANSWERS_WITHIN: Duration = Duration::from_secs(3);
 
-/// How long handling one message may take before it is worth
-/// saying that nothing was being collected meanwhile.
-const HANDLING_IS_SLOW: Duration = Duration::from_millis(500);
+/// How many messages may be waiting to be acted on.
+///
+/// Generous: the queue only grows when something is slow to handle,
+/// and the messages in it are the person's copies.
+const HANDLING_ROOM: usize = 256;
+
+/// Seconds since the epoch, for comparing two moments.
+fn now_in_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+fn which_one(said: &FromReader) -> u8 {
+    match said {
+        FromReader::Ready { .. } => 1,
+        FromReader::Copied(_) => 2,
+        FromReader::OnIt { .. } => 3,
+        FromReader::Read { .. } => 4,
+        FromReader::Said { .. } => 5,
+    }
+}
+
+fn what_that_was(which: u8) -> &'static str {
+    match which {
+        1 => "a hello",
+        2 => "a copy",
+        3 => "what is on it",
+        4 => "a read",
+        _ => "a line",
+    }
+}
 
 /// What a message is, for a log line, without its contents.
 fn what_it_is(said: &FromReader) -> &'static str {
@@ -396,15 +428,94 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
         ),
     }
 
+    // Reading the pipe and acting on what is read are two jobs, and
+    // one thread cannot have both.
+    //
+    // It had both, and the result was a deadlock with the reader
+    // through a single pipe. Handling a `Copied` does not come back
+    // promptly -- it reaches the clipboard layer, which may turn
+    // round and ask this same reader for the contents -- so the
+    // collector stopped reading, the pipe filled, and the reader's
+    // drain blocked inside a write with fifteen messages behind it.
+    // Each half waiting on the other through the one channel they
+    // share.
+    //
+    // This is the mirror of the rule the outbox already encodes.
+    // Writing had to be somebody's whole job; so does reading. The
+    // collector now does nothing but empty the pipe, and a second
+    // thread does the work -- so a slow or circular piece of
+    // handling costs a delay in one message rather than the
+    // conversation.
+    //
+    // Deliberately not a deadline on the round trip. A deadlock with
+    // a timeout is still a deadlock; it merely reports itself
+    // eventually, and the person's clipboard is broken for the
+    // length of the timeout rather than for ever.
+    let (inbox, handle_these) = Outbox::with_room_for(HANDLING_ROOM);
+    let what_is_being_handled = Arc::new(AtomicU8::new(0));
+    let handling_since = Arc::new(AtomicU64::new(0));
+
+    {
+        let listener = reader.clone();
+        let doing = what_is_being_handled.clone();
+        let since = handling_since.clone();
+        std::thread::Builder::new()
+            .name("smkvm-reader-handling".into())
+            .spawn(move || {
+                while let Some(said) = handle_these.next() {
+                    doing.store(which_one(&said), Ordering::Relaxed);
+                    since.store(now_in_seconds().max(1), Ordering::Relaxed);
+                    listener.heard(said);
+                    since.store(0, Ordering::Relaxed);
+                }
+            })
+            .context("starting the thread that acts on what the reader says")?;
+    }
+
+    // The watchdog is a thread of its own, and that is the point
+    // rather than tidiness.
+    //
+    // Four watchdogs in this file have now been silent in exactly
+    // the case they were written for, and all four for the same
+    // reason: each was reached through the thing it was watching.
+    // This one shares no thread, no lock and no channel with the
+    // collector or the handler; it reads two atomics and writes to
+    // the service's own log.
+    {
+        let since = handling_since.clone();
+        let doing = what_is_being_handled.clone();
+        let pid = reader.running.pid;
+        std::thread::Builder::new()
+            .name("smkvm-reader-watchdog".into())
+            .spawn(move || {
+                let mut complained = false;
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let began = since.load(Ordering::Relaxed);
+                    let stuck = began != 0 && now_in_seconds().saturating_sub(began) >= 2;
+                    if stuck && !complained {
+                        tracing::warn!(
+                            pid,
+                            "clipboard: acting on {} from the reader has taken {} s and \
+                             has not come back. The pipe is still being emptied, so the \
+                             reader is not blocked by it",
+                            what_that_was(doing.load(Ordering::Relaxed)),
+                            now_in_seconds().saturating_sub(began)
+                        );
+                        complained = true;
+                    } else if !stuck && complained {
+                        tracing::info!(pid, "clipboard: the reader's work came back");
+                        complained = false;
+                    }
+                }
+            })
+            .context("starting the watchdog for the reader's work")?;
+    }
+
     let listener = reader.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-link".into())
         .spawn(move || {
-            // Said at the start, because "the collector never ran"
-            // and "the collector ran and stopped" look the same
-            // from the other end of a pipe that stops being
-            // emptied -- and that is the state this is being added
-            // to diagnose.
             tracing::info!(
                 pid = listener.running.pid,
                 "clipboard: collecting from the reader"
@@ -415,20 +526,15 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
                     Ok(said) => {
                         collected += 1;
                         let what = what_it_is(&said);
-                        // How long the handling takes, because a
-                        // collector that is slow to handle one
-                        // message is a collector that is not
-                        // reading the next -- and from the reader's
-                        // side a pipe nobody empties and a pipe
-                        // nobody reads are the same thing.
-                        let began = Instant::now();
-                        listener.heard(said);
-                        let took = began.elapsed();
-                        if took > HANDLING_IS_SLOW {
+                        // Posted, never acted on. Everything this
+                        // thread does has to be something that
+                        // cannot wait.
+                        if !inbox.post(said).arrived() {
                             tracing::warn!(
-                                "clipboard: handling {what} from the reader took {} ms, \
-                                 during which nothing was collected from it",
-                                took.as_millis()
+                                "clipboard: dropped {what} from the reader; the thread \
+                                 that acts on them is {} behind. The pipe is still being \
+                                 emptied",
+                                inbox.waiting()
                             );
                         } else if collected <= 5 || collected % 50 == 0 {
                             tracing::debug!(
@@ -438,16 +544,6 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
                         }
                     }
                     Err(e) => {
-                        // With the exit code, and with what the
-                        // reader managed to write for itself.
-                        //
-                        // A reader that goes away is the end of this
-                        // machine's outbound clipboard, and until
-                        // now the only record of it was one line
-                        // about a pipe. The half that supervises
-                        // should notice, and should say what it
-                        // noticed rather than that it noticed
-                        // something.
                         tracing::warn!(
                             pid = listener.running.pid,
                             "clipboard: the reader stopped talking after {collected} \
@@ -460,23 +556,7 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
                     }
                 }
             }
-            // Everything waiting is woken rather than left to its own
-            // deadline, and the slot is emptied so the next read says
-            // "nobody is logged in" at once instead of waiting out
-            // three seconds against a process that has gone.
             listener.nobody_is_answering();
-            // Only if it is still this reader's slot.
-            //
-            // On a plain death this is simply true. On a user
-            // switch it is not: `mind_readers` lets the old reader
-            // go and starts a new one in the same breath, and the
-            // old listener thread wakes *after* the new one has been
-            // installed. Clearing unconditionally nulled a healthy
-            // reader, after which the minding loop saw no reader,
-            // believed it was still serving that session, and
-            // started a third -- leaving the second running as the
-            // person, unreferenced, with a clipboard watch open and
-            // nothing holding its handle.
             let mut held = READER.lock().expect("not poisoned");
             if held.as_ref().is_some_and(|now| Arc::ptr_eq(now, &listener)) {
                 *held = None;

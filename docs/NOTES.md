@@ -2249,6 +2249,34 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**A watchdog that shares a thread, a lock or a channel with what it
+watches is decoration.** Four of them in this file were silent in
+exactly the case they were written for, and all four for one reason:
+each was reached through the thing it was watching. The stall
+warning that went through the outbox it was reporting on; the one
+that went to the trace under a lock the drain also takes; the
+collector's slow-handling line, which could only be printed by the
+thread that was stuck; and the render's own outcome line, two
+rounds earlier. A watchdog needs a thread of its own, state it
+reads rather than is told, and somewhere to write that the watched
+thing cannot reach.
+
+**Reading a pipe and acting on what is read are two jobs, and one
+thread cannot have both.** The service's collector did both, and
+deadlocked with the reader through the one pipe they share: handling
+a `Copied` reaches the clipboard layer, which may turn round and ask
+that same reader for the contents, so the collector stopped reading,
+the pipe filled, and the reader's drain blocked inside a write with
+fifteen behind it. Each half waiting on the other.
+
+This is the mirror of the rule the outbox already encodes -- writing
+had to be somebody's whole job, and so does reading. The collector
+now empties the pipe and does nothing else; a second thread acts.
+Deliberately *not* a deadline on the round trip: a deadlock with a
+timeout is still a deadlock, it merely reports itself eventually,
+and the person's clipboard is broken for the length of the timeout
+rather than for ever.
+
 **A queue's depth belongs to the queue.** "Seventeen waiting" was
 arithmetic on two independent atomics, one incremented after a post
 returned and one after a send succeeded, and it was reported beside
