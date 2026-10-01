@@ -2249,6 +2249,30 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**A wrong answer that arrives second is worse than no answer.** The
+worker's settle timer kept running after a reader was attached, took
+1750 ms over its eight looks, and therefore always reached its
+conclusion *after* the reader's correct one -- and acted on it,
+cancelling what the reader had established. Nothing reached the
+other machines, every time, from a path where every component was
+healthy.
+
+Dropping the worker's *notice* on the service side was not enough,
+because the conclusion is drawn and acted on in the worker. The
+answer is for it not to look. `ToWorker::WatchClipboard(bool)` and
+`WM_WATCH` add and remove the format listener without touching the
+offer, so a worker that has stopped watching still holds out what
+other machines copied and still serves renders for it. Watching and
+offering were one job on one window and are two now; the worker's
+view of what the person copied is wrong by construction on this
+machine, and its view of what to hold out is correct.
+
+The instruction is remembered as well as applied, because it can
+arrive while no clipboard is being served and a worker that forgot
+would start watching again the moment it took one up. And when the
+reader goes, the worker is told to watch again: a wrong answer beats
+none once there is nobody better placed.
+
 **Two synchronous handles onto one pipe serialise with each other.**
 A file object opened without `FILE_FLAG_OVERLAPPED` has every
 request on it serialised by the kernel, and `DuplicateHandle` gives

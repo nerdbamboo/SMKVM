@@ -87,6 +87,23 @@ const WM_RELEASE: u32 = WM_APP + 2;
 /// to happen after that returns.
 const WM_RENEW: u32 = WM_APP + 3;
 
+/// Asks the window thread to start or stop being told about copies.
+///
+/// Separate from giving the clipboard back, and that separation is
+/// the whole point of it. Watching and offering are two jobs on one
+/// window: noticing what the person copied, and holding out what
+/// another machine copied. On a machine with a reader, the first of
+/// those is known to be wrong by construction -- a process running
+/// as the system account cannot see what the person copied -- while
+/// the second works and must keep working.
+///
+/// Before this there was no way to stop one without stopping the
+/// other, so the worker went on looking, settling, concluding and
+/// acting on an answer that was wrong every time, arriving after the
+/// reader's correct one and overwriting it. A wrong answer that
+/// arrives second is worse than no answer.
+const WM_WATCH: u32 = WM_APP + 4;
+
 /// How many times a promise is renewed before the clipboard is given
 /// back altogether.
 ///
@@ -688,6 +705,12 @@ struct State {
     offer: Option<Offer>,
     /// Anything already fetched, so a second paste does not fetch again.
     cache: HashMap<ClipFormat, Vec<u8>>,
+    /// Whether this window is registered to be told about copies.
+    ///
+    /// Tracked because the two calls are not idempotent: registering
+    /// twice fails, and so does unregistering what was never
+    /// registered.
+    watching: bool,
     /// How many times the copy now settling has been looked at.
     looks: u32,
     /// What the clipboard held the first time this copy was looked
@@ -1207,6 +1230,48 @@ unsafe extern "system" fn window_proc(
             // with real data was also the one that reported nothing.
             for line in said {
                 step(&format!("WM_RENDERALLFORMATS {line}"));
+            }
+            LRESULT(0)
+        }
+        WM_WATCH => {
+            let wanted = wparam.0 != 0;
+            let change = STATE.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                match slot.as_mut() {
+                    Some(state) if state.watching != wanted => {
+                        state.watching = wanted;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            if !change {
+                return LRESULT(0);
+            }
+            let outcome = if wanted {
+                // SAFETY: this thread's own window.
+                unsafe { AddClipboardFormatListener(window) }
+            } else {
+                // Any settle in flight belongs to a question nobody
+                // is asking any more.
+                // SAFETY: killing a timer that may not exist is not
+                // an error worth acting on.
+                unsafe {
+                    let _ = KillTimer(window, SETTLE_TIMER);
+                }
+                // SAFETY: this thread's own window.
+                unsafe { RemoveClipboardFormatListener(window) }
+            };
+            match outcome {
+                Ok(()) if wanted => witness("told to watch for copies here again"),
+                Ok(()) => witness(
+                    "told to stop watching for copies here; something better placed is \
+                     doing it, and this window will go on offering what other machines \
+                     copy",
+                ),
+                Err(e) => witness(&format!(
+                    "could not change whether copies are noticed here (wanted {wanted}): {e}"
+                )),
             }
             LRESULT(0)
         }
@@ -1759,6 +1824,15 @@ impl WindowsHandle {
         self.post(WM_RELEASE, WITHDRAWN)
     }
 
+    /// Start or stop being told about copies made here.
+    ///
+    /// Does not touch what is being offered: a window that has
+    /// stopped watching still holds out another machine's clipboard
+    /// and still serves renders for it.
+    pub fn watch_for_copies(&self, wanted: bool) -> Result<()> {
+        self.post(WM_WATCH, usize::from(wanted))
+    }
+
     fn post(&self, message: u32, reason: usize) -> Result<()> {
         // SAFETY: posting to a thread id is safe whether or not it is still
         // running.
@@ -1924,6 +1998,7 @@ fn clipboard_thread(
 
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(State {
+            watching: true,
             looks: 0,
             first_look: None,
             asks,
@@ -2043,6 +2118,13 @@ fn clipboard_thread(
             // Thread messages have no window, so the procedure is called here.
             // SAFETY: the window is this thread's own.
             unsafe { window_proc(window, WM_OFFER, WPARAM(0), LPARAM(0)) };
+            continue;
+        }
+        if message.message == WM_WATCH {
+            // A thread message has no window to be dispatched to, so
+            // it is handed to the procedure here, with its argument.
+            // SAFETY: the window is this thread's own.
+            unsafe { window_proc(window, WM_WATCH, WPARAM(message.wParam.0), LPARAM(0)) };
             continue;
         }
         if message.message == WM_RELEASE {

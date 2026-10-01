@@ -256,6 +256,42 @@ pub fn reader() -> Option<Arc<Reader>> {
 /// Said rather than done quietly, because from outside a clipboard
 /// that has stopped reporting copies looks identical whether it was
 /// let go on purpose or died.
+/// Tell the worker whether it still needs to watch for copies.
+///
+/// With a reader attached it does not, and this is not an
+/// optimisation. The worker runs as the system account and cannot
+/// see what the person copied -- it finds one format where the
+/// person finds five, which is the whole reason the reader exists.
+/// Its eight looks take 1750 ms, so its wrong conclusion always
+/// arrived *after* the reader's right one and replaced it: nothing
+/// offered to the other machines, every time.
+///
+/// Dropping its *notice* on this side was not enough, because the
+/// conclusion is drawn and acted on over there. The answer is for
+/// it not to look. It goes on offering what other machines copy,
+/// which works and is untouched.
+fn the_worker_need_not_watch(wanted: bool) {
+    let Some(link) = crate::secure::windows::link::worker() else {
+        return;
+    };
+    if link.say(&crate::secure::wire::ToWorker::WatchClipboard(wanted)) {
+        tracing::info!(
+            "clipboard: told the worker to {} copies made on the desktop",
+            if wanted {
+                "go back to noticing"
+            } else {
+                "stop noticing"
+            }
+        );
+    } else {
+        tracing::warn!(
+            "clipboard: could not tell the worker to stop noticing copies, so its \
+             answer -- which cannot see what the person copied -- may still overwrite \
+             the reader's"
+        );
+    }
+}
+
 pub fn let_go(why: &str) {
     let held = READER.lock().expect("not poisoned").take();
     if let Some(reader) = held {
@@ -265,6 +301,10 @@ pub fn let_go(why: &str) {
         );
         reader.say(&ToReader::Stop);
         reader.nobody_is_answering();
+        // A wrong answer is better than none once there is nobody
+        // better placed: without a reader, nothing else is watching
+        // at all.
+        the_worker_need_not_watch(true);
         // Asked first, then ended. `Stop` is a courtesy that lets it
         // put the clipboard down tidily; it is not a guarantee, and
         // a reader that ignores it would otherwise go on running as
@@ -600,6 +640,7 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
         .context("listening to the reader")?;
 
     *READER.lock().expect("not poisoned") = Some(reader.clone());
+    the_worker_need_not_watch(false);
     Ok(reader)
 }
 

@@ -21,7 +21,7 @@ use smkvm_proto::{ClipFormat, Key, MouseButton, Scroll};
 /// worker rather than guessing, because the alternative -- misreading a
 /// frame and injecting whatever the bytes happen to decode as -- is a
 /// program typing at random into a consent prompt.
-pub const WORKER_PROTOCOL: u32 = 3;
+pub const WORKER_PROTOCOL: u32 = 4;
 
 /// Longest frame either side will send or accept.
 ///
@@ -66,6 +66,18 @@ pub enum ToWorker {
     /// Only a worker on the ordinary desktop is asked. See
     /// `watch::serves_the_clipboard` for why.
     ServeClipboard(bool),
+    /// Whether to notice copies made on this desktop.
+    ///
+    /// Separate from `ServeClipboard`, and the separation is the
+    /// point. A worker that has stopped watching still offers what
+    /// other machines copied and still serves renders for it; what
+    /// it stops doing is answering a question it cannot answer. On a
+    /// machine with a reader, the worker's view of what the person
+    /// copied is wrong by construction -- it runs as the system
+    /// account and sees one format where the person sees five -- and
+    /// because its answer takes nearly two seconds to reach, it
+    /// arrived after the reader's correct one and replaced it.
+    WatchClipboard(bool),
     /// Read what is on it, for a machine that is pasting elsewhere.
     ReadClipboard {
         id: u64,

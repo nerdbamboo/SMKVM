@@ -94,6 +94,9 @@ pub struct Serving {
     /// that works, rather than a minute of nothing and a warning
     /// nobody sees.
     ready: Arc<Mutex<HashMap<ClipFormat, Vec<u8>>>>,
+    /// The same window, kept concretely so that watching can be
+    /// turned off without the offering going with it.
+    watcher: smkvm_clipboard::platform::windows::WindowsHandle,
 }
 
 /// Somewhere to put a frame, whichever thread is holding one.
@@ -262,7 +265,8 @@ impl Serving {
         Self::from_parts(
             Box::new(clipboard),
             Box::new(handle.clone()),
-            Box::new(handle),
+            Box::new(handle.clone()),
+            handle,
             speak,
         )
     }
@@ -374,6 +378,7 @@ impl Serving {
         watch: Box<dyn Watch + Send>,
         read: Box<dyn Read + Send>,
         write: Box<dyn Write + Send>,
+        watcher: smkvm_clipboard::platform::windows::WindowsHandle,
         speak: Speak,
     ) -> Result<Serving> {
         Self::speak_for_the_clipboard(&speak)?;
@@ -427,6 +432,7 @@ impl Serving {
             })
             .context("starting the worker's clipboard watch")?;
         Ok(Serving {
+            watcher,
             read,
             write,
             pastes,
@@ -486,6 +492,14 @@ impl Serving {
         false
     }
 
+    /// Start or stop noticing copies made here, without putting the
+    /// clipboard down.
+    pub fn watch_for_copies(&self, wanted: bool) -> Result<(), String> {
+        self.watcher
+            .watch_for_copies(wanted)
+            .map_err(|e| e.to_string())
+    }
+
     /// Nothing more will be answered; wake anything mid-paste.
     pub fn nobody_is_answering(&self) {
         self.pastes.nobody_is_answering();
@@ -529,12 +543,21 @@ pub fn catch_a_drag(
 /// main loop stays a list of instructions.
 pub struct Clipboard {
     serving: Mutex<Option<Serving>>,
+    /// Whether copies made here should be noticed.
+    ///
+    /// Remembered rather than only applied, because the instruction
+    /// can arrive while no clipboard is being served -- the service
+    /// starts a reader and tells the worker to stop watching, in
+    /// either order -- and a worker that forgot would start
+    /// watching again the next time it took the clipboard up.
+    notice_copies: std::sync::atomic::AtomicBool,
 }
 
 impl Clipboard {
     pub fn new() -> Clipboard {
         Clipboard {
             serving: Mutex::new(None),
+            notice_copies: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -552,6 +575,14 @@ impl Clipboard {
                 } else {
                     match Serving::start(speak.clone()) {
                         Ok(serving) => {
+                            // Whatever was last asked for, applied to
+                            // the clipboard just taken up.
+                            let wanted = self
+                                .notice_copies
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            if !wanted {
+                                let _ = serving.watch_for_copies(false);
+                            }
                             tell(speak, Level::Info, "holding the person's clipboard");
                             *held = Some(serving);
                         }
@@ -564,6 +595,42 @@ impl Clipboard {
                             format!("cannot reach the person's clipboard: {e:#}"),
                         ),
                     }
+                }
+            }
+            ToWorker::WatchClipboard(wanted) => {
+                self.notice_copies
+                    .store(wanted, std::sync::atomic::Ordering::Relaxed);
+                match held.as_ref() {
+                    Some(serving) => {
+                        if let Err(e) = serving.watch_for_copies(wanted) {
+                            tell(
+                                speak,
+                                Level::Warn,
+                                format!("could not change whether copies are noticed: {e}"),
+                            );
+                        } else {
+                            tell(
+                                speak,
+                                Level::Info,
+                                if wanted {
+                                    "noticing copies made here again"
+                                } else {
+                                    "no longer noticing copies made here; something better \
+                                     placed is doing it. Still offering what other \
+                                     machines copy"
+                                },
+                            );
+                        }
+                    }
+                    // Remembered for when one is taken up.
+                    None => tell(
+                        speak,
+                        Level::Debug,
+                        format!(
+                            "remembering to {} copies once holding a clipboard",
+                            if wanted { "notice" } else { "ignore" }
+                        ),
+                    ),
                 }
             }
             ToWorker::ServeClipboard(false) => {
