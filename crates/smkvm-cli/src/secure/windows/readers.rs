@@ -28,6 +28,21 @@ use smkvm_clipboard::{Say, Throttle};
 /// budget of its own.
 pub const READER_ANSWERS_WITHIN: Duration = Duration::from_secs(3);
 
+/// How long handling one message may take before it is worth
+/// saying that nothing was being collected meanwhile.
+const HANDLING_IS_SLOW: Duration = Duration::from_millis(500);
+
+/// What a message is, for a log line, without its contents.
+fn what_it_is(said: &FromReader) -> &'static str {
+    match said {
+        FromReader::Ready { .. } => "a hello",
+        FromReader::Copied(_) => "a copy",
+        FromReader::OnIt { .. } => "what is on it",
+        FromReader::Read { .. } => "a read",
+        FromReader::Said { .. } => "a line",
+    }
+}
+
 /// Where the reader writes what it is doing, inside the profile of
 /// the person it runs as.
 const READER_TRACE: &str = "smkvm-reader-trace.txt";
@@ -385,9 +400,43 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     std::thread::Builder::new()
         .name("smkvm-reader-link".into())
         .spawn(move || {
+            // Said at the start, because "the collector never ran"
+            // and "the collector ran and stopped" look the same
+            // from the other end of a pipe that stops being
+            // emptied -- and that is the state this is being added
+            // to diagnose.
+            tracing::info!(
+                pid = listener.running.pid,
+                "clipboard: collecting from the reader"
+            );
+            let mut collected = 0usize;
             loop {
                 match read_frame_up_to::<FromReader, _>(&mut reading, LONGEST_READ) {
-                    Ok(said) => listener.heard(said),
+                    Ok(said) => {
+                        collected += 1;
+                        let what = what_it_is(&said);
+                        // How long the handling takes, because a
+                        // collector that is slow to handle one
+                        // message is a collector that is not
+                        // reading the next -- and from the reader's
+                        // side a pipe nobody empties and a pipe
+                        // nobody reads are the same thing.
+                        let began = Instant::now();
+                        listener.heard(said);
+                        let took = began.elapsed();
+                        if took > HANDLING_IS_SLOW {
+                            tracing::warn!(
+                                "clipboard: handling {what} from the reader took {} ms, \
+                                 during which nothing was collected from it",
+                                took.as_millis()
+                            );
+                        } else if collected <= 5 || collected % 50 == 0 {
+                            tracing::debug!(
+                                "clipboard: collected {what} from the reader \
+                                 ({collected} in all)"
+                            );
+                        }
+                    }
                     Err(e) => {
                         // With the exit code, and with what the
                         // reader managed to write for itself.
@@ -401,9 +450,9 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
                         // something.
                         tracing::warn!(
                             pid = listener.running.pid,
-                            "clipboard: the reader stopped talking ({e}): {}. What it said \
-                             for itself: {}. Nothing this machine copies will reach \
-                             another until one starts again",
+                            "clipboard: the reader stopped talking after {collected} \
+                             messages ({e}): {}. What it said for itself: {}. Nothing \
+                             this machine copies will reach another until one starts again",
                             listener.running.how_it_ended(),
                             what_it_said(&listener.trace_to)
                         );

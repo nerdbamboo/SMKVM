@@ -25,7 +25,7 @@
 //! to reason about whether one can be smuggled through.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,23 @@ type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
 /// rest are refused. Generous, because a burst is the moment they
 /// matter; bounded, because a queue nobody drains must not grow.
 const OUTBOX_ROOM: usize = 256;
+
+/// How long a single write may be outstanding before it is worth
+/// saying so.
+///
+/// A write to a pipe whose far end is collecting returns in
+/// microseconds. Two seconds is not a slow service; it is one that
+/// has stopped reading.
+const WRITE_IS_STUCK: u64 = 2;
+
+/// Seconds since the epoch, for comparing two moments and nothing
+/// else.
+fn now_in_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
 
 /// How often to look at the sequence number, and how long to let a
 /// copy settle once it has moved.
@@ -205,18 +222,40 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     // So everything is posted, and one thread does the waiting.
     let (outbox, collect) = Outbox::with_room_for(OUTBOX_ROOM);
     let outbox = Arc::new(outbox);
+    // What the drain is in the middle of, for somebody else to look
+    // at.
+    //
+    // The drain is the one thread here allowed to wait, and it will
+    // therefore wait for ever by design. From outside, a thread
+    // waiting for ever and a thread that died are the same thing --
+    // the twin of the rule about diagnostics: **a path that waits by
+    // design has to say what it is waiting on**, or its patience is
+    // indistinguishable from its death. Ninety seconds of a drain
+    // neither sending nor complaining is what that costs.
+    //
+    // Zero means idle. Anything else is the second the current write
+    // began.
+    let writing_since = Arc::new(AtomicU64::new(0));
+    let posted = Arc::new(AtomicUsize::new(0));
+    let delivered = Arc::new(AtomicUsize::new(0));
     {
         let mut writing = to_service.share()?;
         let draining = trace.clone();
+        let began = writing_since.clone();
+        let done = delivered.clone();
         std::thread::Builder::new()
             .name("smkvm-reader-outbox".into())
             .spawn(move || {
                 let mut failing = false;
                 let mut sent = 0usize;
                 while let Ok(message) = collect.recv() {
-                    match say(&mut writing, &message) {
+                    began.store(now_in_seconds().max(1), Ordering::Relaxed);
+                    let outcome = say(&mut writing, &message);
+                    began.store(0, Ordering::Relaxed);
+                    match outcome {
                         Ok(()) => {
                             sent += 1;
+                            done.store(sent, Ordering::Relaxed);
                             // The first few and then every so often.
                             // A drain that is working has to leave a
                             // mark, or its silence cannot be told
@@ -260,8 +299,12 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     let speak: Saying = {
         let outbox = outbox.clone();
         let posting = trace.clone();
+        let counted = posted.clone();
         Arc::new(move |message: &FromReader| {
             let became = outbox.post(message.clone());
+            if became.arrived() {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
             // Every post, at the moment of posting, with what became
             // of it.
             //
@@ -422,6 +465,9 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
     let claimed = announced.clone();
     let asking = handle.clone();
     let looking = trace.clone();
+    let stalled = writing_since.clone();
+    let posted_so_far = posted.clone();
+    let handed_over = delivered.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-sequence".into())
         .spawn(move || {
@@ -434,8 +480,33 @@ fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) ->
                     smkvm_clipboard::platform::windows::sequence_number()
                 ),
             );
+            // Said once per stall rather than once per tick.
+            let mut complained = false;
             loop {
                 std::thread::sleep(LOOK_EVERY);
+
+                // The drain's watchdog rides on this thread because
+                // it is already ticking and has nothing else to do.
+                let since = stalled.load(Ordering::Relaxed);
+                let waiting =
+                    posted_so_far.load(Ordering::Relaxed) - handed_over.load(Ordering::Relaxed);
+                if since != 0 && now_in_seconds().saturating_sub(since) >= WRITE_IS_STUCK {
+                    if !complained {
+                        looking.say(&format!(
+                            "the write to the service has been outstanding for {} s, with \
+                             {waiting} more waiting behind it. Nothing this machine copies \
+                             is reaching the service, and the service is not collecting",
+                            now_in_seconds().saturating_sub(since)
+                        ));
+                        complained = true;
+                    }
+                } else if complained && since == 0 {
+                    looking.say(&format!(
+                        "the write to the service got through; {waiting} still waiting"
+                    ));
+                    complained = false;
+                }
+
                 let now = smkvm_clipboard::platform::windows::sequence_number();
                 if now == claimed.load(Ordering::Relaxed) {
                     continue;

@@ -2249,6 +2249,31 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**A path that waits by design has to say what it is waiting on.**
+The twin of the rule about diagnostics, and the harder half to
+remember. The reader's outbox drain is the one thread allowed to
+wait, so it will wait for ever by design -- and from outside, a
+thread waiting for ever and a thread that died are the same thing.
+Ninety seconds of a drain neither sending nor complaining is what
+that cost. The drain now records what it is in the middle of and
+when it started; the sequence watch, which is already ticking, says
+so once a write has been outstanding for two seconds, with how many
+messages are queued behind it.
+
+The queue depth is evidence in its own right and nobody was
+reporting it: it could only be had by subtracting the drain's count
+from the number of posts, by hand, from a file.
+
+**A collector has to announce itself.** "Nothing ever read this
+pipe" and "something read it and stopped" are the same thing seen
+from the writer, and a stalled write is how both present. The
+service says when it starts collecting from a reader, counts what it
+takes, says how many it had taken when the reader goes, and warns
+when handling one message took long enough that it was not
+collecting the next -- because a collector slow to handle is a
+collector not reading, and the far end cannot tell those apart
+either.
+
 **An absence must never be asked to carry evidence, and that
 includes the instruments.** The round that was meant to separate
 "posted and not delivered" from "never posted" added tracing only to
