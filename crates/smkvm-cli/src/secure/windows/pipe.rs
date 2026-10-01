@@ -316,6 +316,66 @@ impl Pipe {
     /// window. It is written down here so the next reader does not
     /// rediscover it and wonder whether anybody noticed; it is not worth
     /// code.
+    /// Is this pipe *owned* by the system account?
+    ///
+    /// The same question as [`Pipe::server_is_the_system`] and a
+    /// different way of asking it, because the obvious way is not
+    /// available to everybody.
+    ///
+    /// That one opens the serving process and reads its token. A
+    /// process running as the system account may do that; a process
+    /// running as the person at the desk may not -- `OpenProcessToken`
+    /// on a service's process is refused for an ordinary account, and
+    /// it is refused with no fuss, as an error on a call that usually
+    /// works. So the reader, which is the person, could not complete
+    /// the check it was making before it said a word, and exited.
+    ///
+    /// This asks the object instead of the process. The pipe's
+    /// security descriptor says `O:SY`, and reading an owner needs
+    /// only `READ_CONTROL`, which is part of the `GENERIC_READ` the
+    /// reader's own access control entry grants it. The guarantee is
+    /// if anything stronger: a pipe owned by the system account was
+    /// created by it, and an impostor running as the person cannot
+    /// make one that is.
+    pub fn owned_by_the_system(&self) -> Result<()> {
+        use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+        let mut owner = PSID::default();
+        let mut descriptor = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
+        // SAFETY: a valid handle, and places for the owner and the
+        // descriptor that backs it. The descriptor is freed below and
+        // `owner` points into it, so it must not outlive that.
+        unsafe {
+            GetSecurityInfo(
+                self.handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            )
+        }
+        .ok()
+        .context("asking who owns this pipe")?;
+
+        let same = the_system_account_is(owner);
+        // SAFETY: the descriptor came from the call above, which says
+        // to free it this way, and `owner` is not used after.
+        unsafe {
+            let _ = LocalFree(windows::Win32::Foundation::HLOCAL(descriptor.0));
+        }
+        if !same? {
+            bail!(
+                "this pipe is not owned by the system account, so it was not made by the \
+                 service. Something created the name first, and it is not being spoken to"
+            );
+        }
+        Ok(())
+    }
+
     pub fn server_is_the_system(&self) -> Result<()> {
         let mut pid = 0u32;
         // SAFETY: a valid pipe handle and a place for the id.
@@ -356,29 +416,12 @@ impl Pipe {
         }
         .context("reading who the process serving the pipe runs as")?;
 
-        let mut system = vec![0u8; 128];
-        let mut size = system.len() as u32;
-        // SAFETY: a buffer and its length; the call writes a SID into it.
-        unsafe {
-            CreateWellKnownSid(
-                WinLocalSystemSid,
-                None,
-                PSID(system.as_mut_ptr() as *mut _),
-                &mut size,
-            )
-        }
-        .context("building the system account's identifier to compare against")?;
-
         // SAFETY: the system filled the buffer with a TOKEN_USER whose SID
         // pointer refers into the same buffer; the buffer is `Aligned`, so
         // a reference to the structure in it is properly aligned, which a
-        // `Vec<u8>` would not have guaranteed. `system` holds a SID the
-        // call above wrote.
-        let same = unsafe {
-            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
-            EqualSid(user.User.Sid, PSID(system.as_mut_ptr() as *mut _))
-        };
-        if same.is_err() {
+        // `Vec<u8>` would not have guaranteed.
+        let who = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) }.User.Sid;
+        if !the_system_account_is(who)? {
             bail!(
                 "the pipe is served by process {pid}, which is not the system account. \
                  Something created this pipe name before the service did, and it is not \
@@ -417,6 +460,24 @@ impl Write for Pipe {
         // A pipe write has already gone to the other end when it returns.
         Ok(())
     }
+}
+
+/// Is this the well-known identifier of the system account?
+fn the_system_account_is(who: PSID) -> Result<bool> {
+    let mut system = vec![0u8; 128];
+    let mut size = system.len() as u32;
+    // SAFETY: a buffer and its length; the call writes a SID into it.
+    unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            PSID(system.as_mut_ptr() as *mut _),
+            &mut size,
+        )
+    }
+    .context("building the system account's identifier to compare against")?;
+    // SAFETY: both are SIDs -- one the caller's, one just written here.
+    Ok(unsafe { EqualSid(who, PSID(system.as_mut_ptr() as *mut _)) }.is_ok())
 }
 
 /// A security descriptor built from [`acl::PIPE_SDDL`], freed when dropped.
@@ -547,7 +608,23 @@ pub fn accept(pipe: &Pipe, within: Duration) -> Result<()> {
 /// act as it. That is worth having even though [`Pipe::server_is_the_system`]
 /// is meant to make it moot: the two failures are independent, and the
 /// cost of both is nothing.
+/// Open a pipe somebody else is serving, checking it is the
+/// service's before saying anything.
+///
+/// Which check depends on who is calling, and that is not a detail:
+/// the worker runs as the system account and can open the serving
+/// process's token; the reader runs as the person and cannot. See
+/// [`Pipe::owned_by_the_system`].
 pub fn connect(name: &str) -> Result<Pipe> {
+    connect_checking(name, Pipe::server_is_the_system)
+}
+
+/// The same, for a caller that cannot open a service's token.
+pub fn connect_as_the_person(name: &str) -> Result<Pipe> {
+    connect_checking(name, Pipe::owned_by_the_system)
+}
+
+fn connect_checking(name: &str, check: impl Fn(&Pipe) -> Result<()>) -> Result<Pipe> {
     let path = HSTRING::from(acl::pipe_path(name));
     // SAFETY: a null-terminated path; the handle is wrapped before return.
     let handle = unsafe {
@@ -567,6 +644,6 @@ pub fn connect(name: &str) -> Result<Pipe> {
         event: None,
     };
     // Before a single byte is sent, including the hello.
-    pipe.server_is_the_system()?;
+    check(&pipe)?;
     Ok(pipe)
 }

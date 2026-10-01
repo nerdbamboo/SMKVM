@@ -28,6 +28,29 @@ use smkvm_clipboard::{Say, Throttle};
 /// budget of its own.
 pub const READER_ANSWERS_WITHIN: Duration = Duration::from_secs(3);
 
+/// Where the reader writes what it is doing, inside the profile of
+/// the person it runs as.
+const READER_TRACE: &str = "smkvm-reader-trace.txt";
+
+/// What the reader managed to say before it stopped.
+///
+/// Read back into the service's log, because the service's log is
+/// the one somebody is already looking at, and a file nobody is told
+/// about is a file nobody reads.
+fn what_it_said(trace_to: &Path) -> String {
+    match std::fs::read_to_string(trace_to) {
+        Ok(said) if said.trim().is_empty() => {
+            format!("nothing at all; {} is empty", trace_to.display())
+        }
+        Ok(said) => format!("[{}]", said.trim().replace('\n', " | ")),
+        Err(e) => format!(
+            "nothing at all; {} could not be read ({e}), so it died before its first \
+             statement and the question is process creation rather than anything in it",
+            trace_to.display()
+        ),
+    }
+}
+
 /// How long after starting a reader to look whether it is still
 /// there.
 ///
@@ -219,6 +242,21 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
         .with_context(|| format!("asking who is logged in at session {session}"))?;
     let theirs = token::Owned(handle);
 
+    // Somewhere plain for the reader to say what it is doing,
+    // worked out here because it cannot work one out for itself
+    // before it has said anything -- resolving a writable path is
+    // one of the things that has gone wrong.
+    //
+    // The person's own profile root: proven writable by that account
+    // on this machine, since the probe's child wrote its report
+    // there, and reachable by the service, which is the system
+    // account. The reader is handed it absolute and resolves
+    // nothing.
+    let trace_to = token::home_in_session(session)
+        .context("finding where the person at the desk keeps things")?
+        .join(READER_TRACE);
+    let _ = std::fs::remove_file(&trace_to);
+
     // `Default` and nowhere else. The reader has no business on the
     // desktop a consent prompt is on: the person cannot copy anything
     // there, and the worker is already there for the half that
@@ -226,7 +264,10 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     let running = token::start_on_desktop_as(
         &theirs,
         exe,
-        &format!("clipboard-reader --pipe {name}"),
+        &format!(
+            "clipboard-reader --pipe {name} --trace-to \"{}\"",
+            trace_to.display()
+        ),
         r"WinSta0\Default",
         // Chosen by the caller, which alternates it. See
         // `mind_readers`: the first try gives the reader the
@@ -249,6 +290,7 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
         pid = running.pid,
         session,
         environment = environment.named(),
+        trace = %trace_to.display(),
         "clipboard: started a reader"
     );
 
@@ -262,10 +304,12 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     std::thread::sleep(FIRST_LOOK_AFTER);
     if let ended @ (token::Ended::With(_) | token::Ended::CouldNotAsk(_)) = running.how_it_ended() {
         bail!(
-            "the reader (pid {}, started with {}) was gone {} ms after it was started: {ended}",
+            "the reader (pid {}, started with {}) was gone {} ms after it was started: \
+             {ended}. What it managed to say for itself: {}",
             running.pid,
             environment.named(),
-            FIRST_LOOK_AFTER.as_millis()
+            FIRST_LOOK_AFTER.as_millis(),
+            what_it_said(&trace_to)
         );
     }
 
@@ -301,10 +345,11 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
             // the process is not there; the code says something
             // about why, and not having it cost a deployment.
             let said = format!(
-                "{e:#} (reader pid {}, started with {}: {})",
+                "{e:#} (reader pid {}, started with {}: {}). What it said for itself: {}",
                 running.pid,
                 environment.named(),
-                running.how_it_ended()
+                running.how_it_ended(),
+                what_it_said(&trace_to)
             );
             running.kill();
             bail!("{said}");

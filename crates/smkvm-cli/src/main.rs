@@ -137,6 +137,11 @@ enum Command {
     ClipboardReader {
         #[arg(long)]
         pipe: String,
+        /// Somewhere plain to write what it is doing, handed to it by
+        /// the service because it cannot work out a writable path for
+        /// itself before it has said anything.
+        #[arg(long)]
+        trace_to: Option<std::path::PathBuf>,
     },
     /// Look at this session's clipboard and say what can be seen,
     /// and -- as the system account -- what two other observers see.
@@ -268,7 +273,7 @@ fn main() -> Result<()> {
         Command::ServiceMain => service_main(),
         Command::DesktopWorker { pipe } => desktop_worker(&pipe),
         Command::ClipboardProbe { report_to } => clipboard_probe(report_to),
-        Command::ClipboardReader { pipe } => clipboard_reader(&pipe, no_log),
+        Command::ClipboardReader { pipe, trace_to } => clipboard_reader(&pipe, no_log, trace_to),
         Command::Devices => devices(),
         Command::Forget { name_or_id } => forget(&name_or_id),
         Command::Import {
@@ -535,14 +540,18 @@ fn desktop_worker(pipe: &str) -> Result<()> {
 }
 
 /// Read the person's clipboard for the service, as the person.
-fn clipboard_reader(pipe: &str, no_log: Option<String>) -> Result<()> {
+fn clipboard_reader(
+    pipe: &str,
+    no_log: Option<String>,
+    trace_to: Option<std::path::PathBuf>,
+) -> Result<()> {
     #[cfg(windows)]
     {
-        secure::windows::reader::run(pipe, no_log)
+        secure::windows::reader::run(pipe, no_log, trace_to)
     }
     #[cfg(not(windows))]
     {
-        let _ = (pipe, no_log);
+        let _ = (pipe, no_log, trace_to);
         bail!("the clipboard reader is a Windows arrangement")
     }
 }

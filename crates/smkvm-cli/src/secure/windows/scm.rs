@@ -651,41 +651,15 @@ fn mind_readers(exe: &Path) {
                 if given_up_on == Some(now) || Instant::now() < not_before {
                     continue;
                 }
-                // The environment, alternated, as a measurement
-                // rather than a preference.
-                //
-                // The person's own is what the reader ought to have
-                // and the only thing in that creation that the
-                // probe's child -- same mechanism, same identity,
-                // same session, started by this service and working
-                // on the first try -- did not have. So the first
-                // attempt uses it and the rest use the service's.
-                // If the first dies and a later one lives, the
-                // block is the answer and the log line says which
-                // was used; and because a log the reader cannot
-                // open no longer stops it, the fallback leaves a
-                // working reader with no local log rather than no
-                // reader at all.
-                let environment = if failures == 0 {
-                    token::Environment::ThePersons
-                } else {
-                    token::Environment::TheServices
-                };
+                // The person's own, and no longer alternated. The
+                // alternation was a measurement and it answered:
+                // both environments produced a process that exited
+                // 1 at the same moment, so the block is not the
+                // cause and there is nothing left to compare. This
+                // is the environment the reader ought to have.
+                let environment = token::Environment::ThePersons;
                 match readers::start(exe, now, environment) {
                     Ok(_) => {
-                        if failures > 0 {
-                            // Worth saying loudly: it means the
-                            // first environment is the reason, and
-                            // that this reader is running with one
-                            // that is not its own.
-                            tracing::warn!(
-                                "clipboard: the reader started only once it was given {}, \
-                                 after {failures} failures with the other. It is running, \
-                                 and it will be looking for its own files in the wrong \
-                                 profile",
-                                environment.named()
-                            );
-                        }
                         serving = Some(now);
                         failures = 0;
                     }

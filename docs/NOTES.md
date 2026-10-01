@@ -2249,6 +2249,31 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**An ordinary account cannot open a service's token.** The reader
+connects by `pipe::connect`, which checks that the process serving
+the pipe runs as the system account -- by opening that process and
+reading its token. The worker may do that; it is the system account
+itself. The reader is the person, and `OpenProcessToken` on a
+service's process is refused for an ordinary account. So the reader
+failed the check it made *before saying a word*, returned an error
+out of `main`, and exited 1 with no log, no pipe traffic and nothing
+written anywhere -- while the service, whose pipe it had already
+opened, saw only that the pipe had broken.
+
+The check it needs is `Pipe::owned_by_the_system`, which asks the
+*object* rather than the process. The pipe's descriptor says `O:SY`,
+reading an owner needs only `READ_CONTROL`, and `GENERIC_READ` --
+which the reader's own access control entry grants -- includes it.
+The guarantee is if anything stronger: a pipe owned by the system
+account was created by it, and nothing running as the person can
+make one that is. `connect` and `connect_as_the_person` differ in
+exactly this and in nothing else.
+
+The general shape is one to watch for: **a guard written for one
+caller, inherited by another with less privilege, fails closed and
+silently at the earliest possible moment.** It was the right guard
+in the right place, and it was the first thing the new process did.
+
 **`STILL_ACTIVE` is 259, and a process that exits with 259 cannot be
 told from a running one through `GetExitCodeProcess`.** Nor can a
 *failure* of that call, if its error is folded into the same answer.
@@ -2259,6 +2284,22 @@ most expensive kind of line this codebase produces. `Started::how_it_ended`
 decides by waiting on the handle, which is authoritative, and reads
 the code only once the wait says it has gone. Not yet, a code, and
 could-not-ask are three answers, not one.
+
+**A process that cannot be trusted to speak gets a file handed to
+it.** The reader's log depends on profile paths and a subscriber;
+its voice down the pipe depends on the pipe; and for three rounds
+every one of its words was lost. So the service works out an
+absolute path inside the person's own profile -- proven writable by
+that account, since the probe's child wrote there -- deletes
+whatever is at it, and passes it on the command line. The reader
+appends a line before the log, before the connect, before anything
+that has ever failed, opening and closing per line so a death in the
+next instruction still leaves what it had said. The service reads it
+back into its own log when a start fails, because a file nobody is
+told about is a file nobody reads.
+
+It is temporary and it is meant to be. When the reader is reliable
+it goes.
 
 **Say the pid at creation.** The service knew it and never printed
 it, so telling "died instantly" from "never existed" took fourteen

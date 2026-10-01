@@ -24,6 +24,7 @@
 //! [`crate::secure::reading`] cannot express an injection, nobody has
 //! to reason about whether one can be smuggled through.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -39,16 +40,76 @@ use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
 /// answering questions and the thread noticing copies.
 type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
 
+/// A file the reader appends to, line by line, before and during
+/// everything else.
+///
+/// Cruder than the log on purpose. Three rounds went on inference
+/// about a process that reached Rust, decided something was wrong,
+/// exited 1, and could not tell anybody -- the one failure this file
+/// has spent days removing, surviving in the newest process. Its log
+/// depends on profile paths and a tracing subscriber; its voice down
+/// the pipe depends on the pipe. This depends on neither: an
+/// absolute path handed to it on its command line by a parent that
+/// has already checked the person can write there, opened and closed
+/// per line so a process that dies in the next instruction still
+/// leaves what it had said.
+///
+/// It is temporary. When the reader is reliable it goes.
+struct Trace(Option<std::path::PathBuf>);
+
+impl Trace {
+    fn say(&self, line: &str) {
+        let Some(path) = &self.0 else {
+            return;
+        };
+        use std::io::Write as _;
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{since} {line}");
+            let _ = file.flush();
+        }
+    }
+}
+
 /// Run as the reader until the pipe closes or the service says stop.
-pub fn run(pipe_name: &str, no_log: Option<String>) -> Result<()> {
+pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -> Result<()> {
+    let trace = Trace(trace_to);
+    // The first statement, before the log, before the connect, before
+    // anything that has ever failed here.
+    trace.say(&format!(
+        "alive: running as {}, told to use pipe {pipe_name}",
+        token::whoami()
+    ));
+    match &no_log {
+        None => trace.say(&format!(
+            "log: opened at {}",
+            smkvm_config::paths::log_file().display()
+        )),
+        Some(why) => trace.say(&format!("log: NOT opened: {why}")),
+    }
     // `connect` checks that the process serving this pipe is the
     // system account before a byte is sent. That guard matters more
     // here than it does for the worker: this process runs as the
     // person, so without it anything else running as them could put
     // up a pipe of that name and be told what they copy.
-    let to_service = pipe::connect(pipe_name)
-        .context("reaching the service, which must be the system account")?;
+    trace.say("connecting");
+    let to_service = match pipe::connect_as_the_person(pipe_name) {
+        Ok(to_service) => to_service,
+        Err(e) => {
+            trace.say(&format!("connecting: FAILED: {e:#}"));
+            return Err(e).context("reaching the service, which must own the pipe");
+        }
+    };
+    trace.say("connected, and the pipe is owned by the system account");
     let mut from_service = to_service.share()?;
+    trace.say("sharing the pipe worked");
 
     // One writer, shared. There are two threads that speak: this one
     // answering questions, and the watch noticing copies.
@@ -82,6 +143,7 @@ pub fn run(pipe_name: &str, no_log: Option<String>) -> Result<()> {
         session,
         log: log.clone(),
     });
+    trace.say("said hello");
     match &log {
         Ok(path) => tell(
             &speak,
@@ -101,7 +163,15 @@ pub fn run(pipe_name: &str, no_log: Option<String>) -> Result<()> {
         ),
     }
 
-    let mut clipboard = WindowsClipboard::start().context("watching the person's clipboard")?;
+    trace.say("starting to watch the clipboard");
+    let mut clipboard = match WindowsClipboard::start() {
+        Ok(clipboard) => clipboard,
+        Err(e) => {
+            trace.say(&format!("watching the clipboard: FAILED: {e}"));
+            return Err(e).context("watching the person's clipboard");
+        }
+    };
+    trace.say("watching the clipboard");
     let mut handle = clipboard.handle();
 
     // What is already there, before any change is reported.
@@ -154,6 +224,7 @@ pub fn run(pipe_name: &str, no_log: Option<String>) -> Result<()> {
         })
         .context("starting the reader's watch")?;
 
+    trace.say("answering");
     loop {
         let asked: ToReader = match read_frame_up_to(&mut from_service, LONGEST_READ) {
             Ok(asked) => asked,
