@@ -591,12 +591,42 @@ fn everything_on_it() -> Vec<String> {
     let mut out = Vec::new();
     let mut next = 0u32;
     loop {
+        // Cleared first, because the return value means two things.
+        //
+        // `EnumClipboardFormats` answers zero both for "that was the
+        // last one" and for "that did not work", and tells them
+        // apart only by the error it leaves behind: clear for the
+        // end of the list, something else for a failure. Read
+        // naively it reports every failure as an empty clipboard --
+        // which is what `the clipboard now holds []` was, printed
+        // one line above a list of formats that something else had
+        // just found on the same clipboard.
+        //
+        // This is the second call in this file with that shape. The
+        // first was `SetClipboardData`, whose null return meant both
+        // "promised" and "refused", and which reported every promise
+        // it ever made as a refusal until the error was cleared
+        // before it. A zero that means two things will be read as
+        // the wrong one.
+        // SAFETY: clearing the thread's last-error value.
+        unsafe { SetLastError(WIN32_ERROR(0)) };
         // SAFETY: the clipboard is open, which is what this requires.
         next = unsafe { EnumClipboardFormats(next) };
-        if next == 0 || out.len() > 32 {
+        if next == 0 {
+            let why = last_win32();
+            if why != 0 {
+                out.push(format!(
+                    "(the list could not be read: {})",
+                    describe_win32(why)
+                ));
+            }
             break;
         }
         out.push(name_of(next));
+        if out.len() > 32 {
+            out.push("(and more)".to_string());
+            break;
+        }
     }
     out
 }
@@ -1064,7 +1094,20 @@ unsafe extern "system" fn window_proc(
                         LOOK_AGAIN_AFTER * (looks - 1)
                     ));
                 }
-                step(&format!("the clipboard now holds [{}]", on_it.join(", ")));
+                // `witness`, not `step`, while this disagrees with
+                // itself: an empty list beside a found format is the
+                // open question, and it should not be sitting at
+                // debug while it is.
+                if on_it.is_empty() {
+                    witness(&format!(
+                        "the enumeration found nothing on the clipboard, while the \
+                         formats we share were found to be {:?} on the same clipboard a \
+                         moment earlier. Those two disagree",
+                        found.formats
+                    ));
+                } else {
+                    step(&format!("the clipboard now holds [{}]", on_it.join(", ")));
+                }
                 let announced = format!("{:?}", found.formats);
                 match sender.send(found) {
                     Ok(()) => witness(&format!(

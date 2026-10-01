@@ -4,7 +4,7 @@
 //! The mirror of `link` for the other helper, and deliberately much
 //! smaller, because the reader can be asked only two things.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,9 @@ pub struct Reader {
     /// checked, and so it can be ended.
     running: token::Started,
     pub who: String,
+    /// Where it writes what it is doing, so the service can read it
+    /// back when the reader stops being able to say anything.
+    trace_to: PathBuf,
 }
 
 impl Reader {
@@ -362,6 +365,7 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
         listed: Waiting::new(),
         running,
         who: who.who.clone(),
+        trace_to,
     });
     match &who.log {
         Ok(path) => tracing::info!(
@@ -385,7 +389,24 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
                 match read_frame_up_to::<FromReader, _>(&mut reading, LONGEST_READ) {
                     Ok(said) => listener.heard(said),
                     Err(e) => {
-                        tracing::warn!("the reader stopped talking: {e}");
+                        // With the exit code, and with what the
+                        // reader managed to write for itself.
+                        //
+                        // A reader that goes away is the end of this
+                        // machine's outbound clipboard, and until
+                        // now the only record of it was one line
+                        // about a pipe. The half that supervises
+                        // should notice, and should say what it
+                        // noticed rather than that it noticed
+                        // something.
+                        tracing::warn!(
+                            pid = listener.running.pid,
+                            "clipboard: the reader stopped talking ({e}): {}. What it said \
+                             for itself: {}. Nothing this machine copies will reach \
+                             another until one starts again",
+                            listener.running.how_it_ended(),
+                            what_it_said(&listener.trace_to)
+                        );
                         break;
                     }
                 }

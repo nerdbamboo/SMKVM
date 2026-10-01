@@ -2249,6 +2249,32 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**A zero that means two things will be read as the wrong one.**
+`EnumClipboardFormats` answers zero both for "that was the last one"
+and for "that did not work", and the two are told apart only by the
+error left behind -- clear for the end of the list. Read naively it
+reports every failure as an empty clipboard, which is how `the
+clipboard now holds []` came to be printed one line above a list of
+formats something else had just found on the same clipboard.
+
+That is the second call in this file with that shape. The first was
+`SetClipboardData`, whose null return meant both "promised" and
+"refused", and which reported every promise it ever made as a
+refusal until the error was cleared before the call. **Any Win32
+call whose failure value is also a legitimate answer needs
+`SetLastError(0)` before it.** There will be a third.
+
+**Every way out of a process has to be written down.** The reader's
+ordinary end logged through `tracing`, to a file in the person's
+profile; an error returned to `main` and was printed to a console
+that does not exist; a panic unwound past both. So it could vanish a
+second after saying it had something to report and leave no account
+of why -- which it did. Its outcome, including a panic, now goes to
+the trace file, and so does the end of its outbox and of its watch.
+The service, for its part, says when a reader stops talking, with
+its exit code and with whatever it managed to write for itself: the
+half that supervises should notice, and should say what it noticed.
+
 **The same wedge, in the newest process, put there by the fix for
 the last one.** The reader's writer was a shared `Mutex<Pipe>` and
 an unbounded `write_all` -- the pattern `secure::outbox` exists to

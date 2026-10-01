@@ -108,9 +108,38 @@ impl Trace {
     }
 }
 
-/// Run as the reader until the pipe closes or the service says stop.
+/// Run as the reader, and say how it stopped whatever happens.
+///
+/// Every way out of this process was unlogged in the file we read
+/// first. The ordinary end writes a line through `tracing`, which
+/// goes to a log in the person's profile; an error returns to `main`
+/// and is printed to a console that does not exist; a panic unwinds
+/// past both. So the process could vanish a second after saying it
+/// had something to report and leave no account of why, which is
+/// what it did.
 pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -> Result<()> {
     let trace = Trace(trace_to);
+    // Before anything, so that even a panic in setting up has
+    // somewhere to land. The default hook writes to a stderr nobody
+    // is reading.
+    {
+        let trace = trace.clone();
+        let was = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panicked| {
+            trace.say(&format!("PANIC: {panicked}"));
+            was(panicked);
+        }));
+    }
+    let outcome = run_until_it_stops(pipe_name, no_log, &trace);
+    match &outcome {
+        Ok(()) => trace.say("stopping: ordinarily"),
+        Err(e) => trace.say(&format!("stopping: {e:#}")),
+    }
+    outcome
+}
+
+fn run_until_it_stops(pipe_name: &str, no_log: Option<String>, trace: &Trace) -> Result<()> {
+    let trace = trace.clone();
     // The first statement, before the log, before the connect, before
     // anything that has ever failed here.
     trace.say(&format!(
@@ -164,19 +193,34 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
     let outbox = Arc::new(outbox);
     {
         let mut writing = to_service.share()?;
+        let draining = trace.clone();
         std::thread::Builder::new()
             .name("smkvm-reader-outbox".into())
             .spawn(move || {
                 let mut failing = false;
+                let mut sent = 0usize;
                 while let Ok(message) = collect.recv() {
                     match say(&mut writing, &message) {
-                        Ok(()) => failing = false,
+                        Ok(()) => {
+                            sent += 1;
+                            if failing {
+                                draining.say(&format!(
+                                    "outbox: reaching the service again, {sent} sent in all"
+                                ));
+                            }
+                            failing = false;
+                        }
                         Err(e) => {
                             if !failing {
-                                // Through `tracing`, never through
-                                // the outbox: this line would
-                                // otherwise be the outbox trying to
-                                // report its own failure to report.
+                                // Through `tracing` and the trace
+                                // file, never through the outbox:
+                                // that would be the outbox trying
+                                // to report its own failure to
+                                // report.
+                                draining.say(&format!(
+                                    "outbox: CANNOT reach the service ({e}); {sent} sent \
+                                     before this"
+                                ));
                                 tracing::warn!("the reader cannot reach the service: {e}");
                                 failing = true;
                             }
@@ -188,6 +232,9 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
                         }
                     }
                 }
+                // Only when every sender has gone, which in this
+                // process means it is ending.
+                draining.say(&format!("outbox: nothing more to send; {sent} sent in all"));
             })
             .context("starting the reader's outbox")?;
     }
@@ -400,6 +447,7 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
     // meanwhile.
     let noticing = speak.clone();
     let claimed = announced.clone();
+    let watching = trace.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-watch".into())
         .spawn(move || {
@@ -423,6 +471,7 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
                     return;
                 }
             }
+            watching.say("the clipboard watch has ended");
             tell(
                 &noticing,
                 Level::Warn,
@@ -437,6 +486,10 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
         let asked: ToReader = match read_frame_up_to(&mut from_service, LONGEST_READ) {
             Ok(asked) => asked,
             Err(e) => {
+                // Through the trace as well. This is the ordinary
+                // way the process ends and it was invisible in the
+                // one file that is read when nothing else speaks.
+                trace.say(&format!("the service stopped talking: {e}"));
                 tracing::info!("the service stopped talking to this reader: {e}");
                 return Ok(());
             }
@@ -465,6 +518,7 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
             }
             ToReader::Stop => {
                 tell(&speak, Level::Info, "the service says to stop");
+                trace.say("the service said to stop");
                 return Ok(());
             }
         }
