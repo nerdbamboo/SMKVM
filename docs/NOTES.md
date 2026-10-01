@@ -2249,6 +2249,23 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**Two synchronous handles onto one pipe serialise with each other.**
+A file object opened without `FILE_FLAG_OVERLAPPED` has every
+request on it serialised by the kernel, and `DuplicateHandle` gives
+a second handle to the *same* file object -- so a thread parked in a
+blocking read holds the lock a write on the other handle needs, for
+as long as it is parked. In the reader that is for ever: its main
+loop waits on the service for instructions that only arrive when the
+person pastes, and every copy it tries to report queues behind that
+wait. `connect_as_the_person` opens overlapped, which takes the
+serialisation away.
+
+It also makes the write deadline real. `write_within` only has a
+deadline on the overlapped path, so a synchronous handle had been
+ignoring `WRITE_WITHIN` entirely -- a bounded write that was never
+bounded, which is why the drain could sit in one for ever without
+the deadline ever expiring.
+
 **A watchdog that shares a thread, a lock or a channel with what it
 watches is decoration.** Four of them in this file were silent in
 exactly the case they were written for, and all four for one reason:
@@ -2262,7 +2279,14 @@ reads rather than is told, and somewhere to write that the watched
 thing cannot reach.
 
 **Reading a pipe and acting on what is read are two jobs, and one
-thread cannot have both.** The service's collector did both, and
+thread cannot have both** -- and the handoff between them must not
+be able to wait either, or neither of them really has one job.
+`post` is `try_send`: a full queue drops a notice and counts it,
+because a lost notification costs one paste and a full pipe costs
+the feature. The collector also keeps no `tracing` on its hot path;
+a log line goes to a file and a file can block, and this is the one
+thread whose stopping stops everything. It keeps numbers in atomics
+and the watchdog says them. The service's collector did both, and
 deadlocked with the reader through the one pipe they share: handling
 a `Copied` reaches the clipboard layer, which may turn round and ask
 that same reader for the contents, so the collector stopped reading,

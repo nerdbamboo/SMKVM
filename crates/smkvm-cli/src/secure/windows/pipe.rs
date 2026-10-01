@@ -616,16 +616,49 @@ pub fn accept(pipe: &Pipe, within: Duration) -> Result<()> {
 /// process's token; the reader runs as the person and cannot. See
 /// [`Pipe::owned_by_the_system`].
 pub fn connect(name: &str) -> Result<Pipe> {
-    connect_checking(name, Pipe::server_is_the_system)
+    connect_checking(name, Pipe::server_is_the_system, Waiting::OneAtATime)
 }
 
 /// The same, for a caller that cannot open a service's token.
 pub fn connect_as_the_person(name: &str) -> Result<Pipe> {
-    connect_checking(name, Pipe::owned_by_the_system)
+    connect_checking(name, Pipe::owned_by_the_system, Waiting::Separately)
 }
 
-fn connect_checking(name: &str, check: impl Fn(&Pipe) -> Result<()>) -> Result<Pipe> {
+/// Whether a handle's reads and writes queue behind one another.
+///
+/// Not a performance choice. A file object opened for synchronous
+/// I/O has every request on it serialised by the kernel, and
+/// `DuplicateHandle` gives a second handle to the *same* file
+/// object -- so a thread parked in a blocking read holds the lock
+/// that a write on the other handle needs, for as long as it is
+/// parked. In the reader that is for ever: its main loop waits on
+/// the service for instructions that only arrive when the person
+/// pastes, and meanwhile every copy it tries to report queues
+/// behind that wait.
+///
+/// Opening overlapped takes the serialisation away. It also makes
+/// the write deadline real: `write_within` only has a deadline on
+/// the overlapped path, so a synchronous handle has been ignoring
+/// `WRITE_WITHIN` entirely.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Waiting {
+    /// Synchronous. What the worker has always used.
+    OneAtATime,
+    /// Overlapped: a read and a write on this pipe do not queue
+    /// behind each other, and a write has a deadline.
+    Separately,
+}
+
+fn connect_checking(
+    name: &str,
+    check: impl Fn(&Pipe) -> Result<()>,
+    waiting: Waiting,
+) -> Result<Pipe> {
     let path = HSTRING::from(acl::pipe_path(name));
+    let mut flags = SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0;
+    if waiting == Waiting::Separately {
+        flags |= FILE_FLAG_OVERLAPPED.0;
+    }
     // SAFETY: a null-terminated path; the handle is wrapped before return.
     let handle = unsafe {
         CreateFileW(
@@ -634,14 +667,17 @@ fn connect_checking(name: &str, check: impl Fn(&Pipe) -> Result<()>) -> Result<P
             FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0),
+            FILE_FLAGS_AND_ATTRIBUTES(flags),
             None,
         )
     }
     .with_context(|| format!("opening {}", acl::pipe_path(name)))?;
     let pipe = Pipe {
         handle,
-        event: None,
+        event: match waiting {
+            Waiting::OneAtATime => None,
+            Waiting::Separately => Some(new_event()?),
+        },
     };
     // Before a single byte is sent, including the hello.
     check(&pipe)?;

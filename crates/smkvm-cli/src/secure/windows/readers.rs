@@ -5,7 +5,7 @@
 //! smaller, because the reader can be asked only two things.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,21 @@ use smkvm_clipboard::{Say, Throttle};
 /// bounded, because the thing waiting on it may be a render with a
 /// budget of its own.
 pub const READER_ANSWERS_WITHIN: Duration = Duration::from_secs(3);
+
+/// What the collector is in the middle of.
+const COLLECTOR_STARTING: u8 = 0;
+const COLLECTOR_READING: u8 = 1;
+const COLLECTOR_HANDING_OVER: u8 = 2;
+const COLLECTOR_FINISHED: u8 = 3;
+
+fn where_it_is(doing: u8) -> &'static str {
+    match doing {
+        COLLECTOR_STARTING => "not started",
+        COLLECTOR_READING => "waiting to read from the pipe",
+        COLLECTOR_HANDING_OVER => "handing a message over",
+        _ => "finished",
+    }
+}
 
 /// How many messages may be waiting to be acted on.
 ///
@@ -61,17 +76,6 @@ fn what_that_was(which: u8) -> &'static str {
         3 => "what is on it",
         4 => "a read",
         _ => "a line",
-    }
-}
-
-/// What a message is, for a log line, without its contents.
-fn what_it_is(said: &FromReader) -> &'static str {
-    match said {
-        FromReader::Ready { .. } => "a hello",
-        FromReader::Copied(_) => "a copy",
-        FromReader::OnIt { .. } => "what is on it",
-        FromReader::Read { .. } => "a read",
-        FromReader::Said { .. } => "a line",
     }
 }
 
@@ -452,6 +456,12 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     // eventually, and the person's clipboard is broken for the
     // length of the timeout rather than for ever.
     let (inbox, handle_these) = Outbox::with_room_for(HANDLING_ROOM);
+    let inbox = Arc::new(inbox);
+    // The collector has never reported on itself, and it is the one
+    // thread in this conversation that has stopped in every run.
+    let what_the_collector_is_doing = Arc::new(AtomicU8::new(COLLECTOR_STARTING));
+    let collected = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
     let what_is_being_handled = Arc::new(AtomicU8::new(0));
     let handling_since = Arc::new(AtomicU64::new(0));
 
@@ -484,13 +494,35 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     {
         let since = handling_since.clone();
         let doing = what_is_being_handled.clone();
+        let collecting = what_the_collector_is_doing.clone();
+        let taken = collected.clone();
+        let lost = dropped.clone();
+        let depth = inbox.clone();
         let pid = reader.running.pid;
         std::thread::Builder::new()
             .name("smkvm-reader-watchdog".into())
             .spawn(move || {
                 let mut complained = false;
+                let mut beat = 0u32;
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
+
+                    // A heartbeat from this side too, so the two
+                    // ends can be compared. The reader says how
+                    // many it has sent; until now nothing here said
+                    // how many had been received.
+                    beat += 1;
+                    if beat % 5 == 0 {
+                        tracing::info!(
+                            pid,
+                            "clipboard: collected {} from the reader, {} dropped, {} \
+                             waiting to be acted on; the collector is {}",
+                            taken.load(Ordering::Relaxed),
+                            lost.load(Ordering::Relaxed),
+                            depth.waiting(),
+                            where_it_is(collecting.load(Ordering::Relaxed))
+                        );
+                    }
                     let began = since.load(Ordering::Relaxed);
                     let stuck = began != 0 && now_in_seconds().saturating_sub(began) >= 2;
                     if stuck && !complained {
@@ -513,6 +545,9 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
     }
 
     let listener = reader.clone();
+    let collecting = what_the_collector_is_doing.clone();
+    let taken = collected.clone();
+    let lost = dropped.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-link".into())
         .spawn(move || {
@@ -520,33 +555,33 @@ pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Resul
                 pid = listener.running.pid,
                 "clipboard: collecting from the reader"
             );
-            let mut collected = 0usize;
+            let mut count = 0usize;
             loop {
+                // Nothing on this thread may wait, and that now
+                // includes writing a log line. `tracing` goes to a
+                // file; a file can block; and this is the one thread
+                // in the conversation whose stopping stops
+                // everything. It keeps numbers in atomics and the
+                // watchdog says them.
+                collecting.store(COLLECTOR_READING, Ordering::Relaxed);
                 match read_frame_up_to::<FromReader, _>(&mut reading, LONGEST_READ) {
                     Ok(said) => {
-                        collected += 1;
-                        let what = what_it_is(&said);
-                        // Posted, never acted on. Everything this
-                        // thread does has to be something that
-                        // cannot wait.
+                        collecting.store(COLLECTOR_HANDING_OVER, Ordering::Relaxed);
+                        count += 1;
+                        taken.store(count, Ordering::Relaxed);
+                        // `post` is `try_send` and cannot wait. If
+                        // the queue is full the notice is dropped
+                        // and counted: a lost notice costs one
+                        // paste, a full pipe costs the feature.
                         if !inbox.post(said).arrived() {
-                            tracing::warn!(
-                                "clipboard: dropped {what} from the reader; the thread \
-                                 that acts on them is {} behind. The pipe is still being \
-                                 emptied",
-                                inbox.waiting()
-                            );
-                        } else if collected <= 5 || collected % 50 == 0 {
-                            tracing::debug!(
-                                "clipboard: collected {what} from the reader \
-                                 ({collected} in all)"
-                            );
+                            lost.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Err(e) => {
+                        collecting.store(COLLECTOR_FINISHED, Ordering::Relaxed);
                         tracing::warn!(
                             pid = listener.running.pid,
-                            "clipboard: the reader stopped talking after {collected} \
+                            "clipboard: the reader stopped talking after {count} \
                              messages ({e}): {}. What it said for itself: {}. Nothing \
                              this machine copies will reach another until one starts again",
                             listener.running.how_it_ended(),
