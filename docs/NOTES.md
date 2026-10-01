@@ -2249,6 +2249,22 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**`STILL_ACTIVE` is 259, and a process that exits with 259 cannot be
+told from a running one through `GetExitCodeProcess`.** Nor can a
+*failure* of that call, if its error is folded into the same answer.
+Both were, and the service reported "the reader was still running"
+about a process that was not in the process list at all -- a
+diagnostic asserting something it had not established, which is the
+most expensive kind of line this codebase produces. `Started::how_it_ended`
+decides by waiting on the handle, which is authoritative, and reads
+the code only once the wait says it has gone. Not yet, a code, and
+could-not-ask are three answers, not one.
+
+**Say the pid at creation.** The service knew it and never printed
+it, so telling "died instantly" from "never existed" took fourteen
+samples of a process list taken by hand. One line, at the only
+moment the number is certainly true.
+
 **A process whose first act can kill it silently cannot be
 diagnosed.** The reader has no console, no terminal and a parent that
 can only see a pipe, and `start_logging` was the first thing it did.

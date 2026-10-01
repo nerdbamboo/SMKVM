@@ -28,6 +28,13 @@ use smkvm_clipboard::{Say, Throttle};
 /// budget of its own.
 pub const READER_ANSWERS_WITHIN: Duration = Duration::from_secs(3);
 
+/// How long after starting a reader to look whether it is still
+/// there.
+///
+/// Long enough for a process that cannot start at all to have gone,
+/// short enough that it costs nothing when one starts normally.
+const FIRST_LOOK_AFTER: Duration = Duration::from_millis(300);
+
 /// How long a reader is given to stop politely before it is ended.
 const LET_GO_GRACE: Duration = Duration::from_millis(500);
 
@@ -193,7 +200,7 @@ pub fn let_go(why: &str) {
 }
 
 /// Start a reader in the interactive session, as the person in it.
-pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
+pub fn start(exe: &Path, session: u32, environment: token::Environment) -> Result<Arc<Reader>> {
     token::enable_tcb_privilege()?;
 
     // The pipe is made before the reader is started, so there is no
@@ -221,18 +228,46 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
         exe,
         &format!("clipboard-reader --pipe {name}"),
         r"WinSta0\Default",
-        // The person's own environment, built from their token.
-        //
-        // Not the service's, which is what the worker gets and what
-        // this had. The reader runs *as the person*, so the
-        // service's `APPDATA` and `LOCALAPPDATA` point it into the
-        // system profile -- a place that account cannot write -- and
-        // its first act is to open a log under `LOCALAPPDATA`. It
-        // died there, before a line reached disk anywhere, and all
-        // this end saw was a broken pipe.
-        token::Environment::ThePersons,
+        // Chosen by the caller, which alternates it. See
+        // `mind_readers`: the first try gives the reader the
+        // person's own environment, which is what it ought to have,
+        // and a later one gives it the service's, which is what the
+        // probe's child had when it worked. Those two creations
+        // differ in nothing else, so if one starts and the other
+        // does not, the environment block is the answer.
+        environment,
     )
     .context("starting the reader as the person at the desk")?;
+
+    // Said at creation, before anything can go wrong with it.
+    //
+    // The service knew this number and never printed it, so telling
+    // "died instantly" from "never existed" took fourteen samples of
+    // the process list. One line is cheaper than that and is
+    // available at the only moment it is certainly true.
+    tracing::info!(
+        pid = running.pid,
+        session,
+        environment = environment.named(),
+        "clipboard: started a reader"
+    );
+
+    // And immediately: is it still there?
+    //
+    // `CreateProcessAsUserW` can return success and a handle for a
+    // process that is gone a moment later -- a malformed environment
+    // is one documented way -- and waiting for the pipe to break
+    // reports that as "the reader said nothing", which says nothing
+    // about why. A short look here turns it into an exit code.
+    std::thread::sleep(FIRST_LOOK_AFTER);
+    if let ended @ (token::Ended::With(_) | token::Ended::CouldNotAsk(_)) = running.how_it_ended() {
+        bail!(
+            "the reader (pid {}, started with {}) was gone {} ms after it was started: {ended}",
+            running.pid,
+            environment.named(),
+            FIRST_LOOK_AFTER.as_millis()
+        );
+    }
 
     // Every failure from here ends the process it started.
     //
@@ -265,10 +300,12 @@ pub fn start(exe: &Path, session: u32) -> Result<Arc<Reader>> {
             // code is ours and says nothing. A broken pipe only says
             // the process is not there; the code says something
             // about why, and not having it cost a deployment.
-            let said = match running.exit_code() {
-                Some(code) => format!("{e:#} (the reader had already exited, code {code})"),
-                None => format!("{e:#} (the reader was still running, and has been ended)"),
-            };
+            let said = format!(
+                "{e:#} (reader pid {}, started with {}: {})",
+                running.pid,
+                environment.named(),
+                running.how_it_ended()
+            );
             running.kill();
             bail!("{said}");
         }

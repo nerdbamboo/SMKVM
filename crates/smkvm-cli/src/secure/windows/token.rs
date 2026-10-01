@@ -64,7 +64,7 @@ use anyhow::{bail, Context, Result};
 use windows::core::{PCWSTR, PWSTR};
 
 use crate::secure::windows::Aligned;
-use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE, STILL_ACTIVE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, GetTokenInformation, LookupPrivilegeValueW,
     SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId, TokenUser,
@@ -295,6 +295,25 @@ impl Drop for Block {
     }
 }
 
+/// What became of a process that was started.
+pub enum Ended {
+    /// Still running, established by waiting on it rather than by
+    /// reading a code that cannot tell 259 from running.
+    NotYet,
+    With(u32),
+    CouldNotAsk(String),
+}
+
+impl std::fmt::Display for Ended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ended::NotYet => write!(f, "it is still running"),
+            Ended::With(code) => write!(f, "it exited with code {code}"),
+            Ended::CouldNotAsk(e) => write!(f, "it has exited and the code could not be read: {e}"),
+        }
+    }
+}
+
 /// A process started in the interactive session, on a named desktop.
 pub struct Started {
     process: Owned,
@@ -313,19 +332,31 @@ impl Started {
         waited == windows::Win32::Foundation::WAIT_OBJECT_0
     }
 
-    /// Why it went, if it has.
+    /// How it ended, or that it has not.
     ///
     /// A broken pipe says a process is not there; an exit code says
-    /// something about why. The difference cost a deployment: the
-    /// reader died before it could write a line anywhere and all the
-    /// service had to report was that the pipe had broken.
-    pub fn exit_code(&self) -> Option<u32> {
+    /// something about why. The difference cost a deployment.
+    ///
+    /// The wait decides whether it has ended, not the code. The
+    /// first version of this asked `GetExitCodeProcess` and read
+    /// `STILL_ACTIVE` as "running", which is wrong twice over:
+    /// `STILL_ACTIVE` is 259, so a process that exits *with* 259 is
+    /// indistinguishable from a running one through that call alone,
+    /// and a failure of the call itself came back as "running" too.
+    /// The service then reported "the reader was still running" for
+    /// a process that was not in the process list at all, which is a
+    /// diagnostic asserting something it had not established --
+    /// exactly the thing that has cost this file the most.
+    pub fn how_it_ended(&self) -> Ended {
+        if !self.gone() {
+            return Ended::NotYet;
+        }
         let mut code = 0u32;
         // SAFETY: a valid process handle and a place for the code.
-        unsafe { GetExitCodeProcess(self.process.0, &mut code) }.ok()?;
-        // The documented sentinel for "still running", and the reason
-        // a process must never exit with it.
-        (code != STILL_ACTIVE.0 as u32).then_some(code)
+        match unsafe { GetExitCodeProcess(self.process.0, &mut code) } {
+            Ok(()) => Ended::With(code),
+            Err(e) => Ended::CouldNotAsk(format!("{e}")),
+        }
     }
 
     /// End it.
@@ -384,6 +415,17 @@ pub enum Environment {
     /// death, which is the shape this file has spent two days
     /// removing.
     ThePersons,
+}
+
+impl Environment {
+    /// For a log line, so that two creations that differ only in
+    /// this can be told apart in the record.
+    pub fn named(self) -> &'static str {
+        match self {
+            Environment::TheServices => "the service's environment",
+            Environment::ThePersons => "the person's environment",
+        }
+    }
 }
 
 /// Start a process in the interactive session, on a named desktop,
