@@ -2249,6 +2249,28 @@ offering something new, and a renewal is this machine failing to
 supply something old. Four takes with one announcement is a diagnosis
 on its own, and only if the log distinguishes them.
 
+**One copy, two ways of noticing it, each saying which it was.** The
+reader's window registers as a format listener, the registration is
+accepted, the window pumps -- and `WM_CLIPBOARDUPDATE` never arrives
+there, while the worker's window in the same session on the same
+clipboard is told about every copy. The two processes differ in the
+identity they run as and in nothing else anybody has found: the same
+axis as the finding this arrangement exists for, moved from the
+enumeration to the notification.
+
+So the reader also watches `GetClipboardSequenceNumber`, which needs
+no window, no message queue and nobody's permission, and moves on
+every change. Running both is the measurement -- whichever notices
+says so, in the line -- and it is equally the way out, because a
+copy noticed by polling is as good as one announced. Whichever gets
+there first claims the sequence number, so one copy is one notice
+however many ways it was spotted.
+
+The window also counts what it is sent and says the count. "No
+message arrived" and "a message arrived and the handler did nothing"
+shared a symptom for a round, and an absence cannot be told from a
+dead instrument by looking at the absence.
+
 **`witness_through` is one slot per process, and only the worker
 ever filled it.** Every line the clipboard crate produced inside the
 *reader* -- the settle timer noticing a copy, the clipboard refusing

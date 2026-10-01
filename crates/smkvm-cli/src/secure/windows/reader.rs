@@ -25,7 +25,9 @@
 //! to reason about whether one can be smuggled through.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use smkvm_clipboard::platform::windows::WindowsClipboard;
@@ -39,6 +41,16 @@ use crate::secure::wire::{frame_up_to, read_frame_up_to, Level};
 /// One way of speaking to the service, shared by the thread
 /// answering questions and the thread noticing copies.
 type Saying = Arc<dyn Fn(&FromReader) -> bool + Send + Sync>;
+
+/// How often to look at the sequence number, and how long to let a
+/// copy settle once it has moved.
+///
+/// A quarter-second is well inside what a person notices and costs a
+/// single call that touches nothing. The settle is the same reason
+/// the window's own timer has one: a file copy arrives as several
+/// changes while the shell assembles its data object.
+const LOOK_EVERY: Duration = Duration::from_millis(250);
+const SETTLE_FOR: Duration = Duration::from_millis(400);
 
 /// A file the reader appends to, line by line, before and during
 /// everything else.
@@ -229,18 +241,108 @@ pub fn run(pipe_name: &str, no_log: Option<String>, trace_to: Option<PathBuf>) -
         ),
     }
 
+    // Two ways of noticing a copy, running side by side, each
+    // saying which one it was.
+    //
+    // The window registers as a format listener, the registration is
+    // accepted, the window pumps -- and `WM_CLIPBOARDUPDATE` never
+    // arrives here, while the worker's window in the same session on
+    // the same clipboard is told about every copy. The two processes
+    // differ in the identity they run as and in nothing else anybody
+    // has found, which is the same axis as the finding this whole
+    // arrangement exists for, now in the notification rather than
+    // the enumeration.
+    //
+    // So the sequence number is watched as well. It asks nobody's
+    // permission, needs no window and no message queue, and moves on
+    // every change to the clipboard. Running both is the
+    // measurement -- whichever notices says so, and if only one ever
+    // does, that is the answer -- and it is also the way out, since
+    // a copy noticed by polling is as good a copy as one announced.
+    //
+    // Whoever gets there first announces it; the other sees the
+    // sequence already claimed and stays quiet, so one copy is one
+    // notice however many ways it was spotted.
+    let announced = Arc::new(AtomicU32::new(
+        smkvm_clipboard::platform::windows::sequence_number(),
+    ));
+
+    let polling = speak.clone();
+    let claimed = announced.clone();
+    let asking = handle.clone();
+    std::thread::Builder::new()
+        .name("smkvm-reader-sequence".into())
+        .spawn(move || loop {
+            std::thread::sleep(LOOK_EVERY);
+            let now = smkvm_clipboard::platform::windows::sequence_number();
+            if now == claimed.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Settle first: a copy arrives as several changes, and
+            // the shell's file copy assembles itself over a second
+            // or so.
+            std::thread::sleep(SETTLE_FOR);
+            let settled = smkvm_clipboard::platform::windows::sequence_number();
+            if claimed.swap(settled, Ordering::Relaxed) == settled {
+                continue;
+            }
+            match asking.available() {
+                Ok(there) if there.formats.is_empty() => tell(
+                    &polling,
+                    Level::Info,
+                    format!(
+                        "the clipboard changed (sequence {settled}) but holds none of the \
+                         formats we share"
+                    ),
+                ),
+                Ok(there) => {
+                    tell(
+                        &polling,
+                        Level::Info,
+                        format!(
+                            "something was copied here: {:?} -- noticed by watching the \
+                             sequence number ({settled}), not by being told. This process \
+                             has been told of {} changes since it started",
+                            there.formats,
+                            smkvm_clipboard::platform::windows::NOTICED.load(Ordering::Relaxed)
+                        ),
+                    );
+                    if !polling(&FromReader::Copied(there.formats)) {
+                        return;
+                    }
+                }
+                Err(e) => tell(
+                    &polling,
+                    Level::Warn,
+                    format!("the clipboard changed (sequence {settled}) but would not open: {e}"),
+                ),
+            }
+        })
+        .context("starting the reader's watch on the sequence number")?;
+
     // Copies are noticed on their own thread, because `next_change`
     // blocks until one happens and this one has questions to answer
     // meanwhile.
     let noticing = speak.clone();
+    let claimed = announced.clone();
     std::thread::Builder::new()
         .name("smkvm-reader-watch".into())
         .spawn(move || {
             while let Some(copied) = clipboard.next_change() {
+                let settled = smkvm_clipboard::platform::windows::sequence_number();
+                if claimed.swap(settled, Ordering::Relaxed) == settled {
+                    // The sequence watch got there first. One copy,
+                    // one notice.
+                    continue;
+                }
                 tell(
                     &noticing,
                     Level::Info,
-                    format!("something was copied here: {:?}", copied.formats),
+                    format!(
+                        "something was copied here: {:?} -- noticed by being told \
+                         (sequence {settled})",
+                        copied.formats
+                    ),
                 );
                 if !noticing(&FromReader::Copied(copied.formats)) {
                     return;

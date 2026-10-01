@@ -31,8 +31,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Com::{CoTaskMemFree, DATADIR_GET, FORMATETC};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
-    GetClipboardData, GetClipboardFormatNameW, GetClipboardOwner, GetOpenClipboardWindow,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    GetClipboardData, GetClipboardFormatNameW, GetClipboardOwner, GetClipboardSequenceNumber,
+    GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -150,6 +150,13 @@ fn why_released(reason: usize) -> &'static str {
 /// look ends it.
 const LOOK_AGAIN_AFTER: u32 = 250;
 const LOOK_AT_MOST: u32 = 8;
+
+/// How many `WM_CLIPBOARDUPDATE` messages this process has been sent.
+///
+/// Process-wide rather than per window, because there is one
+/// clipboard window per process and the question being answered is
+/// "does this process get told at all".
+pub static NOTICED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The timer that lets a burst of change notices settle into one report.
 const SETTLE_TIMER: usize = 1;
@@ -428,6 +435,26 @@ impl Drop for Opened {
             let _ = CloseClipboard();
         }
     }
+}
+
+/// How many times the clipboard has changed since the machine
+/// started.
+///
+/// A second, independent way of noticing a copy, and the reason it
+/// is here is that the first one stopped working for one process and
+/// not another. The reader's window registers as a format listener,
+/// the registration is accepted, the window pumps -- and
+/// `WM_CLIPBOARDUPDATE` never arrives, while the worker's window in
+/// the same session on the same clipboard receives every one.
+///
+/// This asks nobody's permission and needs no window, no message
+/// queue and no notification. If the number moves while no message
+/// arrives, the notification path is broken for this process and the
+/// clipboard itself is fine -- which is a diagnosis and a way to
+/// carry on, in the same call.
+pub fn sequence_number() -> u32 {
+    // SAFETY: takes no pointers.
+    unsafe { GetClipboardSequenceNumber() }
 }
 
 /// Is anybody holding the clipboard open right now?
@@ -836,6 +863,19 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         WM_CLIPBOARDUPDATE => {
+            // Counted, and said with the count.
+            //
+            // "No message arrived" and "a message arrived and the
+            // handler did nothing" shared a symptom for a round, and
+            // an absence cannot be told from a dead instrument by
+            // looking at an absence. The number makes the first one
+            // a thing the log says rather than a thing it omits.
+            let seen = NOTICED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            step(&format!(
+                "a clipboard change was announced to this window (number {seen} since it \
+                 opened; the clipboard is at sequence {})",
+                sequence_number()
+            ));
             // Whose change is this? Asked of the system rather than
             // remembered, and that distinction is the whole of this
             // fix.
@@ -1908,8 +1948,10 @@ fn clipboard_thread(
 
     witness(&format!(
         "window is up: window={:?} thread={thread_id} \
+         listening-for-copies=accepted sequence-now={} \
          messages-from-less-privileged[{}]",
         window.0,
+        sequence_number(),
         allowed.join(" ")
     ));
     let _ = ready.send(Ok((thread_id, formats)));
