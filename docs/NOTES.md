@@ -1728,6 +1728,56 @@ write the bug. (This was found while adding the lines above, and is
 not the fault those lines were added to find: `NothingOffered` does
 not renew, so this path was not the one firing.)
 
+**The outbound half had no instrumentation at all.** Four rounds
+were spent making the inbound path -- another machine's copy arriving
+here -- say what it was doing, and in all that time the path by which
+*this* machine's copies reach anywhere else said nothing whatsoever.
+Not one line between `WM_CLIPBOARDUPDATE` noticing a copy and the
+service being told about it, and three places in that span could fail
+silently: the settle timer finding no state, the clipboard refusing
+to open so the formats could not be read, and the send going into a
+channel whose receiver had gone. The last of those means no copy made
+on the machine will ever reach another one again, and it was a
+discarded `Result`.
+
+It now says what it found at each step, and the worker's "something
+was copied on this desktop" moved from debug to info -- a person
+copying something happens at human pace, and that line was the one
+that would have shown this half was not running. The service warns
+rather than silently discarding when the worker reports a copy and
+nothing on this side is listening.
+
+The general shape is worth naming: **instrumenting one direction of a
+two-way path makes the other direction look like a missing feature.**
+Inbound worked and was legible; outbound was broken and silent; and
+the conclusion drawn was that the outbound half had never been
+written.
+
+**Diagnostics became the problem they were added to solve.** A 62 MB
+log on the client, eighty-five identical render lines inside one
+second, and bursts where the worker's outbox reported discarding
+229,897 messages at once. Three separate costs: real work on a thread
+that must not be slowed, an outbox spending its whole budget on
+repetition, and -- worst -- a reader who cannot find anything, which
+produced a wrong conclusion that cost a round.
+
+So `witness` splits in two. `witness` is for things that happen once
+per human action: an offer arriving, an offer being let go with its
+reason, a render that could not be served, a copy noticed here. Those
+stay at info. `step` is for things that happen once per machine
+action -- entering a render, promising a format, taking the clipboard
+-- and goes to debug. The level crosses the pipe with the line, so a
+step does not arrive at the service as something a person is meant to
+wade through.
+
+Both go through `Throttle`, keyed on the text: the first couple of
+identical lines in each second get through and the rest are counted,
+and the count is handed to the next one that does, exactly as the
+outbox does with messages it had to refuse. A spin now reads as
+`[and 83 more like it in the last second]` instead of as a megabyte,
+which also makes the rate of a spin a measurement rather than
+something to be counted by hand.
+
 **Both ends of both directions say what they saw.** A paste crosses
 four boundaries: the worker posts `WantsPaste`, the service receives
 it, the service asks the far machine, and the answer comes back to

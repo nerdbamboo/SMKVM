@@ -49,7 +49,7 @@ static RELAY_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// The return value says whether it got as far as the queue, which is
 /// not the same as reaching the service -- and for a diagnostic line
 /// that distinction does not matter enough to wait for.
-fn say_without_waiting(text: String) -> bool {
+fn say_without_waiting(text: String, level: Level) -> bool {
     let Some(outbox) = OUTBOX.get() else {
         // Nothing has been set up yet, which on this path means the
         // worker is not serving a clipboard. The local log still has
@@ -71,12 +71,7 @@ fn say_without_waiting(text: String) -> bool {
             outbox.put_back(missed);
         }
     }
-    outbox
-        .post(FromWorker::Said {
-            level: Level::Info,
-            text,
-        })
-        .arrived()
+    outbox.post(FromWorker::Said { level, text }).arrived()
 }
 
 /// The worker's end of the clipboard, while it holds one.
@@ -187,7 +182,10 @@ impl Fetch for AskTheService {
         // render as a failure to fetch -- and a failure to fetch is
         // the outcome that renews the promise rather than the one
         // that answers nothing.
-        say_without_waiting(format!("something on this desktop is pasting {format:?}"));
+        say_without_waiting(
+            format!("something on this desktop is pasting {format:?}"),
+            Level::Info,
+        );
         let posted = OUTBOX.get().map(|o| {
             o.post(FromWorker::WantsPaste {
                 id,
@@ -199,15 +197,18 @@ impl Fetch for AskTheService {
         // waiting on is a fault this code has had before. Silence in
         // between has been wrong three times in this path now, so
         // both ends of both directions say what they saw.
-        say_without_waiting(format!(
-            "asked the service for {format:?} as paste {id}: {}",
-            match posted {
-                Some(Posted::Sent) => "sent".to_string(),
-                Some(Posted::NoRoom(n)) => format!("NOT SENT, {n} refused in a row"),
-                Some(Posted::Gone) => "NOT SENT, nobody is draining".to_string(),
-                None => "NOT SENT, the clipboard is not being served".to_string(),
-            }
-        ));
+        say_without_waiting(
+            format!(
+                "asked the service for {format:?} as paste {id}: {}",
+                match posted {
+                    Some(Posted::Sent) => "sent".to_string(),
+                    Some(Posted::NoRoom(n)) => format!("NOT SENT, {n} refused in a row"),
+                    Some(Posted::Gone) => "NOT SENT, nobody is draining".to_string(),
+                    None => "NOT SENT, the clipboard is not being served".to_string(),
+                }
+            ),
+            Level::Info,
+        );
         if !posted.map(Posted::arrived).unwrap_or(false) {
             self.pastes.forget(id);
             self.asked.lock().expect("not poisoned").remove(&id);
@@ -345,12 +346,25 @@ impl Serving {
             })
             .context("starting the worker's outbox")?;
         let _ = OUTBOX.set(outbox);
-        smkvm_clipboard::witness_through(Box::new(move |text| {
+        smkvm_clipboard::witness_through(Box::new(move |text, for_a_person| {
             // Relayed as given. The `clipboard:` prefix is already on
             // it, put there at the source so that the same search
             // finds these lines on both arrangements; adding another
             // here would make it `worker: clipboard: clipboard: ...`.
-            say_without_waiting(text.to_string());
+            //
+            // The level crosses with it. A step the clipboard took is
+            // not something a person reading the service's log is
+            // meant to wade through, and sending everything at info
+            // is how the outbox came to be discarding two hundred
+            // thousand messages at a time.
+            say_without_waiting(
+                text.to_string(),
+                if for_a_person {
+                    Level::Info
+                } else {
+                    Level::Debug
+                },
+            );
         }));
         Ok(())
     }
@@ -374,15 +388,39 @@ impl Serving {
             .name("smkvm-worker-clipboard".into())
             .spawn(move || {
                 while let Some(available) = watch.next_change() {
+                    // Info, not debug. A person copying something is
+                    // not a frequent event -- it happens at human
+                    // pace -- and this is the first step of the only
+                    // path by which anything this machine copies
+                    // reaches another one. It was the one line that
+                    // would have shown this half of the clipboard was
+                    // not running, and it was below the level anybody
+                    // was reading at.
+                    let formats = format!("{:?}", available.formats);
                     tell(
                         &telling,
-                        Level::Debug,
-                        format!("somebody copied something here: {:?}", available.formats),
+                        Level::Info,
+                        format!("something was copied on this desktop: {formats}"),
                     );
                     if !telling(&FromWorker::ClipboardChanged(available.formats)) {
+                        tell(
+                            &telling,
+                            Level::Warn,
+                            format!(
+                                "could not tell the service about {formats} being copied                                  here; no further copies will be reported either"
+                            ),
+                        );
                         return;
                     }
                 }
+                // Reached when the clipboard window has gone. Said,
+                // because from outside it is indistinguishable from
+                // nobody ever copying anything.
+                tell(
+                    &telling,
+                    Level::Warn,
+                    "no longer watching this desktop's clipboard; copies made here will                      not reach another machine",
+                );
             })
             .context("starting the worker's clipboard watch")?;
         Ok(Serving {

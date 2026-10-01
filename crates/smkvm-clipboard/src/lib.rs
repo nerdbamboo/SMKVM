@@ -24,6 +24,9 @@ pub mod html;
 pub mod image;
 pub mod platform;
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use smkvm_proto::ClipFormat;
 
 /// How long a paste may take before what it produces is worthless.
@@ -56,7 +59,7 @@ pub const RENDER_BUDGET: std::time::Duration = std::time::Duration::from_secs(4)
 ///
 /// Set once, by whoever knows where words should go. Never read for
 /// anything but saying something.
-type Saying = Box<dyn Fn(&str) + Send + Sync>;
+type Saying = Box<dyn Fn(&str, bool) + Send + Sync>;
 static WITNESS: std::sync::OnceLock<Saying> = std::sync::OnceLock::new();
 
 /// Say where this crate's most important lines should also go.
@@ -75,7 +78,39 @@ pub fn witness_through(say: Saying) {
 // diagnosis; on X11 the clipboard runs in the person's own session and
 // none of this arises.
 #[cfg_attr(not(windows), allow(dead_code))]
+/// Say something that happens once per human action.
+///
+/// The offer arriving, the offer being let go, a render that could
+/// not be served: things somebody would want to see once, and which
+/// cannot repeat faster than a person can copy and paste.
 pub(crate) fn witness(text: &str) {
+    witness_at(Loudly::Always, text)
+}
+
+/// Say something that happens once per *machine* action, and may
+/// therefore happen very fast indeed.
+///
+/// Entering a render, promising a format, taking the clipboard. These
+/// earned their place while this path was blind, and they have been
+/// read for the last time by anybody who is not debugging: eighty-five
+/// identical render lines inside one second is not a record of
+/// anything. They go to the log at debug and are rate-limited on the
+/// way, so a spin shows up as a handful of lines and a count rather
+/// than as a megabyte.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn step(text: &str) {
+    witness_at(Loudly::OnlyWhenDebugging, text)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Loudly {
+    Always,
+    OnlyWhenDebugging,
+}
+
+static REPEATS: std::sync::OnceLock<Throttle> = std::sync::OnceLock::new();
+
+fn witness_at(loudly: Loudly, text: &str) {
     // Prefixed here rather than by whoever relays it, so that one
     // search finds these lines whichever way they arrived. Under the
     // scheduled task there is no worker and no relay and they reach
@@ -85,10 +120,26 @@ pub(crate) fn witness(text: &str) {
     // with a consent prompt in the way should not have to know which
     // arrangement produced it in order to grep for the thing they
     // need.
-    let said = format!("clipboard: {text}");
-    tracing::info!("{said}");
+    //
+    // Throttled before anything else is done with it, including the
+    // formatting, because on the hot path the cost of these lines is
+    // itself part of the problem.
+    let throttle = REPEATS.get_or_init(Throttle::new);
+    let said = match throttle.asked_at(text, Instant::now()) {
+        Say::No => return,
+        Say::Yes => format!("clipboard: {text}"),
+        Say::YesAfter(held_back) => {
+            format!("clipboard: {text} [and {held_back} more like it in the last second]")
+        }
+    };
+    match loudly {
+        Loudly::Always => tracing::info!("{said}"),
+        Loudly::OnlyWhenDebugging => tracing::debug!("{said}"),
+    }
     if let Some(say) = WITNESS.get() {
-        say(&said);
+        // The relay carries the level too, so a step does not arrive
+        // at the service as something a person is meant to read.
+        say(&said, loudly == Loudly::Always);
     }
 }
 
@@ -165,6 +216,99 @@ impl Rendered {
                 format!("the system would not take the contents: {why}")
             }
         }
+    }
+}
+
+/// How often one repeated line may be said, and how many of them in
+/// that time.
+const SAME_LINE_WITHIN: Duration = Duration::from_secs(1);
+const SAME_LINE_AT_MOST: u32 = 2;
+
+/// What to do with a line that may be one of very many identical ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Say {
+    /// Say it.
+    Yes,
+    /// Say it, and mention this many that were held back since the
+    /// last one got through.
+    YesAfter(u32),
+    /// Hold it back; one just like it was said a moment ago.
+    No,
+}
+
+/// Lets a line through a few times a second and counts the rest.
+///
+/// This exists because the diagnostics in this crate became the
+/// problem they were added to solve. A log of 62 MB with
+/// eighty-five identical render lines inside one second is not an
+/// instrument: the lines cost real work on a thread that must not be
+/// slowed, they filled the worker's outbox until it was discarding
+/// two hundred thousand messages at a time, and -- worst of the
+/// three -- a reader could not find anything in it, which produced a
+/// wrong conclusion that cost a round.
+///
+/// A repeated line carries almost no information after the second
+/// copy. What matters is that it happened, and how often. So the
+/// first couple in each second go out and the rest are counted, and
+/// the count is handed to the next one that gets through, exactly as
+/// the worker's outbox does with messages it had to refuse.
+///
+/// Keyed on the text itself, so two different lines never throttle
+/// each other and a line that genuinely varies is never held back.
+#[derive(Default)]
+pub struct Throttle {
+    seen: std::sync::Mutex<HashMap<String, Spell>>,
+}
+
+#[derive(Clone, Copy)]
+struct Spell {
+    began: Instant,
+    said: u32,
+    held_back: u32,
+}
+
+impl Throttle {
+    pub fn new() -> Throttle {
+        Throttle::default()
+    }
+
+    /// Decide what to do with this line, as of `now`.
+    pub fn asked_at(&self, line: &str, now: Instant) -> Say {
+        let mut seen = self.seen.lock().expect("not poisoned");
+        // Keeps the table from growing without bound in a long run:
+        // anything not seen for a while cannot be in a burst.
+        if seen.len() > 512 {
+            seen.retain(|_, spell| now.duration_since(spell.began) < SAME_LINE_WITHIN);
+        }
+        let spell = seen.entry(line.to_string()).or_insert(Spell {
+            began: now,
+            said: 0,
+            held_back: 0,
+        });
+        if now.duration_since(spell.began) >= SAME_LINE_WITHIN {
+            let held_back = spell.held_back;
+            *spell = Spell {
+                began: now,
+                said: 1,
+                held_back: 0,
+            };
+            return if held_back > 0 {
+                Say::YesAfter(held_back)
+            } else {
+                Say::Yes
+            };
+        }
+        if spell.said < SAME_LINE_AT_MOST {
+            spell.said += 1;
+            let held_back = std::mem::take(&mut spell.held_back);
+            return if held_back > 0 {
+                Say::YesAfter(held_back)
+            } else {
+                Say::Yes
+            };
+        }
+        spell.held_back += 1;
+        Say::No
     }
 }
 
@@ -312,7 +456,8 @@ pub trait CatchDrag: Send {
 
 #[cfg(test)]
 mod rendered_tests {
-    use super::{promise_said, Rendered};
+    use super::{promise_said, Rendered, Say, Throttle};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_promise_that_was_kept_is_never_made_again() {
@@ -386,5 +531,57 @@ mod rendered_tests {
         let said = promise_said(false, 6, false);
         assert!(said.contains("REFUSED"), "{said}");
         assert!(!said.contains("disagree"), "{said}");
+    }
+
+    #[test]
+    fn the_first_few_of_a_burst_get_through_and_the_rest_are_counted() {
+        let throttle = Throttle::new();
+        let now = Instant::now();
+        assert_eq!(throttle.asked_at("render", now), Say::Yes);
+        assert_eq!(throttle.asked_at("render", now), Say::Yes);
+        // The eighty-three others in that second.
+        for _ in 0..83 {
+            assert_eq!(throttle.asked_at("render", now), Say::No);
+        }
+        // The next second admits what it held back rather than
+        // pretending the burst did not happen.
+        let later = now + Duration::from_millis(1100);
+        assert_eq!(throttle.asked_at("render", later), Say::YesAfter(83));
+    }
+
+    #[test]
+    fn different_lines_do_not_hold_each_other_back() {
+        let throttle = Throttle::new();
+        let now = Instant::now();
+        for i in 0..50 {
+            // A line that genuinely varies says something new every
+            // time, and must never be suppressed by its neighbours.
+            assert_eq!(throttle.asked_at(&format!("paste {i}"), now), Say::Yes);
+        }
+    }
+
+    #[test]
+    fn a_quiet_line_is_never_held_back() {
+        let throttle = Throttle::new();
+        let mut now = Instant::now();
+        for _ in 0..20 {
+            assert_eq!(throttle.asked_at("a copy settled", now), Say::Yes);
+            now += Duration::from_secs(2);
+        }
+    }
+
+    #[test]
+    fn the_table_does_not_grow_without_bound() {
+        let throttle = Throttle::new();
+        let now = Instant::now();
+        for i in 0..600 {
+            throttle.asked_at(&format!("line {i}"), now);
+        }
+        let later = now + Duration::from_secs(5);
+        throttle.asked_at("one more", later);
+        assert!(
+            throttle.seen.lock().unwrap().len() < 600,
+            "stale entries were never cleared"
+        );
     }
 }

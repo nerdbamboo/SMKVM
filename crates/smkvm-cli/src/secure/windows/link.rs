@@ -325,8 +325,26 @@ impl Link {
             }
             FromWorker::ClipboardChanged(formats) => {
                 let held = self.clipboard_changes.lock().expect("not poisoned");
-                if let Some(changes) = held.as_ref() {
-                    let _ = changes.send(Available { formats });
+                match held.as_ref() {
+                    Some(changes) => {
+                        tracing::info!(
+                            ?formats,
+                            "clipboard: the worker says something was copied on the desktop"
+                        );
+                        if changes.send(Available { formats }).is_err() {
+                            tracing::warn!(
+                                "clipboard: nothing is listening for copies any more, so                                  what this machine copies will not reach another"
+                            );
+                        }
+                    }
+                    // Dropped in silence until now. This is the far
+                    // end of the only path by which a copy made here
+                    // reaches another machine, and an unwired
+                    // receiver here loses every copy without a word.
+                    None => tracing::warn!(
+                        ?formats,
+                        "clipboard: the worker says something was copied, but nothing on                          this side is listening for copies, so it goes nowhere"
+                    ),
                 }
             }
             FromWorker::ClipboardRead { id, bytes } => {

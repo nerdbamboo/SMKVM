@@ -48,7 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{files, html, image, Available, ClipboardError, Fetch, Result, Write};
-use crate::{witness, Rendered, RENDER_BUDGET};
+use crate::{step, witness, Rendered, RENDER_BUDGET};
 
 /// How long to keep trying to open the clipboard.
 ///
@@ -619,15 +619,58 @@ unsafe extern "system" fn window_proc(
                 let slot = cell.borrow();
                 slot.as_ref().map(|s| (s.formats, s.changes.clone()))
             });
-            if let Some((formats, sender)) = report {
+            let Some((formats, sender)) = report else {
+                witness(
+                    "a copy settled, but there is no state on this thread to report it                      with, so nothing was told about it",
+                );
+                return LRESULT(0);
+            };
+            {
                 // `if let`, not `if ... .is_ok()`. The condition of an
                 // `if` is a terminating scope, so a temporary created
                 // there is dropped *before* the block runs -- which
                 // closed the clipboard and left the body reading a
                 // clipboard it did not have open. Binding the guard is
                 // what keeps it alive for the block.
-                if let Ok(_open) = Opened::take(HWND::default()) {
-                    let _ = sender.send(available_now(formats));
+                //
+                // Everything below this point used to be silent. This
+                // is the whole of the outbound path inside this file
+                // -- a copy made here, on its way to the other
+                // machines -- and it could fail to open the
+                // clipboard, find nothing, or send into a channel
+                // nobody holds, without leaving a single line. The
+                // inbound half has been instrumented for four rounds
+                // and this half for none, which is most of why "the
+                // client copies and nobody hears" looked like a
+                // missing feature rather than a broken one.
+                let found = match Opened::take(HWND::default()) {
+                    Err(e) => {
+                        witness(&format!(
+                            "a copy settled here, but the clipboard would not open to see                              what it was ({e}), so the other machines were not told"
+                        ));
+                        return LRESULT(0);
+                    }
+                    Ok(_open) => available_now(formats),
+                };
+                if found.formats.is_empty() {
+                    witness(
+                        "a copy settled here, but none of the formats we share were on it,                          so the other machines were not told",
+                    );
+                    return LRESULT(0);
+                }
+                let announced = format!("{:?}", found.formats);
+                match sender.send(found) {
+                    Ok(()) => witness(&format!(
+                        "something was copied here: {announced}; telling whoever is                          listening"
+                    )),
+                    // The receiver is the watch, which lives on
+                    // another thread in this process. If it has gone,
+                    // nothing this machine copies will ever reach
+                    // another one again, and that is worth more than
+                    // a discarded `Result`.
+                    Err(_) => witness(&format!(
+                        "something was copied here: {announced}, but NOBODY IS LISTENING                          for copies any more, so no other machine will be told. Nothing                          copied on this machine will reach another until it is restarted"
+                    )),
                 }
             }
             LRESULT(0)
@@ -645,7 +688,7 @@ unsafe extern "system" fn window_proc(
             // other traffic. Both ends are said now, and the outcome
             // between them, whichever way it went.
             let format_id = wparam.0 as u32;
-            witness(&format!("WM_RENDERFORMAT entered for format {format_id}"));
+            step(&format!("WM_RENDERFORMAT entered for format {format_id}"));
             // Said by a guard rather than by a statement after the
             // call, so that it is said whatever happens in between.
             //
@@ -676,7 +719,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_RENDERALLFORMATS => {
-            witness("WM_RENDERALLFORMATS entered; everything promised is wanted now");
+            step("WM_RENDERALLFORMATS entered; everything promised is wanted now");
             // The process is going away; anything promised has to be made real
             // now or it vanishes with us.
             let mut said = Vec::new();
@@ -711,7 +754,7 @@ unsafe extern "system" fn window_proc(
             // the one message that can quietly overwrite every promise
             // with real data was also the one that reported nothing.
             for line in said {
-                witness(&format!("WM_RENDERALLFORMATS {line}"));
+                step(&format!("WM_RENDERALLFORMATS {line}"));
             }
             LRESULT(0)
         }
@@ -779,6 +822,7 @@ struct Returning {
     format_id: u32,
     began: Instant,
     outcome: Option<String>,
+    served: bool,
 }
 
 impl Returning {
@@ -787,11 +831,13 @@ impl Returning {
             format_id,
             began: Instant::now(),
             outcome: None,
+            served: false,
         }
     }
 
     fn was(&mut self, outcome: &Rendered) {
         self.outcome = Some(outcome.said());
+        self.served = matches!(outcome, Rendered::Served(_));
     }
 }
 
@@ -801,11 +847,20 @@ impl Drop for Returning {
             "DID NOT COME BACK -- the handler was left before it could say how it went, \
              so the promise has been answered with nothing and Windows will not ask again",
         );
-        witness(&format!(
+        let line = format!(
             "WM_RENDERFORMAT for format {} returned after {} ms: {said}",
             self.format_id,
             self.began.elapsed().as_millis()
-        ));
+        );
+        // A render that worked is a machine step and repeats as fast
+        // as anything cares to paste. A render that did not is the
+        // thing somebody is looking for, and there is one of them per
+        // attempt.
+        if self.served {
+            step(&line)
+        } else {
+            witness(&line)
+        }
     }
 }
 
@@ -833,7 +888,7 @@ fn take_clipboard(window: HWND, asked_by: &str) -> Result<()> {
         ));
         return Ok(());
     };
-    witness(&format!(
+    step(&format!(
         "taking the clipboard to promise {offered:?} ({asked_by})"
     ));
 
@@ -945,7 +1000,7 @@ fn take_clipboard(window: HWND, asked_by: &str) -> Result<()> {
         let owns = GetWindowThreadProcessId(window, Some(&mut owning));
         (GetCurrentThreadId(), owns)
     };
-    witness(&format!(
+    step(&format!(
         "promising on thread {here}; the window belongs to thread {owns} ({})",
         if here == owns {
             "the same, which is what SetClipboardData requires"
@@ -953,11 +1008,11 @@ fn take_clipboard(window: HWND, asked_by: &str) -> Result<()> {
             "NOT the same -- SetClipboardData will refuse"
         }
     ));
-    witness(&format!(
+    step(&format!(
         "what the system says it now holds: [{}]",
         promises.join("; ")
     ));
-    witness(&format!(
+    step(&format!(
         "promised {:?}; the owner is now window={:?}, and this window is {:?} ({})",
         offered,
         owner.unwrap_or(std::ptr::null_mut()),
